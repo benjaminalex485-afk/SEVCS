@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>EV Charging Station</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body class="dark-mode">
+    <div id="app-container">
+        <!-- Navigation -->
+        <nav id="navbar" class="hidden">
+            <div class="nav-brand">EV Charge Pro</div>
+            <ul class="nav-links">
+                <li><a href="#" id="nav-dash" onclick="showPage('dashboard')">Dashboard</a></li>
+                <li id="nav-book" class="hidden"><a href="#" onclick="showPage('booking')">Book Slot</a></li>
+                <li id="nav-ctrls"><a href="#" onclick="showPage('controls')">Controls</a></li>
+                <li><a href="#" onclick="showPage('logs')">Logs</a></li>
+                <li id="nav-settings" class="hidden"><a href="#" onclick="showPage('settings')">Settings</a></li>
+                <li><a href="#" onclick="logout()">Logout</a></li>
+            </ul>
+        </nav>
+
+        <!-- Login Page -->
+        <div id="login-page" class="page active">
+            <div class="login-card">
+                <h2>Welcome</h2>
+                <input type="text" id="username" placeholder="Username (admin/user)">
+                <input type="password" id="password" placeholder="Password">
+                <button onclick="login()">Login</button>
+                <div id="login-error" class="error-msg"></div>
+            </div>
+        </div>
+
+        <!-- Dashboard Page -->
+        <div id="dashboard-page" class="page hidden">
+            <header><h2>Dashboard</h2></header>
+            
+            <!-- Admin Station Summary -->
+            <div id="admin-summary" class="hidden" style="margin-bottom: 25px;">
+                <div class="summary-grid">
+                    <div class="summary-card">
+                        <div class="label">⚡ Charging</div>
+                        <div class="value" id="sum-charging">0</div>
+                    </div>
+                    <div class="summary-card">
+                        <div class="label">📅 Reserved</div>
+                        <div class="value" id="sum-reserved">0</div>
+                    </div>
+                    <div class="summary-card">
+                        <div class="label">🚗 In Queue</div>
+                        <div class="value" id="sum-queue">0</div>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="status-grid">
+                <div class="card">
+                    <h3>Status</h3>
+                    <div id="sys-state" class="value state-idle">IDLE</div>
+                </div>
+                <div class="card">
+                    <h3>Battery</h3>
+                    <div class="value"><span id="batt-val">0</span>%</div>
+                    <div class="progress-bar"><div id="batt-bar" style="width: 0%"></div></div>
+                </div>
+                <div class="card">
+                    <h3>Power</h3>
+                    <div class="value"><span id="pwr-val">0.00</span> kW</div>
+                </div>
+                <div class="card">
+                    <h3>Energy Delivered</h3>
+                    <div class="value"><span id="nrg-val">0.000</span> kWh</div>
+                </div>
+                <div class="card">
+                    <h3>Camera</h3>
+                    <div class="value" id="cam-online">Checking...</div>
+                    <div style="color:var(--text-secondary); margin-top:5px; text-transform:uppercase; font-size:0.9rem;" id="cam-state">-</div>
+                </div>
+            </div>
+            
+            <div class="chart-container card" style="height: 300px; position: relative;">
+                <canvas id="powerChart"></canvas>
+            </div>
+        </div>
+
+        <!-- Control Panel -->
+        <div id="controls-page" class="page hidden">
+            <header><h2>Control Panel</h2></header>
+            <div class="card controls-card">
+                <div class="btn-group">
+                    <button class="btn-start" onclick="sendAction('/api/start')">Start Charging</button>
+                    <button class="btn-stop" onclick="sendAction('/api/stop')">Stop Charging</button>
+                </div>
+                <hr>
+                <div class="setting-group">
+                    <label>Current Limit (A)</label>
+                    <input type="number" id="current-limit" value="16" min="6" max="32">
+                    <button class="btn-secondary" onclick="setCurrentLimit()">Set Limit</button>
+                </div>
+                <hr>
+                <div class="setting-group fault-group">
+                    <label>System Faults</label>
+                    <div id="fault-display" style="font-size: 1.5rem; color: #cf6679; margin: 10px 0; font-weight: bold;">NONE</div>
+                    <button class="btn-danger" onclick="sendAction('/api/reset_fault')">Reset Fault</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Settings Panel -->
+        <div id="settings-page" class="page hidden">
+            <header><h2>Admin Settings</h2></header>
+            
+            <div class="card">
+                <h3>Camera Controls</h3>
+                <div class="btn-group">
+                    <button class="btn-start" onclick="sendAction('/api/camera/start')">Start Camera</button>
+                    <button class="btn-stop" onclick="sendAction('/api/camera/stop')">Stop Camera</button>
+                </div>
+            </div>
+
+            <div class="card">
+                <h3>User Management</h3>
+                <table class="logs-table">
+                    <thead><tr><th>Username</th><th>Role</th><th>Action</th></tr></thead>
+                    <tbody id="users-body"></tbody>
+                </table>
+                <hr>
+                <div class="setting-group">
+                    <label>Add New User</label>
+                    <input type="text" id="new-user" placeholder="Username">
+                    <input type="password" id="new-pass" placeholder="Password">
+                    <select id="new-role" style="width:100%; padding: 12px; margin-bottom: 15px; background:#2c2c2c; color:white; border-radius:6px; border:1px solid #333;">
+                        <option value="user">User</option>
+                        <option value="admin">Admin</option>
+                    </select>
+                    <button class="btn-start" onclick="addUser()">Add User</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Logs Viewer -->
+        <div id="logs-page" class="page hidden">
+            <header><h2>Session Logs</h2></header>
+            <div class="card" style="overflow-x: auto;">
+                <table class="logs-table">
+                    <thead>
+                        <tr><th>User</th><th>Start</th><th>End</th><th>Energy (kWh)</th><th>Fault</th></tr>
+                    </thead>
+                    <tbody id="logs-body">
+                        <!-- Populated by JS -->
+                    </tbody>
+                </table>
+                <div class="btn-group-horizontal" style="display: flex; gap: 10px; margin-top: 15px;">
+                    <button class="btn-secondary" onclick="fetchLogs()">Refresh Logs</button>
+                    <button id="admin-clear-logs" class="btn-danger hidden" onclick="clearLogs()" style="margin-top: 0; width: auto;">Clear All Logs</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Booking Page -->
+        <div id="booking-page" class="page hidden">
+            <header><h2>Book Your Slot</h2></header>
+            
+            <div id="booking-step-1" class="booking-step">
+                <div class="card">
+                    <h3>1. Requirements</h3>
+                    <div class="setting-group" style="padding-bottom: 10px;">
+                        <label>Energy Required (kWh)</label>
+                        <input type="number" id="book-units" value="20" min="5" max="100">
+                    </div>
+                    <div class="setting-group">
+                        <label>Charge Type</label>
+                        <select id="book-type" class="styled-select">
+                            <option value="Standard">Standard (7kW)</option>
+                            <option value="Fast">Fast (50kW)</option>
+                            <option value="Ultra">Ultra (150kW)</option>
+                        </select>
+                    </div>
+                    <button class="btn-start" onclick="goToStep(2)">Next: Payment</button>
+                </div>
+            </div>
+
+            <div id="booking-step-2" class="booking-step hidden">
+                <div class="card payment-card">
+                    <h3>2. Mock Payment</h3>
+                    <div class="card-visual">
+                        <div class="chip"></div>
+                        <div class="number">**** **** **** 4242</div>
+                        <div class="holder">PREMIUM USER</div>
+                    </div>
+                    <div class="setting-group">
+                        <label>Card Number</label>
+                        <input type="text" placeholder="XXXX XXXX XXXX XXXX">
+                    </div>
+                    <div class="flex-row">
+                        <div class="setting-group"><input type="text" placeholder="MM/YY"></div>
+                        <div class="setting-group"><input type="password" placeholder="CVV"></div>
+                    </div>
+                    <button class="btn-start" id="pay-btn" onclick="processPayment()">Confirm & Pay</button>
+                    <button class="btn-secondary" onclick="goToStep(1)">Back</button>
+                </div>
+            </div>
+
+            <div id="booking-step-3" class="booking-step hidden">
+                <div class="card success-card">
+                    <div class="icon">✅</div>
+                    <h2>Booking Confirmed!</h2>
+                    <p>Your vehicle has been assigned to:</p>
+                    <div class="assigned-slot-box">
+                        <span class="label">SLOT ID</span>
+                        <span class="value" id="assigned-slot-id"># -</span>
+                    </div>
+                    <p style="color: var(--text-secondary);">Estimated Completion: <span id="assigned-slot-time">-</span></p>
+                    <button class="btn-start" onclick="finalizeBooking()">View Progress</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Chart.js local file downloaded in previous step -->
+    <script src="chart.umd.min.js"></script>
+    <script src="app.js"></script>
+</body>
+</html>
