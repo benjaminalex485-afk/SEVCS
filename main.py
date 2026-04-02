@@ -125,6 +125,7 @@ def main():
     
     # State Management
     slots = [Slot(i, poly) for i, poly in enumerate(config.get('slots', []))]
+    slot_estimates = {} # Initialize here to avoid UnboundLocalError
     
     # Sync with API Global State
     G_STATE['slots'] = slots
@@ -138,7 +139,6 @@ def main():
 
     queue_zones = config.get('queue_zones', [])
     conf_threshold = config.get('conf_threshold', 0.15)
-    slot_estimates = {}
     track_ages = {} 
     
     print("System Ready.")
