@@ -5,7 +5,6 @@ import logging
 import cv2
 
 # Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 class SlotState(Enum):
@@ -45,11 +44,32 @@ class Slot:
         self.occlusion_timer = 0.0
         self.state_enter_time = time.time()
 
-    def set_state(self, new_state):
+    def validate_transition(self, new_state):
+        """
+        Enforces physical reality by restricting allowed state jumps.
+        """
+        allowed = {
+            SlotState.FREE: [SlotState.RESERVED, SlotState.ALIGNMENT_PENDING],
+            SlotState.RESERVED: [SlotState.ALIGNMENT_PENDING, SlotState.FREE],
+            SlotState.ALIGNMENT_PENDING: [SlotState.CHARGING, SlotState.MISALIGNED, SlotState.FREE],
+            SlotState.CHARGING: [SlotState.MISALIGNED, SlotState.FREE],
+            SlotState.MISALIGNED: [SlotState.CHARGING, SlotState.FREE]
+        }
+        return new_state in allowed.get(self.state, [])
+
+    def set_state(self, new_state, track_id=None):
         if self.state != new_state:
-            logger.info(f"[Slot {self.slot_id+1}] State Change: {self.state.name} -> {new_state.name} | Track: {self.locked_track_id}")
+            if not self.validate_transition(new_state):
+                logger.error(f"[Slot {self.slot_id+1}] REJECTED Invalid Transition: {self.state.name} -> {new_state.name}")
+                return False
+
+            logger.info(f"[Slot {self.slot_id+1}] State Change: {self.state.name} -> {new_state.name} | Track: {track_id}")
             self.state = new_state
             self.state_enter_time = time.time()
+            
+            # Atomically update track ID during state transition
+            if track_id is not None:
+                self.locked_track_id = track_id
             
             if new_state == SlotState.FREE:
                 self.locked_track_id = None
@@ -57,6 +77,7 @@ class Slot:
                 self.smoothed_alignment_score = 0.0
                 self.misalignment_timer = 0.0
                 self.safety_flag = False
+            return True
 
     def enable_charging(self):
         """
@@ -83,9 +104,10 @@ class Slot:
         ALIGN_THRESHOLD_LOW = 0.45 
         GRACE_PERIOD = 5.0 # Seconds before we declare MISALIGNED
         
-        # Log breakdown
+        # Log throttling (1Hz)
         if "overlap_ratio" in features:
-            logger.info(f"[Slot {self.slot_id+1}] Track {self.locked_track_id} | Overlap: {features['overlap_ratio']:.2f} | Centroid: {features['centroid_score']:.2f} | Final: {score:.2f} | Smoothed: {self.smoothed_alignment_score:.2f}")
+            if current_time - self.last_evaluation_time > 1.0:
+                logger.info(f"[Slot {self.slot_id+1}] Track {self.locked_track_id} | Overlap: {features['overlap_ratio']:.2f} | Centroid: {features['centroid_score']:.2f} | Final: {score:.2f} | Smoothed: {self.smoothed_alignment_score:.2f}")
 
         time_in_slot = current_time - self.state_enter_time
 

@@ -32,3 +32,6 @@ users.json
 # OS Specific
 .DS_Store
 Thumbs.db
+
+# Agent Metadata
+.agents/

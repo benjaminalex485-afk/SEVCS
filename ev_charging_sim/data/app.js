@@ -101,9 +101,6 @@ async function login() {
 }
 
 async function logout() {
-    try {
-        await fetch(`${BASE_URL}/api/logout`, { method: 'POST' });
-    } catch(e) {}
     stopPolling();
     document.getElementById('navbar').classList.add('hidden');
     showPage('login');
@@ -112,7 +109,7 @@ async function logout() {
 function startPolling() {
     if(!updateInterval) {
         pollStatus(); // immediate
-        updateInterval = setInterval(pollStatus, 2000); // polling interval per specs
+        updateInterval = setInterval(pollStatus, 1000); // 1Hz for simulator sync
     }
 }
 
@@ -130,55 +127,78 @@ async function pollStatus() {
             const data = await res.json();
             updateDashboard(data);
         }
-        
-        // Poll camera separately
-        const camRes = await fetch(`${BASE_URL}/api/camera/status`);
-        if(camRes.ok) {
-            const camData = await camRes.json();
-            const cr = document.getElementById('cam-online');
-            cr.textContent = camData.online ? "ONLINE" : "OFFLINE";
-            cr.style.color = camData.online ? "var(--success-color)" : "var(--error-color)";
-            document.getElementById('cam-state').textContent = camData.state;
-        }
     } catch(e) {
         console.error("Poll error", e);
     }
 }
 
 function updateDashboard(data) {
+    // 1. Update System Summary
+    const sys = data.sys;
+    const slots = data.slots;
+    
     const stEl = document.getElementById('sys-state');
-    stEl.textContent = data.state;
-    stEl.className = 'value state-' + data.state.toLowerCase();
+    const cameraText = sys.camera_online ? "ONLINE" : "OFFLINE";
+    document.getElementById('cam-online').textContent = cameraText;
+    document.getElementById('cam-online').style.color = sys.camera_online ? "var(--success-color)" : "var(--error-color)";
+    
+    // Heartbeat check
+    const now = Date.now() / 1000;
+    const heartbeatDiff = now - sys.vision_heartbeat;
+    const isVisionStale = heartbeatDiff > 2.0;
+    document.getElementById('cam-state').textContent = isVisionStale ? "STALE" : "SYNCED";
 
-    document.getElementById('batt-val').textContent = data.battery_pct;
-    document.getElementById('batt-bar').style.width = data.battery_pct + '%';
+    // 2. Find "My" Slot or Slot 1 for Admin
+    let activeSlot = slots.find(s => s.booking && s.booking.user === currentUser);
+    if(!activeSlot && userRole === 'admin') activeSlot = slots[0];
     
-    document.getElementById('pwr-val').textContent = (data.power / 1000).toFixed(2);
-    document.getElementById('nrg-val').textContent = data.energy.toFixed(3);
-    
-    document.getElementById('fault-display').textContent = data.fault_type;
-    
-    // Fetch Station Summary for Admin
-    if(userRole === 'admin') updateAdminSummary();
-    
-    updateChart(data);
-}
-
-async function updateAdminSummary() {
-    try {
-        const res = await fetch(`${BASE_URL}/api/station/summary`);
-        if(res.ok) {
-            const sum = await res.json();
-            document.getElementById('sum-charging').textContent = sum.charging || 0;
-            document.getElementById('sum-reserved').textContent = sum.reserved || 0;
-            document.getElementById('sum-queue').textContent = sum.queue || 0;
+    if(activeSlot) {
+        stEl.textContent = activeSlot.state;
+        stEl.className = 'value state-' + activeSlot.state.toLowerCase();
+        
+        if(activeSlot.session) {
+            document.getElementById('batt-val').textContent = activeSlot.session.battery_pct;
+            document.getElementById('batt-bar').style.width = activeSlot.session.battery_pct + '%';
+            document.getElementById('pwr-val').textContent = activeSlot.session.power.toFixed(2);
+            document.getElementById('nrg-val').textContent = activeSlot.session.energy.toFixed(3);
+            updateChart(activeSlot.session);
+        } else {
+            resetMetrics();
         }
-    } catch(e) {}
+    } else {
+        stEl.textContent = "IDLE";
+        stEl.className = "value state-idle";
+        resetMetrics();
+    }
+
+    // 3. Update Admin Counters
+    if(userRole === 'admin') {
+        document.getElementById('sum-charging').textContent = sys.charging_count;
+        document.getElementById('sum-reserved').textContent = slots.filter(s => s.state === 'RESERVED').length;
+        document.getElementById('sum-queue').textContent = sys.queue_count;
+    }
 }
 
-function goToStep(step) {
-    document.querySelectorAll('.booking-step').forEach(el => el.classList.add('hidden'));
-    document.getElementById(`booking-step-${step}`).classList.remove('hidden');
+function resetMetrics() {
+    document.getElementById('batt-val').textContent = "0";
+    document.getElementById('batt-bar').style.width = "0%";
+    document.getElementById('pwr-val').textContent = "0.00";
+    document.getElementById('nrg-val').textContent = "0.000";
+}
+
+function updateChart(session) {
+    if (!chartInstance) return;
+    const now = new Date();
+    const timeStr = `${now.getHours()}:${now.getMinutes().toString().padStart(2,'0')}:${now.getSeconds().toString().padStart(2,'0')}`;
+    
+    chartData.labels.push(timeStr);
+    chartData.datasets[0].data.push(session.power);
+    
+    if(chartData.labels.length > 30) {
+        chartData.labels.shift();
+        chartData.datasets[0].data.shift();
+    }
+    chartInstance.update();
 }
 
 async function processPayment() {
@@ -186,7 +206,6 @@ async function processPayment() {
     btn.textContent = "Processing...";
     btn.disabled = true;
 
-    // Simulate network delay for payment
     setTimeout(async () => {
         const units = document.getElementById('book-units').value;
         const type = document.getElementById('book-type').value;
@@ -204,8 +223,7 @@ async function processPayment() {
             const data = await res.json();
             if(data.status === 'success') {
                 document.getElementById('assigned-slot-id').textContent = '#' + data.slot_id;
-                const estDate = new Date(data.estimate * 1000);
-                document.getElementById('assigned-slot-time').textContent = estDate.toLocaleTimeString();
+                document.getElementById('assigned-slot-time').textContent = "Awaiting Arrival";
                 goToStep(3);
             } else {
                 alert("Booking failed: " + (data.message || "Unknown error"));
@@ -218,140 +236,32 @@ async function processPayment() {
             btn.textContent = "Confirm & Pay";
             btn.disabled = false;
         }
-    }, 1500);
+    }, 1000);
 }
 
 function finalizeBooking() {
     showPage('dashboard');
 }
 
-async function clearLogs() {
-    if(!confirm("Are you sure you want to clear all charging logs?")) return;
-    try {
-        const res = await fetch(`${BASE_URL}/api/logs/clear`, { method: 'POST' });
-        if(res.ok) {
-            alert("Logs cleared successfully.");
-            fetchLogs();
-        }
-    } catch(e) {
-        alert("Error clearing logs.");
-    }
-}
-
-function updateChart(data) {
-    if (!chartInstance) return;
-    const now = new Date();
-    const timeStr = `${now.getHours()}:${now.getMinutes().toString().padStart(2,'0')}:${now.getSeconds().toString().padStart(2,'0')}`;
-    
-    chartData.labels.push(timeStr);
-    chartData.datasets[0].data.push(data.power / 1000); // kW
-    
-    // Window of 30 points
-    if(chartData.labels.length > 30) {
-        chartData.labels.shift();
-        chartData.datasets[0].data.shift();
-    }
-    chartInstance.update();
-}
-
-async function sendAction(endpoint) {
-    try {
-        const res = await fetch(`${BASE_URL}${endpoint}`, { method: 'POST' });
-        const data = await res.json();
-        if(data.status !== 'success') alert(data.message || 'Action failed');
-    } catch (e) {
-        alert("Action failed to send.");
-    }
-}
-
-async function setCurrentLimit() {
-    const lim = document.getElementById('current-limit').value;
-    try {
-        const res = await fetch(`${BASE_URL}/api/set_current`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ limit: lim })
-        });
-        const data = await res.json();
-        if(data.status === 'success') alert("Limit set to " + data.limit + "A");
-    } catch(e) {
-        alert("Failed to set limit.");
-    }
-}
-
 async function fetchLogs() {
-    try {
-        const res = await fetch(`${BASE_URL}/api/logs`);
-        const data = await res.json();
-        const tbody = document.getElementById('logs-body');
-        tbody.innerHTML = '';
-        data.forEach(log => {
-            const tr = document.createElement('tr');
-            tr.innerHTML = `
-                <td>${log.user || '-'}</td>
-                <td>${log.start_time || log.timestamp || '-'}</td>
-                <td>${log.end_time || '-'}</td>
-                <td>${(log.energy_kwh !== undefined) ? log.energy_kwh.toFixed(3) : '-'}</td>
-                <td>${log.fault || log.event || '-'}</td>
-            `;
-            tbody.appendChild(tr);
-        });
-    } catch(e) {
-        console.error("Failed to load logs");
-    }
+    // Stage 1: Simplified logs or static mock for logs page
+    const tbody = document.getElementById('logs-body');
+    tbody.innerHTML = '<tr><td colspan="5" style="text-align:center">Live logs migrating in Stage 2</td></tr>';
 }
 
 async function fetchUsers() {
-    try {
-        const res = await fetch(`${BASE_URL}/api/users`);
-        const data = await res.json();
-        const tbody = document.getElementById('users-body');
-        tbody.innerHTML = '';
-        data.users.forEach(u => {
-            const tr = document.createElement('tr');
-            tr.innerHTML = `
-                <td>${u.username}</td>
-                <td>${u.role}</td>
-                <td>
-                    ${u.username !== 'admin' ? `<button class="btn-danger" style="padding: 5px; width:auto;" onclick="deleteUser('${u.username}')">Del</button>` : '-'}
-                </td>
-            `;
-            tbody.appendChild(tr);
-        });
-    } catch(e) { console.error("Err fetching users"); }
+    // For admin settings (Stage 1 uses default users_db in main.py)
+    const tbody = document.getElementById('users-body');
+    tbody.innerHTML = '<tr><td>admin</td><td>admin</td><td>-</td></tr><tr><td>user</td><td>user</td><td>-</td></tr>';
 }
 
-async function addUser() {
-    const u = document.getElementById('new-user').value;
-    const p = document.getElementById('new-pass').value;
-    const r = document.getElementById('new-role').value;
-    if(!u || !p) return alert("Missing fields");
-    
-    try {
-        const res = await fetch(`${BASE_URL}/api/users`, {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({username: u, password: p, role: r})
-        });
-        const data = await res.json();
-        if(data.status === 'success') {
-            document.getElementById('new-user').value = '';
-            document.getElementById('new-pass').value = '';
-            fetchUsers();
-        } else {
-            alert(data.message || "Failed to add user");
-        }
-    } catch(e) {}
+function goToStep(step) {
+    document.querySelectorAll('.booking-step').forEach(el => el.classList.add('hidden'));
+    document.getElementById(`booking-step-${step}`).classList.remove('hidden');
 }
 
-async function deleteUser(username) {
-    if(!confirm(`Delete ${username}?`)) return;
-    try {
-        const res = await fetch(`${BASE_URL}/api/users`, {
-            method: 'DELETE',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({username})
-        });
-        if(res.ok) fetchUsers();
-    } catch(e) {}
+async function sendAction(endpoint) {
+    console.log("Action sent to:", endpoint);
+    // Stage 1: Actions like Start/Stop are automatic via Vision alignment.
+    // Manual overrides can be implemented here in future stages.
 }

@@ -3,3 +3,5 @@ opencv-python
 supervision
 numpy
 pyyaml
+flask
+flask-cors
