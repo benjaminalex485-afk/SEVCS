@@ -11,8 +11,10 @@ class SlotState(Enum):
     FREE = 0
     RESERVED = 1
     ALIGNMENT_PENDING = 2
-    CHARGING = 3
-    MISALIGNED = 4
+    AUTH_PENDING = 3
+    AUTH_ACTIVE = 4
+    CHARGING = 5
+    MISALIGNED = 6
 
 class AlignmentState(Enum):
     UNSTABLE = 0
@@ -24,7 +26,14 @@ class Slot:
     def __init__(self, slot_id, polygon):
         self.slot_id = slot_id
         self.polygon = np.array(polygon, np.int32)
-        self.bbox = cv2.boundingRect(self.polygon) # Precompute BBox for pre-filtering
+        self.bbox = cv2.boundingRect(self.polygon)
+        
+        # Precompute centroid
+        M = cv2.moments(self.polygon)
+        if M["m00"] != 0:
+            self.centroid = (int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"]))
+        else:
+            self.centroid = (int(np.mean(self.polygon[:, 0])), int(np.mean(self.polygon[:, 1])))
         
         # State
         self.state = SlotState.FREE
@@ -42,7 +51,7 @@ class Slot:
         self.last_evaluation_time = 0.0
         self.misalignment_timer = 0.0
         self.occlusion_timer = 0.0
-        self.state_enter_time = time.time()
+        self.state_enter_time = time.monotonic()
 
     def validate_transition(self, new_state):
         """
@@ -51,9 +60,11 @@ class Slot:
         allowed = {
             SlotState.FREE: [SlotState.RESERVED, SlotState.ALIGNMENT_PENDING],
             SlotState.RESERVED: [SlotState.ALIGNMENT_PENDING, SlotState.FREE],
-            SlotState.ALIGNMENT_PENDING: [SlotState.CHARGING, SlotState.MISALIGNED, SlotState.FREE],
+            SlotState.ALIGNMENT_PENDING: [SlotState.AUTH_PENDING, SlotState.MISALIGNED, SlotState.FREE],
+            SlotState.AUTH_PENDING: [SlotState.AUTH_ACTIVE, SlotState.ALIGNMENT_PENDING, SlotState.FREE],
+            SlotState.AUTH_ACTIVE: [SlotState.CHARGING, SlotState.ALIGNMENT_PENDING, SlotState.FREE],
             SlotState.CHARGING: [SlotState.MISALIGNED, SlotState.FREE],
-            SlotState.MISALIGNED: [SlotState.CHARGING, SlotState.FREE]
+            SlotState.MISALIGNED: [SlotState.CHARGING, SlotState.ALIGNMENT_PENDING, SlotState.FREE]
         }
         return new_state in allowed.get(self.state, [])
 
@@ -65,7 +76,7 @@ class Slot:
 
             logger.info(f"[Slot {self.slot_id+1}] State Change: {self.state.name} -> {new_state.name} | Track: {track_id}")
             self.state = new_state
-            self.state_enter_time = time.time()
+            self.state_enter_time = time.monotonic()
             
             # Atomically update track ID during state transition
             if track_id is not None:
@@ -73,6 +84,7 @@ class Slot:
             
             if new_state == SlotState.FREE:
                 self.locked_track_id = None
+                self.track_age = 0
                 self.alignment_state = AlignmentState.UNSTABLE
                 self.smoothed_alignment_score = 0.0
                 self.misalignment_timer = 0.0
@@ -99,7 +111,7 @@ class Slot:
         alpha = 0.3
         self.smoothed_alignment_score = (0.7 * self.smoothed_alignment_score) + (alpha * score)
         
-        current_time = time.time()
+        current_time = time.monotonic()
         ALIGN_THRESHOLD_HIGH = 0.75
         ALIGN_THRESHOLD_LOW = 0.45 
         GRACE_PERIOD = 5.0 # Seconds before we declare MISALIGNED
@@ -145,7 +157,7 @@ class Slot:
                 logger.warning(f"[Slot {self.slot_id+1}] Decision: MISALIGNED (Grace Period Expired)")
 
     def handle_occlusion(self, is_occluded):
-        current_time = time.time()
+        current_time = time.monotonic()
         if is_occluded:
             if self.occlusion_timer == 0.0:
                 self.occlusion_timer = current_time

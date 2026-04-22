@@ -141,9 +141,9 @@ class QueueManager:
             if s.state == SlotState.FREE and i not in self.reservations
         ]
 
-        # Try to assign
-        if free_indices:
-            self.assign_slots(free_indices)
+        # Try to assign (DISABLED for validation clarity)
+        # if free_indices:
+        #    self.assign_slots(free_indices)
 
         # 3. Synchronize Slot Objects with Manager State
         for i, slot in enumerate(slots):
