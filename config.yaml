@@ -6,6 +6,13 @@ class_ids:
 - 7
 conf_threshold: 0.15
 model_path: models/yolov8n-seg.pt
+
+# Timing & Policy
+auth_timeout: 60.0
+booking_timeout: 600.0
+rate_limit_attempts: 5
+rate_limit_window: 60.0
+
 queue_zones:
 - - - 377
     - 184

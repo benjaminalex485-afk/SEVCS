@@ -42,6 +42,10 @@ class Slot:
         self.track_age = 0 # Track age in frames for stability weighting
         self.safety_flag = False # True if safety issue detected
         
+        # Stage 3: Suggestions & Allocation
+        self.suggested_track_id = None
+        self.suggestion_timestamp = 0.0
+        
         # Alignment
         self.alignment_state = AlignmentState.UNSTABLE
         self.alignment_score = 0.0

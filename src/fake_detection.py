@@ -37,7 +37,8 @@ class ScenarioEngine:
             "walk_in": 120, "occlusion_id_shift": 120, "misaligned_forever": 120, "slot_jumper": 120,
             "rapid_entry": 120, "long_occlusion": 120, "conflict_test": 120, "stage2_happy_path": 120,
             "stage2_id_shift": 120, "stage2_expiry": 120, "stage2_race": 120, "stage2_equal_timing": 120,
-            "stage2_borderline": 120, "stage2_drift": 120
+            "stage2_borderline": 120, "stage2_drift": 120,
+            "stage3_priority_test": 120, "stage3_cleanup_test": 60, "stage3_hysteresis_test": 120, "stage3_equal_score": 120
         }
         return elapsed > durations.get(self.scenario_name, 30)
 
@@ -57,6 +58,10 @@ class ScenarioEngine:
         elif self.scenario_name == "stage2_equal_timing": return self._scenario_stage2_equal_timing(elapsed)
         elif self.scenario_name == "stage2_borderline": return self._scenario_stage2_borderline(elapsed)
         elif self.scenario_name == "stage2_drift": return self._scenario_stage2_drift(elapsed)
+        elif self.scenario_name == "stage3_priority_test": return self._scenario_stage3_priority_test(elapsed)
+        elif self.scenario_name == "stage3_cleanup_test": return self._scenario_stage3_cleanup_test(elapsed)
+        elif self.scenario_name == "stage3_hysteresis_test": return self._scenario_stage3_hysteresis_test(elapsed)
+        elif self.scenario_name == "stage3_equal_score": return self._scenario_stage3_equal_score(elapsed)
         return self._empty()
 
     def _empty(self):
@@ -171,6 +176,55 @@ class ScenarioEngine:
         if t < 5: return self._create_detections([1], [self._generate_controlled_mask(0, 0.95)])
         if t < 18: return self._empty()
         return self._create_detections([1], [self._generate_controlled_mask(0, 0.95)])
+
+    def _generate_mask_at(self, center, size=(200, 300)):
+        mask = np.zeros((self.frame_wh[1], self.frame_wh[0]), dtype=np.uint8)
+        x1, y1 = max(0, center[0] - size[0]//2), max(0, center[1] - size[1]//2)
+        x2, y2 = min(self.frame_wh[0], center[0] + size[0]//2), min(self.frame_wh[1], center[1] + size[1]//2)
+        mask[y1:y2, x1:x2] = 1
+        return mask
+
+    def _scenario_stage3_priority_test(self, t):
+        # Veh 1: Walk-in (Long wait in Queue Zone)
+        # Veh 2: New Arrival with Booking (at t=10)
+        masks = []
+        ids = []
+        # Veh 1 sits at (300, 600) - Queue Zone
+        masks.append(self._generate_mask_at((300, 600)))
+        ids.append(1)
+        
+        if t > 10:
+            # Veh 2 sits at (900, 600) - Queue Zone
+            masks.append(self._generate_mask_at((900, 600)))
+            ids.append(2)
+        return self._create_detections(ids, masks)
+
+    def _scenario_stage3_cleanup_test(self, t):
+        # Veh 1 appears at t=2, disappears at t=5
+        if 2 < t < 5: return self._create_detections([1], [self._generate_mask_at((640, 600))])
+        return self._empty()
+
+    def _scenario_stage3_hysteresis_test(self, t):
+        # Two vehicles near Slot 1. Veh 1 is slightly closer at first.
+        masks = []
+        ids = []
+        if t < 10:
+            masks.append(self._generate_mask_at((100, 300))) # Veh 1
+            ids.append(1)
+            masks.append(self._generate_mask_at((400, 300))) # Veh 2
+            ids.append(2)
+        else:
+            # Flip positions slightly at t=10
+            masks.append(self._generate_mask_at((105, 300))) # Veh 1
+            ids.append(1)
+            masks.append(self._generate_mask_at((95, 300))) # Veh 2
+            ids.append(2)
+        return self._create_detections(ids, masks)
+
+    def _scenario_stage3_equal_score(self, t):
+        # Two vehicles at exactly same distance and wait
+        masks = [self._generate_mask_at((100, 600)), self._generate_mask_at((1100, 600))]
+        return self._create_detections([1, 2], masks)
 
     def _scenario_conflict_test(self, t):
         mask1 = self._generate_controlled_mask(0, 0.95)

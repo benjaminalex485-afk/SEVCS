@@ -39,6 +39,7 @@ class LogValidator:
 
     def validate_scenario(self, name, expected_patterns, forbidden_patterns=None):
         print(f"\n--- VALIDATING SCENARIO: {name} ---")
+        self._load_logs() # RELOAD FRESH LOGS
         
         # Check sequence
         success, msg = self.verify_sequence(expected_patterns)

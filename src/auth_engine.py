@@ -13,15 +13,24 @@ class AuthEngine:
         self.bookings = {}
         # slot_id -> {track_id, validated_at, status: "AUTHORIZED"|"NONE"}
         self.authorizations = {}
+        # Rate limiting: ip_or_user -> [timestamps]
+        self.attempts = {}
 
     def generate_booking(self, slot_id, user, timeout=600):
         """
         Generates a 6-digit numeric auth code for a slot.
+        Rejects if a non-expired booking already exists.
         """
-        code = "".join(random.choices(string.digits, k=6))
-        expires_at = time.monotonic() + timeout
-        
         with self.lock:
+            # ISSUE 1: Prevent silent overwrite
+            existing = self.bookings.get(slot_id)
+            if existing and existing["status"] == "PENDING" and time.monotonic() < existing["expires_at"]:
+                logger.warning(f"[AUTH] REJECTED: Slot {slot_id+1} already has a valid booking.")
+                return None
+
+            code = "".join(random.choices(string.digits, k=6))
+            expires_at = time.monotonic() + timeout
+            
             self.bookings[slot_id] = {
                 "auth_code": code,
                 "expires_at": expires_at,
@@ -29,11 +38,31 @@ class AuthEngine:
                 "status": "PENDING"
             }
             logger.info(f"[AUTH] CODE_GENERATED for Slot {slot_id+1}: {code} (expires in {timeout}s)")
+            
             # Clear any existing authorization for this slot when a new booking is made
             if slot_id in self.authorizations:
                 del self.authorizations[slot_id]
         
         return code
+
+    def record_attempt(self, identifier):
+        """Records an API attempt timestamp for rate limiting."""
+        with self.lock:
+            now = time.monotonic()
+            if identifier not in self.attempts:
+                self.attempts[identifier] = []
+            self.attempts[identifier].append(now)
+            # Cleanup old attempts (> 1 hour) to prevent leak
+            self.attempts[identifier] = [t for t in self.attempts[identifier] if now - t < 3600]
+
+    def check_rate_limit(self, identifier, limit, window):
+        """Checks if identifier has exceeded limit within window seconds."""
+        with self.lock:
+            if identifier not in self.attempts:
+                return True
+            now = time.monotonic()
+            recent = [t for t in self.attempts[identifier] if now - t < window]
+            return len(recent) <= limit
 
     def authorize_vehicle(self, slot_id, code, current_track_id):
         """
@@ -77,23 +106,24 @@ class AuthEngine:
     def is_authorized(self, slot_id, track_id):
         """
         Thread-safe check if a specific track_id is authorized for a slot.
+        Returns: (is_authorized, reason)
         """
         with self.lock:
             auth = self.authorizations.get(slot_id)
             if not auth or auth["status"] != "AUTHORIZED":
-                return False
+                return False, "NO_AUTH"
             
             if auth["track_id"] != track_id:
                 logger.warning(f"[AUTH] TRACK_MISMATCH for Slot {slot_id+1}: Auth={auth['track_id']}, Current={track_id}")
-                return False
+                return False, "ID_MISMATCH"
                 
             # Double check booking expiry even if authorized
             booking = self.bookings.get(slot_id)
             if not booking or time.monotonic() > booking["expires_at"]:
                 logger.warning(f"[AUTH] EXPIRED while authorized for Slot {slot_id+1}")
-                return False
+                return False, "EXPIRED"
                 
-            return True
+            return True, "VALID"
 
     def is_expired(self, slot_id):
         with self.lock:

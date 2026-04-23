@@ -1,185 +1,203 @@
 import time
 import numpy as np
 import supervision as sv
+from scipy.optimize import linear_sum_assignment
+from .priority_engine import PriorityEngine
+import logging
+from .slot_state_machine import SlotState
+
+logger = logging.getLogger(__name__)
+
+class QueueEntry:
+    def __init__(self, track_id, centroid=(0,0)):
+        self.track_id = track_id
+        self.arrival_time = time.monotonic()
+        self.last_seen_time = time.monotonic()
+        self.centroid = centroid
+        self.user = None
+        self.booking_id = None # Bound during Stage 2 flow
+        self.priority_score = 0.0
+        self.assigned_slot = None
+        self.last_assignment_time = 0.0 # for hysteresis
 
 class QueueManager:
-    def __init__(self, timeout=10.0):
-        self.timeout = timeout
-        # queue: list of dicts {'id': int, 'arrival_time': float, 'last_seen': float}
-        self.queue = [] 
-        # reservations: dict {slot_index: {'vehicle_id': int, 'timestamp': float}}
-        self.reservations = {}
-        # entry_stability: map track_id -> count of frames seen in zone
-        self.entry_stability = {}
+    def __init__(self):
+        self.queue = {} # track_id -> QueueEntry
+        self.priority_engine = PriorityEngine()
+        self.entry_stability = {} # track_id -> frames_seen
+        self.zone_cache = {} # polygon_hash -> PolygonZone
 
-    def update(self, detections, queue_zones):
-        """
-        Updates the queue based on current tracked detections in the queue zone.
-        """
-        current_time = time.time()
-        
-        # 1. Identify vehicles currently in the Queue Zone
-        vehicles_in_zone = set()
-        
-        for zone_poly in queue_zones:
-            polygon = np.array(zone_poly, np.int32)
-            if polygon.shape[0] < 3: continue
-
-            zone = sv.PolygonZone(
+    def _get_zone(self, polygon_coords):
+        poly_hash = hash(tuple(map(tuple, polygon_coords)))
+        if poly_hash not in self.zone_cache:
+            polygon = np.array(polygon_coords, np.int32)
+            self.zone_cache[poly_hash] = sv.PolygonZone(
                 polygon=polygon, 
                 triggering_anchors=[sv.Position.CENTER]
             )
+        return self.zone_cache[poly_hash]
+
+    def update_queue(self, detections, queue_zones):
+        """
+        Updates the queue based on vehicles in the QUEUE_ZONE.
+        """
+        now = time.monotonic()
+        vehicles_in_zone = {} # track_id -> centroid
+        
+        # 1. Detect vehicles in Queue Zones (Efficiency: Use cached zones)
+        for zone_poly in queue_zones:
+            zone = self._get_zone(zone_poly)
             is_inside = zone.trigger(detections=detections)
             
             if detections.tracker_id is not None:
-                ids_in_zone = detections.tracker_id[is_inside]
-                vehicles_in_zone.update(ids_in_zone)
+                ids = detections.tracker_id[is_inside]
+                xyxy = detections.xyxy[is_inside]
+                for i, tid in enumerate(ids):
+                    # Calculate centroid from bbox
+                    bbox = xyxy[i]
+                    centroid = (int((bbox[0] + bbox[2])/2), int((bbox[1] + bbox[3])/2))
+                    vehicles_in_zone[tid] = centroid
 
-        # 2. Add new vehicles to Queue using Stability check
-        queue_ids = {v['id'] for v in self.queue}
+        # 2. Add/Update entries (Correction: Strict Reset for Stability)
+        # Reset stability for any ID not detected in zone this frame
+        active_tids = set(vehicles_in_zone.keys())
+        all_tracked_tids = set(self.entry_stability.keys())
+        for tid in all_tracked_tids - active_tids:
+             # Only reset if NOT in queue (if in queue, we rely on cleanup heartbeat)
+             if tid not in self.queue:
+                 del self.entry_stability[tid]
+
+        for tid, centroid in vehicles_in_zone.items():
+            if tid not in self.queue:
+                self.entry_stability[tid] = self.entry_stability.get(tid, 0) + 1
+                
+                # Only add if stabilized (> 5 frames)
+                if self.entry_stability[tid] > 5:
+                    logger.info(f"[QUEUE] ADD Track {tid}")
+                    self.queue[tid] = QueueEntry(tid, centroid)
+            else:
+                # Update existing
+                entry = self.queue[tid]
+                
+                # ISSUE 3: Teleportation Guard (ID Reuse Reset)
+                dist = np.linalg.norm(np.array(centroid) - np.array(entry.centroid))
+                if dist > 300: # Significant jump -> likely ID reuse for new user
+                    logger.info(f"[QUEUE] Resetting Track {tid} (ID Reuse / Teleport Detected)")
+                    self.queue[tid] = QueueEntry(tid, centroid)
+                else:
+                    entry.last_seen_time = now
+                    entry.centroid = centroid
+
+        # 3. Cleanup Stale Entries (Leak Prevention & ID Reuse Handling)
+        to_remove = []
+        for tid, entry in self.queue.items():
+            if now - entry.last_seen_time > 2.0:
+                logger.info(f"[QUEUE] REMOVE Track {tid} (Stale)")
+                to_remove.append(tid)
         
-        # Cleanup stability for vehicles no longer in zone
-        active_ids = {v_id for v_id in vehicles_in_zone}
-        self.entry_stability = {id: count for id, count in self.entry_stability.items() if id in active_ids}
+        for tid in to_remove:
+            if tid in self.queue: del self.queue[tid]
+            if tid in self.entry_stability: del self.entry_stability[tid]
 
-        for v_id in vehicles_in_zone:
-            # Increment stability count
-            self.entry_stability[v_id] = self.entry_stability.get(v_id, 0) + 1
-            
-            # Join queue only if seen for > 5 frames (~0.2s)
-            if v_id not in queue_ids and self.entry_stability.get(v_id, 0) > 5:
-                print(f"Vehicle {v_id} stabilized in zone. Joining queue.")
-                self.queue.append({
-                    'id': v_id,
-                    'arrival_time': current_time,
-                    'last_seen': current_time
-                })
-            
-            # Update last seen for existing queue members
-            for v in self.queue:
-                if v['id'] == v_id:
-                    v['last_seen'] = current_time
-                    break
-
-        # 3. Prune Queue: Remove if lost from zone AND not reserved
-        # Also remove if reservation exists but vehicle is gone for a long time (safety)
-        self.queue = [
-            v for v in self.queue 
-            if (current_time - v['last_seen'] < 2.0) or (self.is_reserved(v['id']) and (current_time - v['last_seen'] < 10.0))
+    def update_suggestions(self, slots):
+        """
+        Global Allocation using Hungarian Algorithm (Linear Sum Assignment).
+        Advisory only.
+        """
+        now = time.monotonic()
+        
+        # 1. Filter Suggestable Slots
+        suggestable_slots = [
+            s for s in slots 
+            if s.state == SlotState.FREE and s.locked_track_id is None
         ]
         
-        return len(self.queue)
-
-    def is_reserved(self, vehicle_id):
-        for slot_idx, res in self.reservations.items():
-            if res['vehicle_id'] == vehicle_id:
-                return True
-        return False
-
-    def assign_slots(self, free_slots):
-        """
-        Assigns the next available vehicle to a free slot.
-        """
-        current_time = time.time()
+        # Filter Queue Entries
+        queue_list = sorted(self.queue.values(), key=lambda x: x.track_id)
         
-        # Check for slots that are FREE and NOT RESERVED
-        available_slots = [
-            s for s in free_slots 
-            if s not in self.reservations
-        ]
-
-        if not available_slots:
+        # GUARD: Clear all slot suggestions if no assignments possible (Issue 3)
+        if not suggestable_slots or not queue_list:
+            for s in slots:
+                s.suggested_track_id = None
+                s.suggestion_timestamp = 0.0
+            for entry in self.queue.values():
+                entry.assigned_slot = None
+                entry.priority_score = 0.0
             return
 
-        # Assign older unreserved vehicles to available slots
-        for v in self.queue:
-            # Only assign if not reserved AND seen recently (within 2s to handle low FPS)
-            if not self.is_reserved(v['id']):
-                time_since_seen = current_time - v['last_seen']
-                if time_since_seen < 2.0:
-                    if available_slots:
-                        slot_to_assign = available_slots.pop(0)
-                        self.reservations[slot_to_assign] = {
-                            'vehicle_id': v['id'],
-                            'timestamp': current_time
-                        }
-                        print(f"DEBUG: Reserved Slot {slot_to_assign + 1} for Vehicle {v['id']}")
-                else:
-                    print(f"DEBUG: Vehicle {v['id']} in queue but too stale ({time_since_seen:.1f}s) to assign.")
+        # Reset suggestions for non-suggestable slots
+        for s in slots:
+            if s not in suggestable_slots:
+                s.suggested_track_id = None
+                s.suggestion_timestamp = 0.0
 
-    def cleanup_reservations(self):
-        """
-        Timed-out reservations are returned to FREE.
-        """
-        current_time = time.time()
-        expired_slots = []
-        for slot_idx, res in self.reservations.items():
-            if current_time - res['timestamp'] > self.timeout:
-                print(f"Reservation expired for Slot {slot_idx + 1} (Vehicle {res['vehicle_id']})")
-                expired_slots.append(slot_idx)
+        # 2. Build Cost Matrix [Vehicles x Slots]
+        num_v = len(queue_list)
+        num_s = len(suggestable_slots)
+        cost_matrix = np.zeros((num_v, num_s))
         
-        for s in expired_slots:
-            del self.reservations[s]
+        for v_idx, entry in enumerate(queue_list):
+            for s_idx, slot in enumerate(suggestable_slots):
+                priority = self.priority_engine.compute_priority(entry, slot)
+                cost_matrix[v_idx, s_idx] = 1.0 - priority
 
-    def manage_reservations(self, slots):
-        """
-        Synchronizes the queue system with the Slot state machine.
-        - Assigns new reservations to FREE slots.
-        - Fulfills reservations if a car enters.
-        - Cleans up timed-out reservations.
-        """
-        current_time = time.time()
-        from .slot_state_machine import SlotState
+        # 3. Hungarian Assignment
+        row_ind, col_ind = linear_sum_assignment(cost_matrix)
+        
+        if num_v > num_s:
+            logger.info(f"[SUGGEST] Mismatch: {num_v} vehicles vs {num_s} slots. Some unassigned.")
 
-        # 1. Cleanup expired reservations
-        self.cleanup_reservations()
+        # Mapping for current assignments
+        current_assignments = {} # slot_id -> track_id
+        for v_idx, s_idx in zip(row_ind, col_ind):
+            slot = suggestable_slots[s_idx]
+            entry = queue_list[v_idx]
+            current_assignments[slot.slot_id] = entry.track_id
+            
+            # Temporary storage of priority for later application
+            entry._temp_priority = 1.0 - cost_matrix[v_idx, s_idx]
 
-        # 2. Assign reservations to FREE slots
-        # Get indices of slots that are truly FREE (no car, no reservation)
-        free_indices = [
-            i for i, s in enumerate(slots) 
-            if s.state == SlotState.FREE and i not in self.reservations
-        ]
-
-        # Try to assign (DISABLED for validation clarity)
-        # if free_indices:
-        #    self.assign_slots(free_indices)
-
-        # 3. Synchronize Slot Objects with Manager State
-        for i, slot in enumerate(slots):
-            if i in self.reservations:
-                # Manager says it's reserved
-                res = self.reservations[i]
+        # 4. Apply Hysteresis & Symmetry
+        for slot in suggestable_slots:
+            new_tid = current_assignments.get(slot.slot_id)
+            
+            # If we had a suggestion
+            if slot.suggested_track_id is not None:
+                # Break if vehicle lost
+                if slot.suggested_track_id not in self.queue:
+                    logger.info(f"[HYSTERESIS] CLEAR Slot {slot.slot_id+1} (Vehicle Lost)")
+                    slot.suggested_track_id = None
+                    slot.suggestion_timestamp = 0.0
+                # SMART HYSTERESIS: Only hold if still optimal (Issue 2 fix: Refresh timestamp)
+                elif now - slot.suggestion_timestamp < 3.0:
+                    if new_tid == slot.suggested_track_id:
+                        slot.suggestion_timestamp = now # Refresh lock for sticky optimal match
+                        continue 
+            
+            # Update suggestion
+            if new_tid != slot.suggested_track_id:
+                if new_tid is not None:
+                    logger.info(f"[SUGGEST] Slot {slot.slot_id+1} -> Track {new_tid}")
                 
-                if slot.state in [SlotState.ALIGNMENT_PENDING, SlotState.CHARGING, SlotState.MISALIGNED]:
-                    print(f"Slot {i+1}: Physical reservation fulfilled by Vehicle {slot.locked_track_id}")
-                    del self.reservations[i]
-                else:
-                    slot.set_state(SlotState.RESERVED)
-                    slot.reservation_id = res['vehicle_id']
-            elif hasattr(slot, 'reservation_id') and slot.reservation_id == -99:
-                # This is a Virtual Booking from the API
-                # If slot becomes occupied, clear the virtual booking from global state
-                if slot.state in [SlotState.ALIGNMENT_PENDING, SlotState.CHARGING, SlotState.MISALIGNED]:
-                    from main import G_STATE
-                    if i in G_STATE['virtual_bookings']:
-                        print(f"Slot {i+1}: Virtual booking for {G_STATE['virtual_bookings'][i]} fulfilled.")
-                        del G_STATE['virtual_bookings'][i]
-            else:
-                # Manager says NOT reserved
-                if slot.state == SlotState.RESERVED:
-                    # Slot thinks it's reserved, but manager cleared it (timeout or error)
-                    slot.set_state(SlotState.FREE)
-                    slot.reservation_id = None
+                slot.suggested_track_id = new_tid
+                slot.suggestion_timestamp = now
 
-    def get_slot_status(self, slot_idx, is_occupied_physically):
-        """
-        Returns (status_text, color)
-        """
-        # (Kept for backwards compatibility if needed, but main logic now in manage_reservations)
-        if is_occupied_physically:
-            return "Occupied", (0, 0, 255)
-        if slot_idx in self.reservations:
-            vid = self.reservations[slot_idx]['vehicle_id']
-            return f"Res: ID {vid}", (0, 255, 255)
-        return "Free", (0, 255, 0)
+        # Update QueueEntry fields based on final slot state (Issue 4: Reverse Map Optimization)
+        # 1. Create O(1) Reverse Map
+        reverse_map = {s.suggested_track_id: int(s.slot_id) for s in slots if s.suggested_track_id is not None}
+        
+        # 2. Apply to Entries (Issue 1: temp_priority cleanup)
+        for entry in self.queue.values():
+            suggested_slot_id = reverse_map.get(entry.track_id)
+            
+            if suggested_slot_id is not None:
+                entry.assigned_slot = suggested_slot_id
+                # Apply priority score if assigned
+                entry.priority_score = getattr(entry, '_temp_priority', 0.0)
+            else:
+                entry.assigned_slot = None
+                entry.priority_score = 0.0
+            
+            # Cleanup temp priority to prevent memory/state leak
+            if hasattr(entry, '_temp_priority'):
+                del entry._temp_priority
