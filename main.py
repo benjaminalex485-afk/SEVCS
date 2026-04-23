@@ -92,7 +92,15 @@ def release_lock(name, lock):
 # --- ATOMIC SNAPSHOT LAYER ---
 def get_system_snapshot():
     """Atomic multi-subsystem snapshot with strict lock ordering."""
-    snapshot = {}
+    snapshot = {
+        "timestamp": utils.now(),
+        "partial": {
+            "vision": False,
+            "session": False,
+            "booking": False,
+            "queue": False
+        }
+    }
     acquired = []
     
     # 1. Acquire all locks in order
@@ -110,8 +118,7 @@ def get_system_snapshot():
                 acquired.append(lock)
             else:
                 logger.warning(f"[SNAPSHOT] PARTIAL: Could not acquire {name}_lock")
-                snapshot["partial"] = True
-                break
+                snapshot["partial"][name] = True
         
         # 2. Extract Data (Primitive copies only)
         # --- VISION ---
@@ -287,7 +294,8 @@ def charging_simulation_loop():
 def main():
     detector = SlotDetector(CONFIG.get('model_path'), CONFIG.get('class_ids', [2, 3, 5, 7]))
     # tracker is already initialized/mocked at top level
-    queue_manager = QueueManager()
+    dist_norm = CONFIG.get("distance_normalization", 1500.0)
+    queue_manager = QueueManager(max_dist=dist_norm)
     alignment_engine = AlignmentEngine()
     visualizer = Visualizer()
     slots = [Slot(i, poly) for i, poly in enumerate(CONFIG.get('slots', []))]

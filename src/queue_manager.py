@@ -34,9 +34,9 @@ class QueueEntry:
         }
 
 class QueueManager:
-    def __init__(self):
+    def __init__(self, max_dist=1500.0):
         self.queue = {} # track_id -> QueueEntry
-        self.priority_engine = PriorityEngine()
+        self.priority_engine = PriorityEngine(max_dist)
         self.entry_stability = {} # track_id -> frames_seen
         self.zone_cache = {} # polygon_hash -> PolygonZone
 

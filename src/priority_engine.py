@@ -7,8 +7,8 @@ class PriorityEngine:
     W_DISTANCE = 0.1
     W_TYPE = 0.1
     
-    def __init__(self, frame_wh=(1280, 720)):
-        self.max_dist = np.sqrt(frame_wh[0]**2 + frame_wh[1]**2)
+    def __init__(self, max_dist=1500.0):
+        self.max_dist = max_dist
 
     def compute_priority(self, vehicle_entry, slot):
         """
