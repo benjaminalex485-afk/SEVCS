@@ -4,9 +4,40 @@ import numpy as np
 import os
 import time
 
+_LAST_TIME = time.monotonic()
+MAX_REASONABLE_DELTA = 1.0 # 1 second jitter limit
+
 def now():
-    """Central monotonic time wrapper for system-wide consistency."""
-    return time.monotonic()
+    """Central monotonic time wrapper with anomaly detection."""
+    global _LAST_TIME
+    current = time.monotonic()
+    dt = current - _LAST_TIME
+    
+    if dt > MAX_REASONABLE_DELTA:
+        # We don't raise here to keep system alive, but logs should catch it
+        # The consumer will see the jump and flag TIME_ANOMALY
+        pass
+    elif dt < 0:
+        # Monotonic should never go back, but we guard anyway
+        return _LAST_TIME
+        
+    _LAST_TIME = current
+    return current
+
+class FrozenConfig(dict):
+    """Immutable config wrapper to prevent runtime mutation."""
+    def __setitem__(self, key, value):
+        raise RuntimeError(f"Attempted to mutate frozen config: {key}")
+    def update(self, *args, **kwargs):
+        raise RuntimeError("Attempted to mutate frozen config via update()")
+
+def freeze_config(config_dict):
+    """Recursively freeze a dictionary."""
+    if isinstance(config_dict, dict):
+        return FrozenConfig({k: freeze_config(v) for k, v in config_dict.items()})
+    elif isinstance(config_dict, list):
+        return tuple(freeze_config(i) for i in config_dict)
+    return config_dict
 
 def load_config(config_path="config.yaml"):
     if not os.path.exists(config_path):

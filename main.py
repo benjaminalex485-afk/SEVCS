@@ -41,6 +41,8 @@ utils.validate_config(CONFIG)
 ALIGN_THRESHOLD = 0.75
 AUTH_WINDOW = 1.0 # Early authorization window to eliminate API race conditions
 STRICT_MODE = CONFIG.get("strict_mode", False)
+# Freeze configuration after initial load and validation
+CONFIG = utils.freeze_config(CONFIG)
 
 # --- LOGGING CONFIG ---
 logging.basicConfig(
@@ -54,28 +56,39 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # --- STRUCTURED SYSTEM STATE ---
-class SystemState:
+from src.industrial_utils import SystemMode, ReasonCode, IndustrialMetrics
+import collections
+
+class GlobalState:
     def __init__(self):
-        # Granular Locks
-        self.vision_lock = threading.RLock()
-        self.booking_lock = threading.RLock()
-        self.session_lock = threading.RLock()
-        self.queue_lock = threading.RLock()
+        self.slots = []
+        self.queue_manager = None
+        self.camera_online = False
+        self.last_vision_heartbeat = 0
         
-        # State Data
-        self.slots = []             # List of Slot objects
+        # Concurrency
+        self.vision_lock = threading.Lock()
+        self.session_lock = threading.Lock()
+        self.queue_lock = threading.Lock()
+        
+        # Stage 4.1/4.2 Industrial Layer
+        self.mode = SystemMode.FULL
+        self.mode_reason = ReasonCode.NONE
+        self.metrics = IndustrialMetrics(window_size=300)
+        self.snapshot_buffer = collections.deque(maxlen=100) # ~3-5s history
+        self.is_forensic_frozen = False
+        self.freeze_start_time = 0.0
+        
+        # Authentication
         self.auth_engine = AuthEngine()
         self.sessions = {}          # slot_idx -> {battery_pct, power, energy, start_time}
-        self.queue_manager = None   # QueueManager instance
-        self.last_vision_heartbeat = utils.now()
-        self.camera_online = False
         
         self.users_db = [
             {"username": "admin", "password": "admin", "role": "admin"},
             {"username": "user", "password": "user", "role": "user"}
         ]
 
-G_STATE = SystemState()
+G_STATE = GlobalState()
 
 # --- HARDENING HELPERS ---
 def acquire_lock(name, lock):
@@ -90,10 +103,11 @@ def release_lock(name, lock):
     lock.release()
 
 # --- ATOMIC SNAPSHOT LAYER ---
-def get_system_snapshot():
+def get_system_snapshot(debug=False):
     """Atomic multi-subsystem snapshot with strict lock ordering."""
     snapshot = {
         "timestamp": utils.now(),
+        "snapshot_id": G_STATE.metrics.next_snapshot_id(),
         "partial": {
             "vision": False,
             "session": False,
@@ -124,9 +138,21 @@ def get_system_snapshot():
         # --- VISION ---
         snapshot["camera_online"] = G_STATE.camera_online
         snapshot["last_heartbeat"] = G_STATE.last_vision_heartbeat
+        snapshot["mode"] = G_STATE.mode.name
+        snapshot["mode_reason"] = G_STATE.mode_reason.name
         
         # --- SLOTS ---
-        snapshot["slots"] = [s.to_dict() for s in G_STATE.slots]
+        snapshot["slots"] = []
+        for s in G_STATE.slots:
+            s_dict = s.to_dict()
+            if debug:
+                # Add extra industrial fields
+                s_dict["industrial"] = {
+                    "hold_track": int(s.hold_track_id) if s.hold_track_id is not None else None,
+                    "hold_conf": float(s.hold_confidence),
+                    "consistency": int(G_STATE.queue_manager.consistency_counters.get((s.slot_id, s.suggested_track_id), 0)) if G_STATE.queue_manager else 0
+                }
+            snapshot["slots"].append(s_dict)
         
         # --- AUTH/BOOKING ---
         auth_data = G_STATE.auth_engine.to_dict()
@@ -136,6 +162,11 @@ def get_system_snapshot():
         snapshot["suggestions"] = []
         if G_STATE.queue_manager:
             snapshot["suggestions"] = G_STATE.queue_manager.get_suggestions_snapshot()
+            if debug:
+                snapshot["intelligence"] = {
+                    "health": float(G_STATE.queue_manager.system_health),
+                    "thrash_rate": float(G_STATE.queue_manager.thrash_rate)
+                }
             
     except Exception as e:
         logger.error(f"SNAPSHOT ERROR: {e}")
@@ -154,19 +185,78 @@ CORS(api_app)
 def get_status():
     return jsonify(get_system_snapshot())
 
+# --- OPERATIONAL SAFETY: RATE LIMITING ---
+class TokenBucket:
+    def __init__(self, capacity, refill_rate):
+        self.capacity = capacity
+        self.refill_rate = refill_rate
+        self.tokens = capacity
+        self.last_refill = utils.now()
+        self.lock = threading.Lock()
+
+    def consume(self, count=1):
+        with self.lock:
+            now = utils.now()
+            dt = now - self.last_refill
+            self.tokens = min(self.capacity, self.tokens + dt * self.refill_rate)
+            self.last_refill = now
+            if self.tokens >= count:
+                self.tokens -= count
+                return True
+            return False
+
+GLOBAL_LIMITER = TokenBucket(100, 10) # 100 burst, 10/sec refill
+IP_LIMITERS = collections.defaultdict(lambda: TokenBucket(20, 2)) # 20 burst, 2/sec refill
+
+def rate_limit(endpoint_name):
+    """Decorator for rate limiting."""
+    def decorator(f):
+        @wraps(f)
+        def wrapped(*args, **kwargs):
+            ip = request.remote_addr
+            
+            # 1. Global Bypass for Priority APIs
+            priority_endpoints = ["authorize"]
+            if endpoint_name in priority_endpoints:
+                # Still check per-IP for security, but skip global cap
+                pass
+            elif not GLOBAL_LIMITER.consume():
+                return jsonify({"status": "error", "code": "global_rate_limit"}), 429
+            
+            # 2. Per-IP Check
+            if not IP_LIMITERS[ip].consume():
+                return jsonify({"status": "error", "code": "rate_limit"}), 429
+                
+            return f(*args, **kwargs)
+        return wrapped
+    return decorator
+
+from functools import wraps
+
 @api_app.route('/api/suggestions', methods=['GET'])
+@rate_limit("suggestions")
 def get_suggestions():
-    snapshot = get_system_snapshot()
-    suggestions = []
-    for s in snapshot["slots"]:
-        suggestions.append({
-            "slot_id": s["slot_id"],
-            "track_id": s["suggestion"]["track_id"],
-            "confidence": s["suggestion"]["confidence"],
-            "stable_for": s["suggestion"]["stable_for"],
-            "state": s["suggestion"]["state"]
-        })
-    return jsonify(suggestions)
+    debug = request.args.get('debug', 'false').lower() == 'true'
+    snapshot = get_system_snapshot(debug=debug)
+    return jsonify(snapshot)
+
+@api_app.route('/api/forensics', methods=['GET'])
+@rate_limit("forensics")
+def get_forensics():
+    return jsonify(list(G_STATE.snapshot_buffer))
+
+@api_app.route('/api/forensics/freeze', methods=['POST'])
+@rate_limit("forensics")
+def freeze_forensics():
+    G_STATE.is_forensic_frozen = True
+    G_STATE.freeze_start_time = utils.now()
+    return jsonify({"status": "frozen", "expiry": 60})
+
+@api_app.route('/api/forensics/unfreeze', methods=['POST'])
+@rate_limit("forensics")
+def unfreeze_forensics():
+    G_STATE.is_forensic_frozen = False
+    return jsonify({"status": "rolling"})
 
 @api_app.route('/api/queue', methods=['GET'])
 def get_queue_api():
@@ -248,7 +338,7 @@ def authorize_api():
     slot_id, code = data.get('slot_id'), data.get('code')
     if slot_id is None or code is None: return jsonify({"status": "error", "message": "Missing slot_id or code"}), 400
     idx = slot_id - 1
-    now_mono = utils.now()
+    loop_start = utils.now()
     
     with G_STATE.vision_lock:
         if idx < 0 or idx >= len(G_STATE.slots): return jsonify({"status": "error", "code": "wrong_slot"}), 400
@@ -256,7 +346,7 @@ def authorize_api():
         
         # STABILIZED STAGE 2: Early Authorization Window
         is_pending = (slot.state == SlotState.AUTH_PENDING)
-        is_early_window = (slot.state == SlotState.ALIGNMENT_PENDING and (now_mono - slot.state_enter_time <= AUTH_WINDOW))
+        is_early_window = (slot.state == SlotState.ALIGNMENT_PENDING and (loop_start - slot.state_enter_time <= AUTH_WINDOW))
         
         if not (is_pending or is_early_window):
             return jsonify({"status": "error", "code": "stale_request"}), 400
@@ -312,9 +402,26 @@ def main():
     
     logger.info(f"System Ready. Mode: {'FAKE' if USE_FAKE_INPUT else 'REAL'} | Scenario: {ACTIVE_SCENARIO if USE_FAKE_INPUT else 'N/A'}")
     
-    last_heartbeat = 0
+    last_loop_time = utils.now()
     while True:
-        now_mono = utils.now()
+        loop_start = utils.now()
+        dt = loop_start - last_loop_time
+        last_loop_time = loop_start
+        
+        # 1. Latency Watchdog
+        G_STATE.metrics.record_latency(dt)
+        p95_latency = G_STATE.metrics.get_latency_p95()
+        
+        if p95_latency > 0.8: # SAFE Trigger
+            G_STATE.mode = SystemMode.SAFE
+            G_STATE.mode_reason = ReasonCode.SYSTEM_STALL
+        elif p95_latency > 0.4: # SOFT_SAFE Trigger
+            G_STATE.mode = SystemMode.SOFT_SAFE
+            G_STATE.mode_reason = ReasonCode.SYSTEM_STALL
+        elif p95_latency > 0.2: # WARN
+            if G_STATE.metrics.snapshot_id % 30 == 0:
+                logger.warning(f"[STALL] Loop Latency High: {p95_latency:.3f}s")
+        
         if USE_FAKE_INPUT:
             # Simulate 30 FPS and give other threads (API/Simulation) time to acquire locks
             time.sleep(0.033)
@@ -328,7 +435,7 @@ def main():
         
         # --- ATOMIC FRAME PROCESSING ---
         with G_STATE.vision_lock:
-            G_STATE.last_vision_heartbeat = now_mono
+            G_STATE.last_vision_heartbeat = loop_start
             current_track_ids = set(detections.tracker_id) if detections.tracker_id is not None else set()
             for tid in current_track_ids:
                 track_ages[tid] = track_ages.get(tid, 0) + 1
@@ -396,7 +503,7 @@ def main():
                             is_expired = G_STATE.auth_engine.is_expired(s_idx)
                             
                             timeout = CONFIG.get('auth_timeout', 60.0)
-                            if now_mono - slot.state_enter_time > timeout:
+                            if loop_start - slot.state_enter_time > timeout:
                                 logger.warning(f"[AUTH] REVOKE: TIMEOUT for Slot {s_idx+1}")
                                 G_STATE.auth_engine.revoke_authorization(s_idx)
                                 slot.set_state(SlotState.FREE)
@@ -455,8 +562,8 @@ def main():
 
                 if i not in matched_slots:
                     if slot.state == SlotState.AUTH_PENDING:
-                        if not hasattr(slot, 'departure_time'): slot.departure_time = now_mono
-                        if now_mono - slot.departure_time > 1.0:
+                        if not hasattr(slot, 'departure_time'): slot.departure_time = loop_start
+                        if loop_start - slot.departure_time > 1.0:
                             logger.warning(f"[AUTH] REVOKE: VEHICLE_LEFT for Slot {i+1}")
                             G_STATE.auth_engine.revoke_authorization(i)
                             slot.set_state(SlotState.FREE)
@@ -464,6 +571,25 @@ def main():
                         if hasattr(slot, 'departure_time'): del slot.departure_time
                     if slot.state not in [SlotState.FREE, SlotState.RESERVED]:
                         slot.handle_occlusion(True)
+
+            # --- FINAL SANITY ASSERTIONS ---
+            active_ids = set()
+            for s_idx, s in enumerate(G_STATE.slots):
+                if s.locked_track_id is not None:
+                    if s.locked_track_id in active_ids:
+                        logger.error(f"[INVARIANT] Duplicate ID {s.locked_track_id} on Slot {s_idx+1}")
+                        s.force_safe_state()
+                    active_ids.add(s.locked_track_id)
+            
+        # 2. Snapshot Replay Buffer (End of Loop)
+        if not G_STATE.is_forensic_frozen:
+            snapshot = get_system_snapshot(debug=True)
+            G_STATE.snapshot_buffer.append(snapshot)
+        else:
+            # Auto-unfreeze safety (60s)
+            if utils.now() - G_STATE.freeze_start_time > 60.0:
+                logger.warning("[FORENSICS] Auto-unfreezing buffer (Timeout)")
+                G_STATE.is_forensic_frozen = False
 
         if not USE_FAKE_INPUT:
             frame = visualizer.draw_overlays(frame, G_STATE.slots, CONFIG.get('queue_zones', []), {})

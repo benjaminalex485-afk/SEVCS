@@ -49,11 +49,16 @@ class Slot:
         self.track_age = 0
         self.safety_flag = False
         
-        # Stage 3: Suggestions & Trust
+        # Stage 3/4: Suggestions & Hardening
         self.suggested_track_id = None
         self.suggestion_timestamp = 0.0
         self.suggestion_confidence = 0.0
         self.suggestion_state = SuggestionState.SOFT
+        
+        self.hold_track_id = None
+        self.hold_start_time = 0.0
+        self.hold_confidence = 0.0
+        self.hold_frames = 0
         
         # Alignment
         self.alignment_state = AlignmentState.UNSTABLE
@@ -65,14 +70,35 @@ class Slot:
         self.misalignment_timer = 0.0
         self.occlusion_timer = 0.0
         self.state_enter_time = utils.now()
+        self.last_update_time = utils.now()
+
+    def update_hold(self):
+        """FPS-aware HOLD decay logic."""
+        if self.hold_track_id is None:
+            return
+
+        now = utils.now()
+        dt = now - self.last_update_time
+        self.last_update_time = now
+        
+        # Exponential decay: ~10 frame half-life at 30 FPS (k=2.0)
+        self.hold_confidence *= np.exp(-2.0 * dt)
+        self.hold_frames += 1
+        
+        # Expiry: Time-based (max ~500ms) or frame-based (max 10)
+        if self.hold_frames > 10 or now - self.hold_start_time > 0.5:
+            logger.debug(f"[Slot {self.slot_id+1}] HOLD Expired for Track {self.hold_track_id}")
+            self.hold_track_id = None
+            self.hold_confidence = 0.0
+            self.hold_frames = 0
 
     def to_dict(self):
         """Deep isolation snapshot: returns primitive types only."""
         return {
             "slot_id": int(self.slot_id),
             "state": self.state.name,
-            "locked_track_id": self.locked_track_id,
-            "assigned_track_id": self.assigned_track_id,
+            "locked_track_id": int(self.locked_track_id) if self.locked_track_id is not None else None,
+            "assigned_track_id": int(self.assigned_track_id) if self.assigned_track_id is not None else None,
             "alignment_state": self.alignment_state.name,
             "alignment_score": float(self.alignment_score),
             "smoothed_alignment_score": float(self.smoothed_alignment_score),
