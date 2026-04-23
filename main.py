@@ -55,17 +55,17 @@ logger = logging.getLogger(__name__)
 class SystemState:
     def __init__(self):
         # Granular Locks
-        self.vision_lock = threading.Lock()
-        self.booking_lock = threading.Lock()
-        self.session_lock = threading.Lock()
-        self.queue_lock = threading.Lock()
+        self.vision_lock = threading.RLock()
+        self.booking_lock = threading.RLock()
+        self.session_lock = threading.RLock()
+        self.queue_lock = threading.RLock()
         
         # State Data
         self.slots = []             # List of Slot objects
         self.auth_engine = AuthEngine()
         self.sessions = {}          # slot_idx -> {battery_pct, power, energy, start_time}
         self.queue_manager = None   # QueueManager instance
-        self.last_vision_heartbeat = time.monotonic()
+        self.last_vision_heartbeat = utils.now()
         self.camera_online = False
         
         self.users_db = [
@@ -74,38 +74,67 @@ class SystemState:
         ]
 
 G_STATE = SystemState()
+CONFIG = utils.load_config()
+utils.validate_config(CONFIG)
+
+# --- HARDENING HELPERS ---
+def acquire_lock(name, lock):
+    """Debug-only lock ordering enforcement."""
+    if CONFIG.get("debug_locks", False):
+        logger.debug(f"[LOCK] Acquiring {name}")
+    lock.acquire()
+
+def release_lock(name, lock):
+    if CONFIG.get("debug_locks", False):
+        logger.debug(f"[LOCK] Releasing {name}")
+    lock.release()
 
 # --- ATOMIC SNAPSHOT LAYER ---
 def get_system_snapshot():
-    snapshot = {
-        "sys": { "timestamp": time.time() },
-        "slots": [],
-        "queue": []
-    }
-    with G_STATE.vision_lock:
-        snapshot["sys"]["camera_online"] = G_STATE.camera_online
-        snapshot["sys"]["vision_heartbeat"] = G_STATE.last_vision_heartbeat
-        for i, slot in enumerate(G_STATE.slots):
-            data = {
-                "id": i + 1, "state": slot.state.name, "alignment": slot.alignment_state.name,
-                "type": "Standard", "state_enter_time": slot.state_enter_time
-            }
-            with G_STATE.auth_engine.lock:
-                data["booking"] = copy.deepcopy(G_STATE.auth_engine.bookings.get(i))
-            with G_STATE.session_lock:
-                data["session"] = copy.deepcopy(G_STATE.sessions.get(i))
-            snapshot["slots"].append(data)
-    with G_STATE.queue_lock:
+    """Atomic multi-subsystem snapshot with strict lock ordering."""
+    snapshot = {}
+    acquired = []
+    
+    # 1. Acquire all locks in order
+    locks = [
+        ("vision", G_STATE.vision_lock),
+        ("session", G_STATE.session_lock),
+        ("booking", G_STATE.auth_engine.lock),
+        ("queue", G_STATE.queue_lock)
+    ]
+    
+    try:
+        for name, lock in locks:
+            if lock.acquire(timeout=2.0):
+                acquired.append(lock)
+            else:
+                logger.error(f"LOCK TIMEOUT: {name} - Returning partial snapshot")
+                break
+        
+        # 2. Extract Data (Primitive copies only)
+        # --- VISION ---
+        snapshot["camera_online"] = G_STATE.camera_online
+        snapshot["last_heartbeat"] = G_STATE.last_vision_heartbeat
+        
+        # --- SLOTS ---
+        snapshot["slots"] = [s.to_dict() for s in G_STATE.slots]
+        
+        # --- AUTH/BOOKING ---
+        auth_data = G_STATE.auth_engine.to_dict()
+        snapshot["bookings"] = auth_data.get("bookings", {})
+        
+        # --- QUEUE ---
+        snapshot["suggestions"] = []
         if G_STATE.queue_manager:
-            for tid, entry in G_STATE.queue_manager.queue.items():
-                snapshot["queue"].append({
-                    "track_id": int(tid), 
-                    "arrival": entry.arrival_time,
-                    "priority": entry.priority_score,
-                    "suggestion": int(entry.assigned_slot) if entry.assigned_slot is not None else None
-                })
-    snapshot["sys"]["queue_count"] = len(snapshot["queue"])
-    snapshot["sys"]["charging_count"] = sum(1 for s in snapshot["slots"] if s["state"] == "CHARGING")
+            snapshot["suggestions"] = G_STATE.queue_manager.get_suggestions_snapshot()
+            
+    except Exception as e:
+        logger.error(f"SNAPSHOT ERROR: {e}")
+    finally:
+        # Release in REVERSE order
+        for lock in reversed(acquired):
+            lock.release()
+        
     return snapshot
 
 # --- API SERVER ---
@@ -115,6 +144,21 @@ CORS(api_app)
 @api_app.route('/api/status', methods=['GET'])
 def get_status():
     return jsonify(get_system_snapshot())
+
+@api_app.route('/api/suggestions', methods=['GET'])
+def get_suggestions():
+    snapshot = get_system_snapshot()
+    # Extract minimal suggestion schema
+    suggestions = []
+    for s in snapshot["slots"]:
+        suggestions.append({
+            "slot_id": s["slot_id"],
+            "track_id": s["suggestion"]["track_id"],
+            "confidence": s["suggestion"]["confidence"],
+            "stable_for": s["suggestion"]["stable_for"],
+            "state": s["suggestion"]["state"]
+        })
+    return jsonify(suggestions)
 
 @api_app.route('/api/queue', methods=['GET'])
 def get_queue_api():
@@ -197,14 +241,21 @@ def authorize_api():
         if idx < 0 or idx >= len(G_STATE.slots): return jsonify({"status": "error", "code": "wrong_slot"}), 400
         slot = G_STATE.slots[idx]
         
-        # STABILIZED STAGE 2: Early Authorization Window (Fix with strict boundary)
+        # STABILIZED STAGE 2: Early Authorization Window
         is_pending = (slot.state == SlotState.AUTH_PENDING)
         is_early_window = (slot.state == SlotState.ALIGNMENT_PENDING and (now_mono - slot.state_enter_time <= AUTH_WINDOW))
         
         if not (is_pending or is_early_window):
             return jsonify({"status": "error", "code": "stale_request"}), 400
             
-        if slot.locked_track_id is None: return jsonify({"status": "error", "code": "no_vehicle"}), 400
+        if slot.locked_track_id is None:
+            return jsonify({"status": "error", "code": "no_vehicle"}), 400
+            
+        # STAGE 3.5: Occlusion Debounce Safety
+        if slot.is_in_occlusion_debounce():
+            logger.warning(f"[AUTH] REJECTED Early Auth for Slot {idx+1}: UNSTABLE_TRACK (Occluded)")
+            return jsonify({"status": "error", "code": "unstable_track"}), 400
+            
         current_track_id = slot.locked_track_id
         
     status, is_idempotent = G_STATE.auth_engine.authorize_vehicle(idx, code, current_track_id)
@@ -248,8 +299,9 @@ def main():
     
     logger.info(f"System Ready. Mode: {'FAKE' if USE_FAKE_INPUT else 'REAL'} | Scenario: {ACTIVE_SCENARIO if USE_FAKE_INPUT else 'N/A'}")
     
+    last_heartbeat = 0
     while True:
-        now_mono = time.monotonic()
+        now_mono = utils.now()
         if USE_FAKE_INPUT:
             frame = np.zeros((720, 1280, 3), dtype=np.uint8)
             detections = engine.get_detections()
@@ -260,60 +312,77 @@ def main():
             if not ret: break
             detections = tracker.update_with_detections(detector.detect(frame, conf=0.15))
         
+        # --- ATOMIC FRAME PROCESSING ---
         with G_STATE.vision_lock:
             G_STATE.last_vision_heartbeat = now_mono
-        
-        current_track_ids = detections.tracker_id if detections.tracker_id is not None else []
-        for tid in current_track_ids:
-            track_ages[tid] = track_ages.get(tid, 0) + 1
-        
-        # --- QUEUE MANAGEMENT (STAGE 3) ---
-        with G_STATE.queue_lock:
-            if G_STATE.queue_manager:
-                G_STATE.queue_manager.update_queue(detections, [QUEUE_ZONE_POLYGON])
-                G_STATE.queue_manager.update_suggestions(slots)
-        
-        # --- ASSIGNMENT ---
-        matched_slots = set()
-        if len(detections) > 0:
-            costs = np.zeros((len(detections), len(slots)))
-            overlaps = np.zeros((len(detections), len(slots)))
-            centroid_scores = np.zeros((len(detections), len(slots)))
-            MAX_MATCH_COST = 0.6
+            current_track_ids = set(detections.tracker_id) if detections.tracker_id is not None else set()
+            for tid in current_track_ids:
+                track_ages[tid] = track_ages.get(tid, 0) + 1
             
-            for d_idx in range(len(detections)):
-                det_xyxy = detections.xyxy[d_idx]
-                det_center = ((det_xyxy[0] + det_xyxy[2]) / 2, (det_xyxy[1] + det_xyxy[3]) / 2)
-                for s_idx, slot in enumerate(slots):
-                    overlap = alignment_engine.calculate_overlap(detections.mask[d_idx], slot.polygon, resolution_wh) if detections.mask is not None else 0.0
-                    overlaps[d_idx, s_idx] = overlap
-                    dist = np.linalg.norm(np.array(det_center) - np.array(slot.centroid))
-                    centroid_score = 1.0 - (dist / max_diag)
-                    centroid_scores[d_idx, s_idx] = centroid_score
-                    costs[d_idx, s_idx] = 0.7 * (1.0 - overlap) + 0.3 * (1.0 - centroid_score)
+            # --- DEFENSIVE GUARD: Clear Stale Assignments ---
+            for slot in slots:
+                if slot.assigned_track_id is not None and slot.assigned_track_id not in current_track_ids:
+                    slot.assigned_track_id = None
+
+            # --- QUEUE MANAGEMENT (STAGE 3) ---
+            with G_STATE.queue_lock:
+                if G_STATE.queue_manager:
+                    # Correct nesting: CONFIG['queue_zone']['polygon'] is a list of points [[x,y],...]
+                    q_zone = CONFIG.get("queue_zone", {}).get("polygon", QUEUE_ZONE_POLYGON)
+                    G_STATE.queue_manager.update_queue(detections, [q_zone])
+                    G_STATE.queue_manager.update_suggestions(slots)
             
-            row_ind, col_ind = linear_sum_assignment(costs)
-            
-            with G_STATE.vision_lock:
+            # --- ASSIGNMENT ---
+            matched_slots = set()
+            if len(detections) > 0:
+                costs = np.zeros((len(detections), len(slots)))
+                overlaps = np.zeros((len(detections), len(slots)))
+                centroid_scores = np.zeros((len(detections), len(slots)))
+                MAX_MATCH_COST = 0.6
+                
+                for d_idx in range(len(detections)):
+                    det_xyxy = detections.xyxy[d_idx]
+                    det_center = ((det_xyxy[0] + det_xyxy[2]) / 2, (det_xyxy[1] + det_xyxy[3]) / 2)
+                    for s_idx, slot in enumerate(slots):
+                        overlap = alignment_engine.calculate_overlap(detections.mask[d_idx], slot.polygon, resolution_wh) if detections.mask is not None else 0.0
+                        overlaps[d_idx, s_idx] = overlap
+                        dist = np.linalg.norm(np.array(det_center) - np.array(slot.centroid))
+                        centroid_score = 1.0 - (dist / max_diag)
+                        centroid_scores[d_idx, s_idx] = centroid_score
+                        costs[d_idx, s_idx] = 0.7 * (1.0 - overlap) + 0.3 * (1.0 - centroid_score)
+                
+                row_ind, col_ind = linear_sum_assignment(costs)
+                assigned_this_frame = {} # tid -> slot_idx
+                
                 for d_idx, s_idx in zip(row_ind, col_ind):
                     if costs[d_idx, s_idx] <= MAX_MATCH_COST:
                         slot = slots[s_idx]
-                        vehicle_track_id = detections.tracker_id[d_idx]
-                        overlap = overlaps[d_idx, s_idx]
-                        c_score = centroid_scores[d_idx, s_idx]
+                        tid = detections.tracker_id[d_idx]
+                        
+                        # INVARIANT: Assignment Uniqueness
+                        if tid in assigned_this_frame:
+                            if CONFIG.get("strict_mode", False):
+                                raise RuntimeError("Duplicate assignment detected")
+                            else:
+                                slot.force_safe_state()
+                                slots[assigned_this_frame[tid]].force_safe_state()
+                                continue
+                        
+                        assigned_this_frame[tid] = s_idx
                         matched_slots.add(s_idx)
                         
+                        overlap = overlaps[d_idx, s_idx]
+                        c_score = centroid_scores[d_idx, s_idx]
                         final_score = 0.7 * overlap + 0.3 * c_score
                         slot.update_alignment(final_score, {"overlap_ratio": overlap, "centroid_score": c_score})
                         
-                        # --- STATE MACHINE (STAGE 1 & 2) ---
+                        # --- STATE MACHINE ---
                         if slot.state == SlotState.AUTH_PENDING:
-                            is_auth, reason = G_STATE.auth_engine.is_authorized(s_idx, vehicle_track_id)
+                            is_auth, reason = G_STATE.auth_engine.is_authorized(s_idx, tid)
                             has_booking = (s_idx in G_STATE.auth_engine.bookings)
                             is_expired = G_STATE.auth_engine.is_expired(s_idx)
                             
-                            # ISSUE 2: Config-driven timeout
-                            timeout = config.get('auth_timeout', 60.0)
+                            timeout = CONFIG.get('auth_timeout', 60.0)
                             if now_mono - slot.state_enter_time > timeout:
                                 logger.warning(f"[AUTH] REVOKE: TIMEOUT for Slot {s_idx+1}")
                                 G_STATE.auth_engine.revoke_authorization(s_idx)
@@ -330,51 +399,52 @@ def main():
                                 is_aligned = (slot.alignment_state == AlignmentState.ALIGNED and slot.smoothed_alignment_score >= ALIGN_THRESHOLD)
                                 if is_aligned:
                                     logger.info(f"[AUTH] PENDING -> ACTIVE for Slot {s_idx+1}")
-                                    slot.set_state(SlotState.AUTH_ACTIVE, track_id=vehicle_track_id)
+                                    slot.set_state(SlotState.AUTH_ACTIVE, track_id=tid)
 
                         elif slot.state in [SlotState.FREE, SlotState.RESERVED]:
-                            slot.set_state(SlotState.ALIGNMENT_PENDING, track_id=vehicle_track_id)
+                            slot.set_state(SlotState.ALIGNMENT_PENDING, track_id=tid)
                         elif slot.state == SlotState.ALIGNMENT_PENDING:
                             if slot.alignment_state == AlignmentState.ALIGNED and slot.smoothed_alignment_score >= ALIGN_THRESHOLD:
-                                slot.set_state(SlotState.AUTH_PENDING, track_id=vehicle_track_id)
+                                slot.set_state(SlotState.AUTH_PENDING, track_id=tid)
                         
                         elif slot.state == SlotState.AUTH_ACTIVE:
-                            is_auth, reason = G_STATE.auth_engine.is_authorized(s_idx, vehicle_track_id)
+                            is_auth, reason = G_STATE.auth_engine.is_authorized(s_idx, tid)
                             is_aligned = (slot.alignment_state == AlignmentState.ALIGNED and slot.smoothed_alignment_score >= ALIGN_THRESHOLD)
                             if not is_auth:
-                                log_tag = "EXPIRED" if reason == "EXPIRED" else "ID_MISMATCH"
-                                logger.warning(f"[AUTH] REVOKE: {log_tag} during AUTH_ACTIVE for Slot {s_idx+1}")
+                                logger.warning(f"[AUTH] REVOKE: {reason} during AUTH_ACTIVE for Slot {s_idx+1}")
                                 G_STATE.auth_engine.revoke_authorization(s_idx)
                                 slot.set_state(SlotState.FREE)
                             elif not is_aligned:
                                 logger.warning(f"[AUTH] REVOKE: MISALIGNED during AUTH_ACTIVE for Slot {s_idx+1}")
                                 G_STATE.auth_engine.revoke_authorization(s_idx)
-                                slot.set_state(SlotState.ALIGNMENT_PENDING, track_id=vehicle_track_id)
+                                slot.set_state(SlotState.ALIGNMENT_PENDING, track_id=tid)
                             else:
-                                if slot.set_state(SlotState.CHARGING, track_id=vehicle_track_id):
+                                if slot.set_state(SlotState.CHARGING, track_id=tid):
                                     G_STATE.auth_engine.consume_booking(s_idx)
-                                    logger.info(f"VALIDATED Slot {s_idx+1}")
-                                    with G_STATE.queue_lock:
-                                        if G_STATE.queue_manager and vehicle_track_id in G_STATE.queue_manager.queue:
-                                            entry = G_STATE.queue_manager.queue[vehicle_track_id]
-                                            entry.booking_id = s_idx
+                                    logger.info(f"[AUTH] AUTH_ACTIVE -> CHARGING for Slot {s_idx+1}")
+                                    logger.info(f"VALIDATED Session Start for Slot {s_idx+1}")
 
                         elif slot.state == SlotState.CHARGING:
-                            is_auth, _ = G_STATE.auth_engine.is_authorized(s_idx, vehicle_track_id)
+                            is_auth, _ = G_STATE.auth_engine.is_authorized(s_idx, tid)
                             is_aligned = (slot.alignment_state == AlignmentState.ALIGNED and slot.smoothed_alignment_score >= ALIGN_THRESHOLD)
                             if not is_auth or not is_aligned:
                                 logger.warning(f"[AUTH] SESSION TERMINATED for Slot {s_idx+1}")
                                 slot.set_state(SlotState.FREE)
                         slot.handle_occlusion(False)
 
-        # MANDATORY FIX: Departure handling MUST run every frame, even with 0 detections
-        with G_STATE.vision_lock:
+            # --- DEPARTURE & GHOST RECOVERY ---
             for i, slot in enumerate(slots):
+                # Ghost Charging check
+                if slot.state == SlotState.CHARGING and slot.locked_track_id is None:
+                    logger.critical(f"[INVARIANT] Ghost Charging on Slot {i+1} -> FORCED RESET")
+                    slot.force_safe_state()
+                    G_STATE.auth_engine.revoke_authorization(i)
+
                 if i not in matched_slots:
                     if slot.state == SlotState.AUTH_PENDING:
                         if not hasattr(slot, 'departure_time'): slot.departure_time = now_mono
                         if now_mono - slot.departure_time > 1.0:
-                            logger.warning(f"[AUTH] REVOKE: VEHICLE_LEFT (Confirmed) for Slot {i+1}")
+                            logger.warning(f"[AUTH] REVOKE: VEHICLE_LEFT for Slot {i+1}")
                             G_STATE.auth_engine.revoke_authorization(i)
                             slot.set_state(SlotState.FREE)
                     else:
@@ -389,7 +459,7 @@ def main():
             cv2.imshow("Smart EV Charging", frame)
             if cv2.waitKey(1) & 0xFF == ord('q'): break
         else:
-            time.sleep(0.001)
+            time.sleep(0.033)
 
     if cap: cap.release()
     cv2.destroyAllWindows()

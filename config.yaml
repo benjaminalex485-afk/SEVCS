@@ -7,21 +7,27 @@ class_ids:
 conf_threshold: 0.15
 model_path: models/yolov8n-seg.pt
 
-# Timing & Policy
+# Hardening & Policy
+strict_mode: False
+debug_locks: False
+distance_normalization: 1500.0
 auth_timeout: 60.0
 booking_timeout: 600.0
 rate_limit_attempts: 5
 rate_limit_window: 60.0
 
-queue_zones:
-- - - 377
-    - 184
-  - - 390
-    - 294
-  - - 595
-    - 309
-  - - 595
-    - 189
+# Vision Zones
+queue_zone:
+  polygon:
+  - - 0
+    - 400
+  - - 1280
+    - 400
+  - - 1280
+    - 720
+  - - 0
+    - 720
+
 slots:
 - - - 351
     - 99

@@ -3,6 +3,7 @@ from enum import Enum
 import numpy as np
 import logging
 import cv2
+from . import utils
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -22,6 +23,11 @@ class AlignmentState(Enum):
     ALIGNED = 2
     MISALIGNED = 3
 
+class SuggestionState(Enum):
+    SOFT = 0      # < 1s
+    STABLE = 1    # 1-3s
+    COMMITTED = 2 # > 3s
+
 class Slot:
     def __init__(self, slot_id, polygon):
         self.slot_id = slot_id
@@ -38,13 +44,16 @@ class Slot:
         # State
         self.state = SlotState.FREE
         self.locked_track_id = None
-        self.reservation_id = None # Store the ID of the vehicle that has reserved this slot
-        self.track_age = 0 # Track age in frames for stability weighting
-        self.safety_flag = False # True if safety issue detected
+        self.assigned_track_id = None
+        self.reservation_id = None
+        self.track_age = 0
+        self.safety_flag = False
         
-        # Stage 3: Suggestions & Allocation
+        # Stage 3: Suggestions & Trust
         self.suggested_track_id = None
         self.suggestion_timestamp = 0.0
+        self.suggestion_confidence = 0.0
+        self.suggestion_state = SuggestionState.SOFT
         
         # Alignment
         self.alignment_state = AlignmentState.UNSTABLE
@@ -55,7 +64,51 @@ class Slot:
         self.last_evaluation_time = 0.0
         self.misalignment_timer = 0.0
         self.occlusion_timer = 0.0
-        self.state_enter_time = time.monotonic()
+        self.state_enter_time = utils.now()
+
+    def to_dict(self):
+        """Deep isolation snapshot: returns primitive types only."""
+        return {
+            "slot_id": int(self.slot_id),
+            "state": self.state.name,
+            "locked_track_id": self.locked_track_id,
+            "assigned_track_id": self.assigned_track_id,
+            "alignment_state": self.alignment_state.name,
+            "alignment_score": float(self.alignment_score),
+            "smoothed_alignment_score": float(self.smoothed_alignment_score),
+            "suggestion": {
+                "track_id": self.suggested_track_id,
+                "confidence": float(self.suggestion_confidence),
+                "state": self.suggestion_state.name,
+                "stable_for": float(min(utils.now() - self.suggestion_timestamp, 10.0)) if self.suggestion_timestamp > 0 else 0.0
+            },
+            "occluded": self.occlusion_timer > 0
+        }
+
+    def force_safe_state(self):
+        """
+        Emergency-only bypass of transition validation.
+        Resets slot to FREE and clears all coupling fields.
+        """
+        logger.critical(f"[Slot {self.slot_id+1}] FORCED SAFE RESET triggered.")
+        self.locked_track_id = None
+        self.assigned_track_id = None
+        self.smoothed_alignment_score = 0.0
+        self.alignment_state = AlignmentState.UNSTABLE
+        self.suggestion_state = SuggestionState.SOFT
+        self.suggestion_timestamp = 0
+        self.suggestion_confidence = 0.0
+        self.track_age = 0
+        self.misalignment_timer = 0.0
+        self.occlusion_timer = 0.0
+        
+        # Emergency bypass: direct assignment
+        self.state = SlotState.FREE
+        self.state_enter_time = utils.now()
+
+    def is_in_occlusion_debounce(self):
+        """Returns True if the vehicle is currently occluded but the grace period hasn't expired."""
+        return self.occlusion_timer > 0
 
     def validate_transition(self, new_state):
         """
@@ -76,11 +129,18 @@ class Slot:
         if self.state != new_state:
             if not self.validate_transition(new_state):
                 logger.error(f"[Slot {self.slot_id+1}] REJECTED Invalid Transition: {self.state.name} -> {new_state.name}")
-                return False
+                
+                config = utils.load_config()
+                if config.get("strict_mode", False):
+                    raise RuntimeError(f"Invalid state transition: {self.state.name} -> {new_state.name}")
+                else:
+                    self.force_safe_state()
+                    logger.debug(f"[Slot {self.slot_id+1}] set_state returning False due to invalid transition")
+                    return False
 
             logger.info(f"[Slot {self.slot_id+1}] State Change: {self.state.name} -> {new_state.name} | Track: {track_id}")
             self.state = new_state
-            self.state_enter_time = time.monotonic()
+            self.state_enter_time = utils.now()
             
             # Atomically update track ID during state transition
             if track_id is not None:
@@ -88,11 +148,14 @@ class Slot:
             
             if new_state == SlotState.FREE:
                 self.locked_track_id = None
+                self.assigned_track_id = None
                 self.track_age = 0
                 self.alignment_state = AlignmentState.UNSTABLE
                 self.smoothed_alignment_score = 0.0
                 self.misalignment_timer = 0.0
                 self.safety_flag = False
+                self.suggestion_state = SuggestionState.SOFT
+                self.suggestion_timestamp = 0
             return True
 
     def enable_charging(self):
@@ -115,7 +178,7 @@ class Slot:
         alpha = 0.3
         self.smoothed_alignment_score = (0.7 * self.smoothed_alignment_score) + (alpha * score)
         
-        current_time = time.monotonic()
+        current_time = utils.now()
         ALIGN_THRESHOLD_HIGH = 0.75
         ALIGN_THRESHOLD_LOW = 0.45 
         GRACE_PERIOD = 5.0 # Seconds before we declare MISALIGNED
@@ -161,7 +224,7 @@ class Slot:
                 logger.warning(f"[Slot {self.slot_id+1}] Decision: MISALIGNED (Grace Period Expired)")
 
     def handle_occlusion(self, is_occluded):
-        current_time = time.monotonic()
+        current_time = utils.now()
         if is_occluded:
             if self.occlusion_timer == 0.0:
                 self.occlusion_timer = current_time

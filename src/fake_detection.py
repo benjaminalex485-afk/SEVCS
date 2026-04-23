@@ -38,7 +38,8 @@ class ScenarioEngine:
             "rapid_entry": 120, "long_occlusion": 120, "conflict_test": 120, "stage2_happy_path": 120,
             "stage2_id_shift": 120, "stage2_expiry": 120, "stage2_race": 120, "stage2_equal_timing": 120,
             "stage2_borderline": 120, "stage2_drift": 120,
-            "stage3_priority_test": 120, "stage3_cleanup_test": 60, "stage3_hysteresis_test": 120, "stage3_equal_score": 120
+            "stage3_priority_test": 120, "stage3_cleanup_test": 60, "stage3_hysteresis_test": 120, "stage3_equal_score": 120,
+            "stage3_5_transient_drop": 60, "stage3_5_occlusion_recovery": 60
         }
         return elapsed > durations.get(self.scenario_name, 30)
 
@@ -62,7 +63,23 @@ class ScenarioEngine:
         elif self.scenario_name == "stage3_cleanup_test": return self._scenario_stage3_cleanup_test(elapsed)
         elif self.scenario_name == "stage3_hysteresis_test": return self._scenario_stage3_hysteresis_test(elapsed)
         elif self.scenario_name == "stage3_equal_score": return self._scenario_stage3_equal_score(elapsed)
+        elif self.scenario_name == "stage3_5_transient_drop": return self._scenario_stage3_5_transient_drop(elapsed)
+        elif self.scenario_name == "stage3_5_occlusion_recovery": return self._scenario_stage3_5_occlusion_recovery(elapsed)
         return self._empty()
+
+    def _scenario_stage3_5_transient_drop(self, t):
+        # Veh 1 sits at Slot 0 (95% overlap)
+        # At t=15.0, drop to 0.4 (MISALIGNED) for 0.1s
+        if 15.0 <= t < 15.1:
+            return self._create_detections([1], [self._generate_controlled_mask(0, 0.4)])
+        return self._create_detections([1], [self._generate_controlled_mask(0, 0.95)])
+
+    def _scenario_stage3_5_occlusion_recovery(self, t):
+        # Veh 1 in Queue Zone
+        # At t=5.0, occlusion for 0.2s
+        if 5.0 <= t < 5.2:
+            return self._empty()
+        return self._create_detections([1], [self._generate_mask_at((300, 600))])
 
     def _empty(self):
         return sv.Detections(xyxy=np.empty((0, 4)), tracker_id=np.array([], dtype=int), class_id=np.array([], dtype=int), mask=np.empty((0, self.frame_wh[1], self.frame_wh[0]), dtype=bool))

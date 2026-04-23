@@ -1,10 +1,34 @@
 import cv2
 import yaml
 import numpy as np
+import os
+import time
 
-def load_config(path="config.yaml"):
-    with open(path, "r") as f:
+def now():
+    """Central monotonic time wrapper for system-wide consistency."""
+    return time.monotonic()
+
+def load_config(config_path="config.yaml"):
+    if not os.path.exists(config_path):
+        return {}
+    with open(config_path, "r") as f:
         return yaml.safe_load(f)
+
+def validate_config(config):
+    """Enforces safety invariants on the system configuration."""
+    assert "queue_zone" in config, "Missing 'queue_zone' in config"
+    poly = config["queue_zone"].get("polygon", [])
+    assert len(poly) >= 3, "Queue zone polygon must have at least 3 points"
+    for p in poly:
+        assert len(p) == 2, f"Invalid point in queue zone: {p}"
+    
+    # Defaults for Stage 3.5 hardening
+    config.setdefault("strict_mode", False)
+    config.setdefault("debug_locks", False)
+    config.setdefault("distance_normalization", 1500.0)
+    config.setdefault("auth_timeout", 60.0)
+    config.setdefault("booking_timeout", 600.0)
+    return True
 
 def save_config(data, path="config.yaml"):
     with open(path, "w") as f:
