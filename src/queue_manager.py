@@ -156,6 +156,7 @@ class QueueManager:
         
         # GUARD: Clear all slot suggestions if no assignments possible
         if not suggestable_slots or not queue_list:
+            logger.debug(f"[QUEUE] Clearing Suggestions: slots={len(suggestable_slots)}, queue={len(queue_list)}")
             for s in slots:
                 s.suggested_track_id = None
                 s.suggestion_timestamp = 0.0
@@ -174,13 +175,12 @@ class QueueManager:
         for v_idx, entry in enumerate(queue_list):
             for s_idx, slot in enumerate(suggestable_slots):
                 priority = self.priority_engine.compute_priority(entry, slot)
-                # ISSUE 9: Priority Saturation Logging
-                if priority > 0.95:
-                    logger.warning(f"[PRIORITY] Saturation Track {entry.track_id} Score={priority:.2f}")
+                # Cost = 1.0 - Priority (Higher priority = Lower cost)
                 cost_matrix[v_idx, s_idx] = 1.0 - priority
 
         # 3. Hungarian Assignment
         row_ind, col_ind = linear_sum_assignment(cost_matrix)
+        logger.debug(f"[QUEUE] Assignment Matrix {num_v}x{num_s} | Matches: {len(row_ind)}")
         
         # Mapping for current assignments
         current_assignments = {} # slot_id -> track_id
@@ -193,6 +193,14 @@ class QueueManager:
             entry._temp_priority = 1.0 - cost_matrix[v_idx, s_idx]
 
         # 4. Apply Trust State Machine & Hysteresis
+        # First, clear suggested_track_id for slots that are NO LONGER suggestable
+        suggestable_ids = {s.slot_id for s in suggestable_slots}
+        for s in slots:
+            if s.slot_id not in suggestable_ids:
+                s.suggested_track_id = None
+                s.suggestion_timestamp = 0.0
+                s.suggestion_state = SuggestionState.SOFT
+
         for slot in suggestable_slots:
             new_tid = current_assignments.get(slot.slot_id)
             

@@ -139,11 +139,11 @@ class Visualizer:
         if not queue_manager.queue:
             cv2.putText(frame, "Waiting: 0", (sb_x, queue_y + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150, 150, 150), 1)
         else:
-            for idx, v in enumerate(queue_manager.queue):
+            for idx, entry in enumerate(queue_manager.queue.values()):
                 iy = queue_y + 30 + (idx * 18)
-                q_text = f"ID {v['id']} (Queue)"
-                if queue_manager.is_reserved(v['id']):
-                    q_text = f"ID {v['id']} (RES)"
+                q_text = f"ID {entry.track_id} (Queue)"
+                if entry.booking_id:
+                    q_text = f"ID {entry.track_id} (RES)"
                 cv2.putText(frame, q_text, (sb_x, iy), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
 
         # Stability Candidates

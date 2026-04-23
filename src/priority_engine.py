@@ -1,5 +1,5 @@
 import numpy as np
-import time
+from . import utils
 
 class PriorityEngine:
     W_BOOKING = 0.5
@@ -19,7 +19,7 @@ class PriorityEngine:
         booking_score = 1.0 if vehicle_entry.booking_id is not None else 0.0
         
         # 2. Wait Time Score (Normalized over 120s)
-        wait_time = time.monotonic() - vehicle_entry.arrival_time
+        wait_time = utils.now() - vehicle_entry.arrival_time
         wait_score = min(1.0, wait_time / 120.0)
         
         # 3. Distance Score (Normalized by fixed frame diagonal)
@@ -33,9 +33,9 @@ class PriorityEngine:
         
         # Combined Base Score
         score = (self.W_BOOKING * booking_score + 
-                 self.W_WAIT * wait_score + 
-                 self.W_DISTANCE * distance_score + 
-                 self.W_TYPE * type_score)
+                  self.W_WAIT * wait_score + 
+                  self.W_DISTANCE * distance_score + 
+                  self.W_TYPE * type_score)
         
         # 5. Dynamic Priority Boost
         if wait_time > 120.0:

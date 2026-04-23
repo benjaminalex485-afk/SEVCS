@@ -16,11 +16,11 @@ def load_config(config_path="config.yaml"):
 
 def validate_config(config):
     """Enforces safety invariants on the system configuration."""
-    assert "queue_zone" in config, "Missing 'queue_zone' in config"
-    poly = config["queue_zone"].get("polygon", [])
-    assert len(poly) >= 3, "Queue zone polygon must have at least 3 points"
-    for p in poly:
-        assert len(p) == 2, f"Invalid point in queue zone: {p}"
+    assert "queue_zones" in config, "Missing 'queue_zones' in config"
+    for poly in config["queue_zones"]:
+        assert len(poly) >= 3, "Queue zone polygon must have at least 3 points"
+        for p in poly:
+            assert len(p) == 2, f"Invalid point in queue zone: {p}"
     
     # Defaults for Stage 3.5 hardening
     config.setdefault("strict_mode", False)

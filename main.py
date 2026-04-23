@@ -36,9 +36,11 @@ else:
     tracker = sv.ByteTrack()
 
 # --- CONSTANTS ---
+CONFIG = utils.load_config()
+utils.validate_config(CONFIG)
 ALIGN_THRESHOLD = 0.75
-QUEUE_ZONE_POLYGON = [[0, 400], [1280, 400], [1280, 720], [0, 720]]
 AUTH_WINDOW = 1.0 # Early authorization window to eliminate API race conditions
+STRICT_MODE = CONFIG.get("strict_mode", False)
 
 # --- LOGGING CONFIG ---
 logging.basicConfig(
@@ -74,8 +76,6 @@ class SystemState:
         ]
 
 G_STATE = SystemState()
-CONFIG = utils.load_config()
-utils.validate_config(CONFIG)
 
 # --- HARDENING HELPERS ---
 def acquire_lock(name, lock):
@@ -105,10 +105,12 @@ def get_system_snapshot():
     
     try:
         for name, lock in locks:
-            if lock.acquire(timeout=2.0):
+            # High-frequency non-blocking fallback
+            if lock.acquire(timeout=0.01):
                 acquired.append(lock)
             else:
-                logger.error(f"LOCK TIMEOUT: {name} - Returning partial snapshot")
+                logger.warning(f"[SNAPSHOT] PARTIAL: Could not acquire {name}_lock")
+                snapshot["partial"] = True
                 break
         
         # 2. Extract Data (Primitive copies only)
@@ -148,7 +150,6 @@ def get_status():
 @api_app.route('/api/suggestions', methods=['GET'])
 def get_suggestions():
     snapshot = get_system_snapshot()
-    # Extract minimal suggestion schema
     suggestions = []
     for s in snapshot["slots"]:
         suggestions.append({
@@ -168,7 +169,7 @@ def get_queue_api():
             for tid, entry in G_STATE.queue_manager.queue.items():
                 data.append({
                     "track_id": int(tid),
-                    "wait_time": int(time.monotonic() - entry.arrival_time),
+                    "wait_time": int(utils.now() - entry.arrival_time),
                     "priority": round(entry.priority_score, 2),
                     "suggestion": int(entry.assigned_slot) if entry.assigned_slot is not None else None
                 })
@@ -188,14 +189,16 @@ def get_slots_api():
 @api_app.route('/api/book', methods=['POST'])
 def book_slot_api():
     # ISSUE 4: Rate Limiting
-    limit = utils.load_config().get('rate_limit_attempts', 5)
-    window = utils.load_config().get('rate_limit_window', 60.0)
-    if not G_STATE.auth_engine.check_rate_limit(request.remote_addr, limit, window):
-        return jsonify({"status": "error", "message": "Rate limit exceeded"}), 429
-    G_STATE.auth_engine.record_attempt(request.remote_addr)
-
     data = request.json or {}
     username = data.get('username', 'Anonymous')
+    identifier = f"{request.remote_addr}:{username}"
+    
+    limit = CONFIG.get('rate_limit_attempts', 5)
+    window = CONFIG.get('rate_limit_window', 60.0)
+    
+    if not G_STATE.auth_engine.check_rate_limit(identifier, limit, window):
+        return jsonify({"status": "error", "message": "Rate limit exceeded"}), 429
+    G_STATE.auth_engine.record_attempt(identifier)
     with G_STATE.vision_lock:
         assigned_idx = -1
         # PRIORITY 1: If vehicle is already present -> bind to that slot
@@ -224,18 +227,21 @@ def book_slot_api():
 
 @api_app.route('/api/authorize', methods=['POST'])
 def authorize_api():
-    # ISSUE 4: Rate Limiting
-    limit = utils.load_config().get('rate_limit_attempts', 5)
-    window = utils.load_config().get('rate_limit_window', 60.0)
-    if not G_STATE.auth_engine.check_rate_limit(request.remote_addr, limit, window):
-        return jsonify({"status": "error", "message": "Rate limit exceeded"}), 429
-    G_STATE.auth_engine.record_attempt(request.remote_addr)
-
     data = request.json or {}
+    username = data.get("username", "Anonymous")
+    identifier = f"{request.remote_addr}:{username}"
+
+    # ISSUE 4: Rate Limiting
+    limit = CONFIG.get('rate_limit_attempts', 5)
+    window = CONFIG.get('rate_limit_window', 60.0)
+    if not G_STATE.auth_engine.check_rate_limit(identifier, limit, window):
+        return jsonify({"status": "error", "message": "Rate limit exceeded"}), 429
+    G_STATE.auth_engine.record_attempt(identifier)
+
     slot_id, code = data.get('slot_id'), data.get('code')
     if slot_id is None or code is None: return jsonify({"status": "error", "message": "Missing slot_id or code"}), 400
     idx = slot_id - 1
-    now_mono = time.monotonic()
+    now_mono = utils.now()
     
     with G_STATE.vision_lock:
         if idx < 0 or idx >= len(G_STATE.slots): return jsonify({"status": "error", "code": "wrong_slot"}), 400
@@ -279,20 +285,19 @@ def charging_simulation_loop():
 
 # --- MAIN LOOP ---
 def main():
-    config = utils.load_config()
-    detector = SlotDetector(config.get('model_path'), config.get('class_ids', [2, 3, 5, 7]))
+    detector = SlotDetector(CONFIG.get('model_path'), CONFIG.get('class_ids', [2, 3, 5, 7]))
     # tracker is already initialized/mocked at top level
     queue_manager = QueueManager()
     alignment_engine = AlignmentEngine()
     visualizer = Visualizer()
-    slots = [Slot(i, poly) for i, poly in enumerate(config.get('slots', []))]
+    slots = [Slot(i, poly) for i, poly in enumerate(CONFIG.get('slots', []))]
     G_STATE.auth_engine.clear_all()
     with G_STATE.vision_lock:
         G_STATE.slots, G_STATE.queue_manager, G_STATE.camera_online = slots, queue_manager, True
     threading.Thread(target=run_api, daemon=True).start()
     threading.Thread(target=charging_simulation_loop, daemon=True).start()
     
-    cap = None if USE_FAKE_INPUT else cv2.VideoCapture(config.get('camera_index', 0))
+    cap = None if USE_FAKE_INPUT else cv2.VideoCapture(CONFIG.get('camera_index', 0))
     resolution_wh = (1280, 720)
     max_diag = np.linalg.norm(resolution_wh)
     track_ages = {}
@@ -303,9 +308,10 @@ def main():
     while True:
         now_mono = utils.now()
         if USE_FAKE_INPUT:
+            # Simulate 30 FPS and give other threads (API/Simulation) time to acquire locks
+            time.sleep(0.033)
             frame = np.zeros((720, 1280, 3), dtype=np.uint8)
             detections = engine.get_detections()
-            time.sleep(0.001)
             if engine.is_complete(): engine.reset()
         else:
             ret, frame = cap.read()
@@ -320,30 +326,29 @@ def main():
                 track_ages[tid] = track_ages.get(tid, 0) + 1
             
             # --- DEFENSIVE GUARD: Clear Stale Assignments ---
-            for slot in slots:
+            for slot in G_STATE.slots:
                 if slot.assigned_track_id is not None and slot.assigned_track_id not in current_track_ids:
                     slot.assigned_track_id = None
 
             # --- QUEUE MANAGEMENT (STAGE 3) ---
             with G_STATE.queue_lock:
                 if G_STATE.queue_manager:
-                    # Correct nesting: CONFIG['queue_zone']['polygon'] is a list of points [[x,y],...]
-                    q_zone = CONFIG.get("queue_zone", {}).get("polygon", QUEUE_ZONE_POLYGON)
-                    G_STATE.queue_manager.update_queue(detections, [q_zone])
-                    G_STATE.queue_manager.update_suggestions(slots)
+                    q_zones = CONFIG.get("queue_zones", [])
+                    G_STATE.queue_manager.update_queue(detections, q_zones)
+                    G_STATE.queue_manager.update_suggestions(G_STATE.slots)
             
             # --- ASSIGNMENT ---
             matched_slots = set()
             if len(detections) > 0:
-                costs = np.zeros((len(detections), len(slots)))
-                overlaps = np.zeros((len(detections), len(slots)))
-                centroid_scores = np.zeros((len(detections), len(slots)))
+                costs = np.zeros((len(detections), len(G_STATE.slots)))
+                overlaps = np.zeros((len(detections), len(G_STATE.slots)))
+                centroid_scores = np.zeros((len(detections), len(G_STATE.slots)))
                 MAX_MATCH_COST = 0.6
                 
                 for d_idx in range(len(detections)):
                     det_xyxy = detections.xyxy[d_idx]
                     det_center = ((det_xyxy[0] + det_xyxy[2]) / 2, (det_xyxy[1] + det_xyxy[3]) / 2)
-                    for s_idx, slot in enumerate(slots):
+                    for s_idx, slot in enumerate(G_STATE.slots):
                         overlap = alignment_engine.calculate_overlap(detections.mask[d_idx], slot.polygon, resolution_wh) if detections.mask is not None else 0.0
                         overlaps[d_idx, s_idx] = overlap
                         dist = np.linalg.norm(np.array(det_center) - np.array(slot.centroid))
@@ -356,16 +361,16 @@ def main():
                 
                 for d_idx, s_idx in zip(row_ind, col_ind):
                     if costs[d_idx, s_idx] <= MAX_MATCH_COST:
-                        slot = slots[s_idx]
+                        slot = G_STATE.slots[s_idx]
                         tid = detections.tracker_id[d_idx]
                         
                         # INVARIANT: Assignment Uniqueness
                         if tid in assigned_this_frame:
-                            if CONFIG.get("strict_mode", False):
+                            if STRICT_MODE:
                                 raise RuntimeError("Duplicate assignment detected")
                             else:
                                 slot.force_safe_state()
-                                slots[assigned_this_frame[tid]].force_safe_state()
+                                G_STATE.slots[assigned_this_frame[tid]].force_safe_state()
                                 continue
                         
                         assigned_this_frame[tid] = s_idx
@@ -433,7 +438,7 @@ def main():
                         slot.handle_occlusion(False)
 
             # --- DEPARTURE & GHOST RECOVERY ---
-            for i, slot in enumerate(slots):
+            for i, slot in enumerate(G_STATE.slots):
                 # Ghost Charging check
                 if slot.state == SlotState.CHARGING and slot.locked_track_id is None:
                     logger.critical(f"[INVARIANT] Ghost Charging on Slot {i+1} -> FORCED RESET")
@@ -453,13 +458,14 @@ def main():
                         slot.handle_occlusion(True)
 
         if not USE_FAKE_INPUT:
-            frame = visualizer.draw_overlays(frame, slots, config.get('queue_zones', []), {})
+            frame = visualizer.draw_overlays(frame, G_STATE.slots, CONFIG.get('queue_zones', []), {})
             frame = visualizer.draw_detections(frame, detections)
-            frame = visualizer.draw_sidebar(frame, queue_manager)
+            frame = visualizer.draw_sidebar(frame, G_STATE.queue_manager)
             cv2.imshow("Smart EV Charging", frame)
             if cv2.waitKey(1) & 0xFF == ord('q'): break
         else:
-            time.sleep(0.033)
+            # Already slept at the top of the loop in FAKE mode
+            pass
 
     if cap: cap.release()
     cv2.destroyAllWindows()

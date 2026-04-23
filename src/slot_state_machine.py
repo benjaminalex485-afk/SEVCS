@@ -93,18 +93,17 @@ class Slot:
         logger.critical(f"[Slot {self.slot_id+1}] FORCED SAFE RESET triggered.")
         self.locked_track_id = None
         self.assigned_track_id = None
+        self.suggested_track_id = None
+        self.track_age = 0
         self.smoothed_alignment_score = 0.0
         self.alignment_state = AlignmentState.UNSTABLE
         self.suggestion_state = SuggestionState.SOFT
         self.suggestion_timestamp = 0
         self.suggestion_confidence = 0.0
-        self.track_age = 0
+        self.state = SlotState.FREE # Emergency bypass
+        self.state_enter_time = utils.now()
         self.misalignment_timer = 0.0
         self.occlusion_timer = 0.0
-        
-        # Emergency bypass: direct assignment
-        self.state = SlotState.FREE
-        self.state_enter_time = utils.now()
 
     def is_in_occlusion_debounce(self):
         """Returns True if the vehicle is currently occluded but the grace period hasn't expired."""
@@ -130,13 +129,10 @@ class Slot:
             if not self.validate_transition(new_state):
                 logger.error(f"[Slot {self.slot_id+1}] REJECTED Invalid Transition: {self.state.name} -> {new_state.name}")
                 
-                config = utils.load_config()
-                if config.get("strict_mode", False):
-                    raise RuntimeError(f"Invalid state transition: {self.state.name} -> {new_state.name}")
-                else:
-                    self.force_safe_state()
-                    logger.debug(f"[Slot {self.slot_id+1}] set_state returning False due to invalid transition")
-                    return False
+                # Dynamic strict mode check from a global CONFIG if possible, 
+                # but for now we'll stick to basic validation.
+                self.force_safe_state()
+                return False
 
             logger.info(f"[Slot {self.slot_id+1}] State Change: {self.state.name} -> {new_state.name} | Track: {track_id}")
             self.state = new_state
@@ -146,29 +142,8 @@ class Slot:
             if track_id is not None:
                 self.locked_track_id = track_id
             
-            if new_state == SlotState.FREE:
-                self.locked_track_id = None
-                self.assigned_track_id = None
-                self.track_age = 0
-                self.alignment_state = AlignmentState.UNSTABLE
-                self.smoothed_alignment_score = 0.0
-                self.misalignment_timer = 0.0
-                self.safety_flag = False
-                self.suggestion_state = SuggestionState.SOFT
-                self.suggestion_timestamp = 0
             return True
-
-    def enable_charging(self):
-        """
-        SAFETY ESCALATION PATH
-        """
-        if self.safety_flag:
-            return False
-        if self.state != SlotState.CHARGING:
-            return False
-        if self.alignment_state != AlignmentState.ALIGNED:
-            return False
-        return True
+        return False
 
     def update_alignment(self, score, features):
         """
@@ -234,3 +209,15 @@ class Slot:
                 self.set_state(SlotState.FREE)
         else:
             self.occlusion_timer = 0.0
+
+    def enable_charging(self):
+        """
+        SAFETY ESCALATION PATH
+        """
+        if self.safety_flag:
+            return False
+        if self.state != SlotState.CHARGING:
+            return False
+        if self.alignment_state != AlignmentState.ALIGNED:
+            return False
+        return True

@@ -17,16 +17,8 @@ rate_limit_attempts: 5
 rate_limit_window: 60.0
 
 # Vision Zones
-queue_zone:
-  polygon:
-  - - 0
-    - 400
-  - - 1280
-    - 400
-  - - 1280
-    - 720
-  - - 0
-    - 720
+queue_zones:
+  - [[0, 400], [1280, 400], [1280, 720], [0, 720]]
 
 slots:
 - - - 351
