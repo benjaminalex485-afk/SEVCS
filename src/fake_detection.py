@@ -94,20 +94,19 @@ class ScenarioEngine:
 
     def _generate_controlled_mask(self, slot_idx, target_overlap, jitter=True):
         """
-        Refined 2D mask generator with jitter cap (5px).
+        Optimized 2D mask generator for Stage 4.5.
         """
         slot_poly = self.slots[slot_idx]
         slot_mask = np.zeros((self.frame_wh[1], self.frame_wh[0]), dtype=np.uint8)
         cv2.fillPoly(slot_mask, [slot_poly], 1)
         slot_area = np.sum(slot_mask)
         
-        # Iterative 2D search for target overlap
         best_mask = slot_mask.copy()
         current_best_diff = 1.0
         
-        # We try different x, y shifts to find target overlap (Centered range)
-        for dx in range(-150, 150, 5):
-            for dy in range(-50, 50, 5):
+        # Optimized search: Large steps first
+        for dx in range(-150, 151, 25):
+            for dy in range(-50, 51, 15):
                 shifted = np.zeros_like(slot_mask)
                 sy_start, sy_end = max(0, dy), min(self.frame_wh[1], self.frame_wh[1] + dy)
                 sx_start, sx_end = max(0, dx), min(self.frame_wh[0], self.frame_wh[0] + dx)
@@ -117,17 +116,12 @@ class ScenarioEngine:
                 if abs(overlap - target_overlap) < current_best_diff:
                     current_best_diff = abs(overlap - target_overlap)
                     best_mask = shifted
-                if current_best_diff < 0.02: break
-            if current_best_diff < 0.02: break
+                if current_best_diff < 0.05: break
         
         if jitter:
-            # Apply tiny jitter (capped at 5px)
             jx, jy = random.randint(-5, 5), random.randint(-5, 5)
-            jittered = np.zeros_like(best_mask)
-            sy_s, sy_e = max(0, jy), min(self.frame_wh[1], self.frame_wh[1] + jy)
-            sx_s, sx_e = max(0, jx), min(self.frame_wh[0], self.frame_wh[0] + jx)
-            jittered[sy_s:sy_e, sx_s:sx_e] = best_mask[max(0, -jy):min(self.frame_wh[1], self.frame_wh[1] - jy), max(0, -jx):min(self.frame_wh[0], self.frame_wh[0] - jx)]
-            return jittered > 0
+            # Fast jitter
+            best_mask = np.roll(best_mask, (jy, jx), axis=(0, 1))
             
         return best_mask > 0
 

@@ -3,6 +3,7 @@ import time
 import hashlib
 import uuid
 import collections
+import numpy as np
 from src import utils
 
 class ReasonCode(Enum):
@@ -23,6 +24,40 @@ class SystemMode(Enum):
     SOFT_SAFE = 2
     SAFE = 3
     MINIMAL = 4
+
+# --- STAGE 4.5: REALITY HARDENING ---
+MIN_MOVEMENT = 5.0 # Min pixels moved to compute direction
+DRIFT_THRESHOLD = 1.0 # Seconds before drift is flagged
+SIGNAL_SMOOTHING = 0.3 # EWMA alpha
+
+class SignalQuality:
+    @staticmethod
+    def compute_stability(history):
+        """Returns 0-1 score based on tracking duration."""
+        if not history: return 0.0
+        return min(1.0, len(history) / 20.0)
+
+    @staticmethod
+    def compute_consistency(history):
+        """Returns 0-1 score based on bbox area variance."""
+        if len(history) < 5: return 1.0
+        areas = []
+        for _, _, bbox in history:
+            area = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
+            areas.append(area)
+        
+        mean_area = np.mean(areas)
+        if mean_area == 0: return 0.0
+        std_area = np.std(areas)
+        # Higher variance = lower consistency
+        return max(0.0, 1.0 - (std_area / mean_area))
+
+    @staticmethod
+    def normalize_safe(vec):
+        """Safely normalize a vector with epsilon."""
+        norm = np.linalg.norm(vec)
+        if norm < 1e-6: return np.zeros_like(vec)
+        return vec / (norm + 1e-6)
 
 class EventGenerator:
     """Monotonic, sortable, sub-nanosecond event IDs."""
@@ -68,5 +103,3 @@ class IndustrialMetrics:
         self.snapshot_id = (self.snapshot_id + 1) % self.MAX_SNAPSHOT_ID
         return self.snapshot_id
 
-# Import numpy for percentile calculation if needed, otherwise use simple sorted logic
-import numpy as np

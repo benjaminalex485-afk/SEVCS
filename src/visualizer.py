@@ -140,11 +140,14 @@ class Visualizer:
             cv2.putText(frame, "Waiting: 0", (sb_x, queue_y + 25), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150, 150, 150), 1)
         else:
             for idx, entry in enumerate(queue_manager.queue.values()):
-                iy = queue_y + 30 + (idx * 18)
-                q_text = f"ID {entry.track_id} (Queue)"
-                if entry.booking_id:
-                    q_text = f"ID {entry.track_id} (RES)"
+                iy = queue_y + 30 + (idx * 30)
+                q_text = f"ID {entry.track_id} | {int(entry.smoothed_signal_conf*100)}%"
+                if entry.assigned_slot is not None:
+                    q_text += f" -> S{entry.assigned_slot+1}"
+                
                 cv2.putText(frame, q_text, (sb_x, iy), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
+                reason_txt = f"{entry.decision_reason}"
+                cv2.putText(frame, reason_txt, (sb_x, iy + 12), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (150, 150, 150), 1)
 
         # Stability Candidates
         cand_y = queue_y + 70

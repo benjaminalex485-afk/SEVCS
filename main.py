@@ -78,6 +78,8 @@ class GlobalState:
         self.snapshot_buffer = collections.deque(maxlen=100) # ~3-5s history
         self.is_forensic_frozen = False
         self.freeze_start_time = 0.0
+        self.startup_time = utils.now()
+        self.last_detections = None
         
         # Authentication
         self.auth_engine = AuthEngine()
@@ -167,6 +169,10 @@ def get_system_snapshot(debug=False):
                     "health": float(G_STATE.queue_manager.system_health),
                     "thrash_rate": float(G_STATE.queue_manager.thrash_rate)
                 }
+                # Capture detections for replay (optional: check if detections variable is accessible)
+                # In main loop, we can store detections in G_STATE temporarily
+                if hasattr(G_STATE, 'last_detections'):
+                    snapshot["detections"] = utils.serialize_detections(G_STATE.last_detections)
             
     except Exception as e:
         logger.error(f"SNAPSHOT ERROR: {e}")
@@ -239,6 +245,39 @@ def get_suggestions():
     debug = request.args.get('debug', 'false').lower() == 'true'
     snapshot = get_system_snapshot(debug=debug)
     return jsonify(snapshot)
+
+@api_app.route('/api/summary', methods=['GET'])
+@rate_limit("summary")
+def get_summary_api():
+    """Compact system health for UI."""
+    with G_STATE.queue_lock:
+        health = float(G_STATE.queue_manager.system_health) if G_STATE.queue_manager else 1.0
+        thrash = float(G_STATE.queue_manager.thrash_rate) if G_STATE.queue_manager else 0.0
+    
+    active_tracks = 0
+    if hasattr(G_STATE, 'last_detections') and G_STATE.last_detections is not None:
+        active_tracks = len(G_STATE.last_detections.tracker_id) if G_STATE.last_detections.tracker_id is not None else 0
+
+    return jsonify({
+        "mode": G_STATE.mode.name,
+        "mode_reason": G_STATE.mode_reason.name,
+        "health": round(health, 2),
+        "thrash_rate": round(thrash, 3),
+        "latency_p95": round(G_STATE.metrics.get_latency_p95(), 3),
+        "active_tracks": active_tracks,
+        "queue_size": len(G_STATE.queue_manager.queue) if G_STATE.queue_manager else 0
+    })
+
+@api_app.route('/api/system/mode', methods=['POST'])
+@rate_limit("admin")
+def set_system_mode_api():
+    """Toggles STRICT_MODE at runtime."""
+    data = request.json or {}
+    global STRICT_MODE
+    if "strict_mode" in data:
+        STRICT_MODE = bool(data["strict_mode"])
+        logger.warning(f"[API] STRICT_MODE updated to: {STRICT_MODE}")
+    return jsonify({"status": "ok", "strict_mode": STRICT_MODE})
 
 @api_app.route('/api/forensics', methods=['GET'])
 @rate_limit("forensics")
@@ -402,14 +441,25 @@ def main():
     
     logger.info(f"System Ready. Mode: {'FAKE' if USE_FAKE_INPUT else 'REAL'} | Scenario: {ACTIVE_SCENARIO if USE_FAKE_INPUT else 'N/A'}")
     
+    REPLAY_MODE = CONFIG.get("replay_mode", False)
+    if REPLAY_MODE:
+        logger.info("!!! REPLAY MODE ACTIVE !!! Live Input Disabled.")
+        if not USE_FAKE_INPUT:
+            logger.error("REPLAY_MODE and LIVE_INPUT are mutually exclusive. Exiting.")
+            return
+
     last_loop_time = utils.now()
+    replay_idx = 0
+    first_loop = True
     while True:
         loop_start = utils.now()
         dt = loop_start - last_loop_time
         last_loop_time = loop_start
         
         # 1. Latency Watchdog
-        G_STATE.metrics.record_latency(dt)
+        if not first_loop:
+            G_STATE.metrics.record_latency(dt)
+        first_loop = False
         p95_latency = G_STATE.metrics.get_latency_p95()
         
         if p95_latency > 0.8: # SAFE Trigger
@@ -418,12 +468,38 @@ def main():
         elif p95_latency > 0.4: # SOFT_SAFE Trigger
             G_STATE.mode = SystemMode.SOFT_SAFE
             G_STATE.mode_reason = ReasonCode.SYSTEM_STALL
-        elif p95_latency > 0.2: # WARN
-            if G_STATE.metrics.snapshot_id % 30 == 0:
-                logger.warning(f"[STALL] Loop Latency High: {p95_latency:.3f}s")
+        else:
+            if G_STATE.mode in [SystemMode.SAFE, SystemMode.SOFT_SAFE] and G_STATE.mode_reason == ReasonCode.SYSTEM_STALL:
+                logger.info(f"[WATCHDOG] Performance Recovered ({p95_latency:.3f}s) -> FULL Mode")
+                G_STATE.mode = SystemMode.FULL
+                G_STATE.mode_reason = ReasonCode.NONE
+            
+            if p95_latency > 0.2: # WARN
+                if G_STATE.metrics.snapshot_id % 30 == 0:
+                    logger.warning(f"[STALL] Loop Latency High: {p95_latency:.3f}s")
         
-        if USE_FAKE_INPUT:
-            # Simulate 30 FPS and give other threads (API/Simulation) time to acquire locks
+        # --- INPUT HANDLING ---
+        if REPLAY_MODE:
+            if not G_STATE.snapshot_buffer:
+                time.sleep(1.0)
+                continue
+            snapshot = G_STATE.snapshot_buffer[replay_idx % len(G_STATE.snapshot_buffer)]
+            replay_idx += 1
+            
+            # DETERMINISTIC REPLAY: Use snapshot time as loop authority
+            loop_start = snapshot["timestamp"]
+            
+            # Reconstruct detections from snapshot (needs snapshot upgrade)
+            # For now, if we don't have detections in snapshot, we skip
+            if "detections" not in snapshot:
+                logger.warning("No detections in snapshot. Replay limited.")
+                time.sleep(0.033)
+                continue
+            detections = utils.deserialize_detections(snapshot["detections"])
+            frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+            time.sleep(0.033)
+        elif USE_FAKE_INPUT:
+            # Simulate 30 FPS
             time.sleep(0.033)
             frame = np.zeros((720, 1280, 3), dtype=np.uint8)
             detections = engine.get_detections()
@@ -436,7 +512,10 @@ def main():
         # --- ATOMIC FRAME PROCESSING ---
         with G_STATE.vision_lock:
             G_STATE.last_vision_heartbeat = loop_start
+            G_STATE.last_detections = detections
             current_track_ids = set(detections.tracker_id) if detections.tracker_id is not None else set()
+            
+            # --- TRACKING PERSISTENCE ---
             for tid in current_track_ids:
                 track_ages[tid] = track_ages.get(tid, 0) + 1
             
@@ -450,7 +529,10 @@ def main():
                 if G_STATE.queue_manager:
                     q_zones = CONFIG.get("queue_zones", [])
                     G_STATE.queue_manager.update_queue(detections, q_zones)
-                    G_STATE.queue_manager.update_suggestions(G_STATE.slots)
+                    
+                    # --- STAGE 4.5: COLD START SUPPRESSION ---
+                    allow_new = (loop_start - G_STATE.startup_time > 2.0)
+                    G_STATE.queue_manager.update_suggestions(G_STATE.slots, allow_new_assignments=allow_new)
             
             # --- ASSIGNMENT ---
             matched_slots = set()

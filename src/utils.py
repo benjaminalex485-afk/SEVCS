@@ -164,3 +164,24 @@ def get_charging_input(slot_id):
 
     root.destroy()
     return kwh, rate
+
+
+def serialize_detections(detections):
+    if detections is None: return None
+    return {
+        'xyxy': detections.xyxy.tolist(),
+        'confidence': detections.confidence.tolist() if detections.confidence is not None else None,
+        'class_id': detections.class_id.tolist() if detections.class_id is not None else None,
+        'tracker_id': detections.tracker_id.tolist() if detections.tracker_id is not None else None
+    }
+
+def deserialize_detections(data):
+    if data is None: return None
+    import supervision as sv
+    import numpy as np
+    return sv.Detections(
+        xyxy=np.array(data['xyxy']),
+        confidence=np.array(data['confidence']) if data['confidence'] is not None else None,
+        class_id=np.array(data['class_id']) if data['class_id'] is not None else None,
+        tracker_id=np.array(data['tracker_id']) if data['tracker_id'] is not None else None
+    )

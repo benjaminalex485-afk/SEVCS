@@ -5,7 +5,7 @@ from scipy.optimize import linear_sum_assignment
 from .priority_engine import PriorityEngine
 import logging
 from .slot_state_machine import SlotState, SuggestionState
-from .industrial_utils import ReasonCode, SystemMode, EVENT_BUS
+from .industrial_utils import ReasonCode, SystemMode, EVENT_BUS, SignalQuality, MIN_MOVEMENT, DRIFT_THRESHOLD, SIGNAL_SMOOTHING
 from . import utils
 import collections
 
@@ -23,6 +23,14 @@ class QueueEntry:
         self.assigned_slot = None
         self.suggestion_state = SuggestionState.SOFT
         self.last_assignment_time = 0.0
+        
+        # Stage 4.5 Reality Layer
+        self.history = collections.deque(maxlen=20) # (time, centroid, bbox)
+        self.latest_conf = 0.0
+        self.drift_counter = 0.0
+        self.drift_score = 0.0
+        self.smoothed_signal_conf = 0.5 # Real-world cold start bias
+        self.decision_reason = "INIT"
 
     def to_dict(self):
         """Deep isolation snapshot: returns primitive types only."""
@@ -32,7 +40,10 @@ class QueueEntry:
             "user": self.user,
             "priority": float(self.priority_score),
             "assigned_slot": self.assigned_slot,
-            "wait_time": float(utils.now() - self.arrival_time)
+            "wait_time": float(utils.now() - self.arrival_time),
+            "signal_confidence": float(self.smoothed_signal_conf),
+            "decision_reason": self.decision_reason,
+            "drift_score": float(self.drift_score)
         }
 
 class QueueManager:
@@ -157,12 +168,20 @@ class QueueManager:
                  del self.entry_stability[tid]
 
         for tid, centroid in vehicles_in_zone.items():
+            # Update stability counter
+            self.entry_stability[tid] = self.entry_stability.get(tid, 0) + 1
+            
+            # Find detection data for this tid
+            idx_list = np.where(detections.tracker_id == tid)[0]
+            if len(idx_list) == 0: continue
+            idx = idx_list[0]
+            bbox = detections.xyxy[idx]
+            conf = detections.confidence[idx] if detections.confidence is not None else 0.0
+
             if tid not in self.queue:
-                self.entry_stability[tid] = self.entry_stability.get(tid, 0) + 1
-                
                 # Only add if stabilized (> 5 frames)
                 if self.entry_stability[tid] > 5:
-                    logger.info(f"[QUEUE] ADD Track {tid}")
+                    logger.info(f"[QUEUE] {EVENT_BUS.next_id()} Vehicle {tid} ENTERED at {centroid}")
                     self.queue[tid] = QueueEntry(tid, centroid)
             else:
                 # Update existing
@@ -176,6 +195,8 @@ class QueueManager:
                 else:
                     entry.last_seen_time = now
                     entry.centroid = centroid
+                    entry.latest_conf = conf
+                    entry.history.append((now, centroid, bbox))
 
         # 3. Cleanup Stale Entries (Leak Prevention & ID Reuse Handling)
         to_remove = []
@@ -188,11 +209,18 @@ class QueueManager:
             if tid in self.queue: del self.queue[tid]
             if tid in self.entry_stability: del self.entry_stability[tid]
 
-    def update_suggestions(self, slots):
+    def update_suggestions(self, slots, allow_new_assignments=True):
         """Hardened production-grade suggestion engine with industrial reliability."""
         now = utils.now()
         dt = now - self.last_update_time
         self.last_update_time = now
+
+        # --- STAGE 4.5: COLD START SUPPRESSION ---
+        if not allow_new_assignments:
+            # Update holds for slots but don't perform new assignments
+            for s in slots:
+                s.update_hold()
+            return
         
         # 1. Update System Health & Mode Awareness
         self._update_system_health(self.has_recent_anomaly, dt)
@@ -247,11 +275,59 @@ class QueueManager:
             sorted_costs = np.sort(row)
             margin = (sorted_costs[1] - sorted_costs[0]) if len(sorted_costs) > 1 else 1.0
             norm_margin = margin / (current_score + 1e-6) if current_score >= 0.2 else 0.0
+
+            # --- STAGE 4.5: SIGNAL QUALITY LAYER ---
+            stability = SignalQuality.compute_stability(entry.history)
+            consistency = SignalQuality.compute_consistency(entry.history)
             
-            # Global Confidence (for now just signal quality, could include others)
-            global_conf = 1.0 # TODO: Integrate sensor-level confidence
+            # Composite raw signal confidence
+            raw_signal_conf = (0.4 * stability + 0.3 * consistency + 0.3 * entry.latest_conf)
             
+            # EWMA Debouncing
+            entry.smoothed_signal_conf = (SIGNAL_SMOOTHING * raw_signal_conf + 
+                                         (1.0 - SIGNAL_SMOOTHING) * entry.smoothed_signal_conf)
+            global_conf = np.clip(entry.smoothed_signal_conf, 0.0, 1.0)
+            
+            # --- STAGE 4.5: TRUTH DRIFT DETECTOR ---
+            if len(entry.history) >= 2:
+                prev_pos = np.array(entry.history[-2][1])
+                curr_pos = np.array(entry.history[-1][1])
+                motion_vec = curr_pos - prev_pos
+                
+                if np.linalg.norm(motion_vec) >= MIN_MOVEMENT:
+                    slot_vec = np.array(slot.centroid) - curr_pos
+                    
+                    norm_motion = SignalQuality.normalize_safe(motion_vec)
+                    norm_slot = SignalQuality.normalize_safe(slot_vec)
+                    
+                    alignment = np.dot(norm_motion, norm_slot)
+                    
+                    if alignment < -0.3: # Moving AWAY from slot
+                        entry.drift_counter += dt
+                    else:
+                        entry.drift_counter = 0
+                else:
+                    # Reset counter if movement is below threshold to prevent accumulation during jitter
+                    entry.drift_counter = 0
+                
+                # Clamped Drift Scoring
+                entry.drift_score = np.clip(entry.drift_counter / DRIFT_THRESHOLD, 0.0, 1.0)
+                
+                # Reduce confidence based on drift
+                global_conf *= (1.0 - 0.5 * entry.drift_score)
+
             decision_conf, reason = self._get_decision_confidence(global_conf, norm_margin)
+            
+            # --- STRUCTURED EXPLAINABILITY ---
+            flags = []
+            if norm_margin > 0.8: flags.append("HIGH_MARGIN")
+            if (now - slot.suggestion_timestamp > 1.0): flags.append("STABLE")
+            if self.system_health > 0.8: flags.append("HEALTHY")
+            if entry.drift_score > 0.3: flags.append("DRIFT_WARNING")
+            if global_conf < 0.4: flags.append("LOW_SIGNAL")
+            
+            entry.decision_reason = " + ".join(sorted(flags)) if flags else "EVALUATING"
+            entry.decision_confidence = decision_conf # Store for snapshot
             
             # --- CONSISTENCY & HYSTERESIS ---
             candidate_key = (slot.slot_id, entry.track_id)
@@ -301,6 +377,11 @@ class QueueManager:
                         # Fallback Contract: Geometry -> Clear
                         slot.suggested_track_id = None
                         logger.info(f"[SUGGEST] {EVENT_BUS.next_id()} Slot {slot.slot_id+1} -> CLEAR (Reason: {reason.name})")
+
+        # --- STAGE 4.5: LEAK PREVENTION ---
+        # Cleanup stale consistency counters (only keep active assignments)
+        active_keys = {(s.slot_id, s.suggested_track_id) for s in slots if s.suggested_track_id is not None}
+        self.consistency_counters = {k: v for k, v in self.consistency_counters.items() if k in active_keys}
 
         # 4. Sync Entry Fields
         for entry in self.queue.values():
