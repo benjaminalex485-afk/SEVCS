@@ -9,6 +9,7 @@ import copy
 from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
 from scipy.optimize import linear_sum_assignment
+import json
 
 # Professional Package-style Imports
 from src.queue_manager import QueueManager
@@ -78,8 +79,21 @@ class GlobalState:
         self.snapshot_buffer = collections.deque(maxlen=100) # ~3-5s history
         self.is_forensic_frozen = False
         self.freeze_start_time = 0.0
-        self.startup_time = utils.now()
+        self.startup_time = utils.system_now(caller="main_loop")
         self.last_detections = None
+        
+        # Stage 5.1.4 Determinism & Sequencing
+        self.snapshot_sequence = 0
+        self.last_snapshot_version = 0
+        self.freeze_reason = None
+        self.freeze_age = 0
+        self.recovery_attempts = 0
+        self.schema_version = 1
+        self.overflow_frames = 0
+        self.overflow_start_time = 0.0
+        
+        # Locks
+        self.snapshot_lock = threading.Lock()
         
         # Authentication
         self.auth_engine = AuthEngine()
@@ -104,84 +118,162 @@ def release_lock(name, lock):
         logger.debug(f"[LOCK] Releasing {name}")
     lock.release()
 
+def trigger_freeze(reason):
+    """Idempotent freeze trigger with priority and diagnostic logging."""
+    if G_STATE.is_forensic_frozen:
+        # Only override if new reason is critical or we are in the first frame of freeze
+        return
+    
+    G_STATE.is_forensic_frozen = True
+    G_STATE.freeze_reason = reason
+    G_STATE.freeze_start_time = utils.system_now(caller="main_loop")
+    logger.critical(f"!!! SYSTEM FREEZE TRIGGERED: {reason} !!!")
+
+# --- VALIDATION GATES (Pure & Non-Mutating) ---
+def validate_required_keys(snapshot):
+    """Enforces structural completeness at the entity level."""
+    for entry in snapshot.get("queue", []):
+        if "global_id" not in entry or "track_id" not in entry:
+            raise ValueError("MISSING_REQUIRED_FIELD: Queue entry incomplete")
+    
+    for slot in snapshot.get("slots", []):
+        if "slot_id" not in slot:
+            raise ValueError("MISSING_REQUIRED_FIELD: Slot entry incomplete")
+
+def validate_value_ranges(snapshot):
+    """Enforces physical domain safety (0.0 to 1.0 for metrics)."""
+    for entry in snapshot.get("queue", []):
+        d_score = entry.get("drift_score", 0.0)
+        conf = entry.get("signal_confidence", 0.0)
+        if not (0.0 <= d_score <= 1.0) or not (0.0 <= conf <= 1.0):
+            raise ValueError(f"VALUE_OUT_OF_RANGE: Drift={d_score}, Conf={conf}")
+
+def validate_referential_integrity(snapshot):
+    """Enforces graph consistency (Dangling assignments, duplicates)."""
+    ids = {e["global_id"] for e in snapshot.get("queue", []) if "global_id" in e}
+    
+    # 1. Duplicate Global IDs
+    if len(ids) != len(snapshot.get("queue", [])):
+         raise ValueError("DUPLICATE_GLOBAL_ID: Identity collision detected")
+         
+    # 2. Dangling Assignments
+    for slot in snapshot.get("slots", []):
+        gid = slot.get("assigned_global_id")
+        if gid and gid not in ids:
+            raise ValueError(f"DANGLING_ASSIGNMENT: Slot points to non-existent ID {gid}")
+
+def validate_internal_state(snapshot):
+    """Ensures presence of deep-state buffers required for replay."""
+    internal = snapshot.get("internal_state", {})
+    required = ["ewma_buffers", "hysteresis_state", "cooldowns", "consistency_counters"]
+    for key in required:
+        if key not in internal:
+            raise ValueError(f"STATE_CORRUPTION: Missing {key} in internal_state")
+
 # --- ATOMIC SNAPSHOT LAYER ---
-def get_system_snapshot(debug=False):
-    """Atomic multi-subsystem snapshot with strict lock ordering."""
-    snapshot = {
-        "timestamp": utils.now(),
-        "snapshot_id": G_STATE.metrics.next_snapshot_id(),
-        "partial": {
-            "vision": False,
-            "session": False,
-            "booking": False,
-            "queue": False
+def get_system_snapshot(frame_id, frame_time, debug=True):
+    """
+    9-Step Correct-by-Construction Forensic Pipeline:
+    1. Reference Capture (Locked)
+    2. Build Candidate (Async)
+    3. Serialize-Deserialize-Normalize-Validate (Async)
+    4. Atomic Sequence Commit (Locked)
+    """
+    # --- 1. REFERENCE CAPTURE (Minimal Lock Scope) ---
+    with G_STATE.vision_lock, G_STATE.session_lock, G_STATE.auth_engine.lock, G_STATE.queue_lock:
+        local_slots = [s for s in G_STATE.slots]
+        local_queue = list(G_STATE.queue_manager.queue.values()) if G_STATE.queue_manager else []
+        local_bookings = copy.deepcopy(G_STATE.auth_engine.bookings)
+        local_mode = G_STATE.mode
+        local_reason = G_STATE.mode_reason
+        # Internal deep state
+        local_internal = {
+            "ewma_buffers": {}, # Placeholder: Need actual buffers from QM/Slots
+            "hysteresis_state": {},
+            "cooldowns": {},
+            "consistency_counters": dict(G_STATE.queue_manager.consistency_counters) if G_STATE.queue_manager else {}
         }
-    }
-    acquired = []
-    
-    # 1. Acquire all locks in order
-    locks = [
-        ("vision", G_STATE.vision_lock),
-        ("session", G_STATE.session_lock),
-        ("booking", G_STATE.auth_engine.lock),
-        ("queue", G_STATE.queue_lock)
-    ]
-    
+        
+    # --- 2. BUILD CANDIDATE (Async/Primitive Data Only) ---
     try:
-        for name, lock in locks:
-            # High-frequency non-blocking fallback
-            if lock.acquire(timeout=0.01):
-                acquired.append(lock)
-            else:
-                logger.warning(f"[SNAPSHOT] PARTIAL: Could not acquire {name}_lock")
-                snapshot["partial"][name] = True
+        snapshot_candidate = {
+            "snapshot_version": frame_id,
+            "frame_time": utils.normalize_float(frame_time),
+            "mode": local_mode.name,
+            "mode_reason": local_reason.name,
+            "queue": [e.to_dict() for e in local_queue],
+            "slots": [s.to_dict() for s in local_slots],
+            "internal_state": local_internal,
+            "schema_version": G_STATE.schema_version,
+            "scope": {"node_id": "node_1", "camera_id": "cam_1"}
+        }
         
-        # 2. Extract Data (Primitive copies only)
-        # --- VISION ---
-        snapshot["camera_online"] = G_STATE.camera_online
-        snapshot["last_heartbeat"] = G_STATE.last_vision_heartbeat
-        snapshot["mode"] = G_STATE.mode.name
-        snapshot["mode_reason"] = G_STATE.mode_reason.name
+        # --- 3. FULL-CYCLE SANITY GATE (Dump -> Load -> Normalize -> Validate) ---
+        # A. Serialize (Strict NaN/Inf rejection)
+        serialized = json.dumps(snapshot_candidate, allow_nan=False)
         
-        # --- SLOTS ---
-        snapshot["slots"] = []
-        for s in G_STATE.slots:
-            s_dict = s.to_dict()
-            if debug:
-                # Add extra industrial fields
-                s_dict["industrial"] = {
-                    "hold_track": int(s.hold_track_id) if s.hold_track_id is not None else None,
-                    "hold_conf": float(s.hold_confidence),
-                    "consistency": int(G_STATE.queue_manager.consistency_counters.get((s.slot_id, s.suggested_track_id), 0)) if G_STATE.queue_manager else 0
-                }
-            snapshot["slots"].append(s_dict)
+        # B. Deserialize (Bit-drift removal)
+        deserialized = json.loads(serialized)
         
-        # --- AUTH/BOOKING ---
-        auth_data = G_STATE.auth_engine.to_dict()
-        snapshot["bookings"] = auth_data.get("bookings", {})
+        # C. Normalize (None-Removal -> Float Round -> Deep Sort)
+        normalized = utils.normalize_state(deserialized)
         
-        # --- QUEUE ---
-        snapshot["suggestions"] = []
-        if G_STATE.queue_manager:
-            snapshot["suggestions"] = G_STATE.queue_manager.get_suggestions_snapshot()
-            if debug:
-                snapshot["intelligence"] = {
-                    "health": float(G_STATE.queue_manager.system_health),
-                    "thrash_rate": float(G_STATE.queue_manager.thrash_rate)
-                }
-                # Capture detections for replay (optional: check if detections variable is accessible)
-                # In main loop, we can store detections in G_STATE temporarily
-                if hasattr(G_STATE, 'last_detections'):
-                    snapshot["detections"] = utils.serialize_detections(G_STATE.last_detections)
+        # --- CONTAINER VALIDATION (Context-Aware) ---
+        # 1. Slots must ALWAYS exist (hard invariant)
+        slots = normalized.get("slots")
+        if not isinstance(slots, list) or len(slots) == 0:
+            raise ValueError("EMPTY_SLOTS")
+
+        # 2. Mode must be present
+        mode = normalized.get("mode")
+        if mode is None:
+            raise ValueError("MISSING_MODE")
+
+        # 3. Queue can be empty ONLY in safe/idle states
+        queue = normalized.get("queue")
+        if queue is None:
+            raise ValueError("MISSING_QUEUE")
+
+        if len(queue) == 0:
+            # Allowed empty states
+            ALLOWED_EMPTY_QUEUE_MODES = {
+                "SAFE",
+                "IDLE",
+                "INIT",
+                "SOFT_SAFE"
+            }
+
+            if mode not in ALLOWED_EMPTY_QUEUE_MODES:
+                raise ValueError(f"EMPTY_QUEUE_INVALID_STATE: mode={mode}")
+             
+        validate_required_keys(normalized)
+        validate_value_ranges(normalized)
+        validate_referential_integrity(normalized)
+        validate_internal_state(normalized)
+        
+        # --- 4. ATOMIC SEQUENCE COMMIT (Locked) ---
+        with G_STATE.snapshot_lock:
+            G_STATE.snapshot_sequence += 1
+            seq = G_STATE.snapshot_sequence
+            
+            # Lineage
+            prev = G_STATE.last_snapshot_version
+            normalized["snapshot_sequence"] = seq
+            normalized["previous_snapshot_version"] = prev if prev else frame_id
+            
+            G_STATE.last_snapshot_version = frame_id
+            
+            # Final Hash (on normalized data only)
+            import hashlib
+            state_str = json.dumps(normalized, sort_keys=True)
+            normalized["state_hash"] = hashlib.sha256(state_str.encode()).hexdigest()
+            
+            return normalized
             
     except Exception as e:
-        logger.error(f"SNAPSHOT ERROR: {e}")
-    finally:
-        # Release in REVERSE order
-        for lock in reversed(acquired):
-            lock.release()
-        
-    return snapshot
+        logger.error(f"SNAPSHOT_PIPELINE_FAILURE: {e}")
+        trigger_freeze(f"SNAPSHOT_PIPELINE_ERROR: {type(e).__name__}")
+        return None
 
 # --- API SERVER ---
 api_app = Flask(__name__)
@@ -189,7 +281,9 @@ CORS(api_app)
 
 @api_app.route('/api/status', methods=['GET'])
 def get_status():
-    return jsonify(get_system_snapshot())
+    if G_STATE.snapshot_buffer:
+        return jsonify(copy.deepcopy(G_STATE.snapshot_buffer[-1]))
+    return jsonify({"error": "No snapshots available"}), 503
 
 # --- OPERATIONAL SAFETY: RATE LIMITING ---
 class TokenBucket:
@@ -197,12 +291,12 @@ class TokenBucket:
         self.capacity = capacity
         self.refill_rate = refill_rate
         self.tokens = capacity
-        self.last_refill = utils.now()
+        self.last_refill = utils.system_now(caller="api_thread")
         self.lock = threading.Lock()
 
     def consume(self, count=1):
         with self.lock:
-            now = utils.now()
+            now = utils.system_now(caller="api_thread")
             dt = now - self.last_refill
             self.tokens = min(self.capacity, self.tokens + dt * self.refill_rate)
             self.last_refill = now
@@ -243,8 +337,10 @@ from functools import wraps
 @rate_limit("suggestions")
 def get_suggestions():
     debug = request.args.get('debug', 'false').lower() == 'true'
-    snapshot = get_system_snapshot(debug=debug)
-    return jsonify(snapshot)
+    # Use dummy frame info for API if needed, or get last committed
+    if G_STATE.snapshot_buffer:
+        return jsonify(copy.deepcopy(G_STATE.snapshot_buffer[-1]))
+    return jsonify({"error": "No snapshots available"}), 503
 
 @api_app.route('/api/summary', methods=['GET'])
 @rate_limit("summary")
@@ -288,7 +384,7 @@ def get_forensics():
 @rate_limit("forensics")
 def freeze_forensics():
     G_STATE.is_forensic_frozen = True
-    G_STATE.freeze_start_time = utils.now()
+    G_STATE.freeze_start_time = utils.system_now(caller="api_thread")
     return jsonify({"status": "frozen", "expiry": 60})
 
 @api_app.route('/api/forensics/unfreeze', methods=['POST'])
@@ -305,7 +401,7 @@ def get_queue_api():
             for tid, entry in G_STATE.queue_manager.queue.items():
                 data.append({
                     "track_id": int(tid),
-                    "wait_time": int(utils.now() - entry.arrival_time),
+                    "wait_time": int(utils.system_now(caller="api_thread") - entry.arrival_time),
                     "priority": round(entry.priority_score, 2),
                     "suggestion": int(entry.assigned_slot) if entry.assigned_slot is not None else None
                 })
@@ -377,7 +473,7 @@ def authorize_api():
     slot_id, code = data.get('slot_id'), data.get('code')
     if slot_id is None or code is None: return jsonify({"status": "error", "message": "Missing slot_id or code"}), 400
     idx = slot_id - 1
-    loop_start = utils.now()
+    loop_start = utils.system_now(caller="api_thread")
     
     with G_STATE.vision_lock:
         if idx < 0 or idx >= len(G_STATE.slots): return jsonify({"status": "error", "code": "wrong_slot"}), 400
@@ -448,35 +544,55 @@ def main():
             logger.error("REPLAY_MODE and LIVE_INPUT are mutually exclusive. Exiting.")
             return
 
-    last_loop_time = utils.now()
+    last_loop_time = utils.system_now(caller="main_loop")
     replay_idx = 0
     first_loop = True
+    frame_id = 0
+    
+    # --- CONSECUTIVE COUNTERS ---
+    consecutive_overflow = 0
+    overflow_start_frame_time = 0.0
     while True:
-        loop_start = utils.now()
+        frame_id += 1
+        loop_start = utils.system_now(caller="main_loop")
         dt = loop_start - last_loop_time
         last_loop_time = loop_start
         
-        # 1. Latency Watchdog
-        if not first_loop:
-            G_STATE.metrics.record_latency(dt)
-        first_loop = False
+        # 1. Dual-Condition Watchdog (Stagnation OR Compute Hang)
+        is_replay = CONFIG.get("replay_mode", False)
+        in_startup_grace = (loop_start - G_STATE.startup_time < 2.0)
+        
+        if not in_startup_grace and not is_replay:
+            if dt > 4.0:
+                 trigger_freeze("SYSTEM_STALL: Compute hang detected (>4s)")
+        
+        # Performance mode logic (Refactored)
+        G_STATE.metrics.record_latency(dt)
         p95_latency = G_STATE.metrics.get_latency_p95()
         
-        if p95_latency > 0.8: # SAFE Trigger
-            G_STATE.mode = SystemMode.SAFE
-            G_STATE.mode_reason = ReasonCode.SYSTEM_STALL
-        elif p95_latency > 0.4: # SOFT_SAFE Trigger
-            G_STATE.mode = SystemMode.SOFT_SAFE
-            G_STATE.mode_reason = ReasonCode.SYSTEM_STALL
-        else:
-            if G_STATE.mode in [SystemMode.SAFE, SystemMode.SOFT_SAFE] and G_STATE.mode_reason == ReasonCode.SYSTEM_STALL:
-                logger.info(f"[WATCHDOG] Performance Recovered ({p95_latency:.3f}s) -> FULL Mode")
-                G_STATE.mode = SystemMode.FULL
-                G_STATE.mode_reason = ReasonCode.NONE
+        # --- OVERFLOW ESCALATION (Consecutive Frame Contract) ---
+        queue_size = len(G_STATE.queue_manager.queue) if G_STATE.queue_manager else 0
+        MAX_TRACKS = CONFIG.get("max_tracks", 50)
+        
+        if queue_size > MAX_TRACKS:
+            if consecutive_overflow == 0:
+                overflow_start_frame_time = loop_start
+            consecutive_overflow += 1
             
-            if p95_latency > 0.2: # WARN
-                if G_STATE.metrics.snapshot_id % 30 == 0:
-                    logger.warning(f"[STALL] Loop Latency High: {p95_latency:.3f}s")
+            # Escalation Rules
+            duration = loop_start - overflow_start_frame_time
+            if consecutive_overflow > 10 or duration > 2.0:
+                trigger_freeze(f"PERSISTENT_OVERFLOW: {consecutive_overflow} frames / {duration:.2f}s")
+            else:
+                G_STATE.mode = SystemMode.SOFT_SAFE
+                G_STATE.mode_reason = ReasonCode.OVERFLOW
+        else:
+            # INSTANT RESET
+            consecutive_overflow = 0
+            overflow_start_frame_time = 0.0
+            if G_STATE.mode == SystemMode.SOFT_SAFE and G_STATE.mode_reason == ReasonCode.OVERFLOW:
+                 G_STATE.mode = SystemMode.FULL
+                 G_STATE.mode_reason = ReasonCode.NONE
         
         # --- INPUT HANDLING ---
         if REPLAY_MODE:
@@ -487,15 +603,14 @@ def main():
             replay_idx += 1
             
             # DETERMINISTIC REPLAY: Use snapshot time as loop authority
-            loop_start = snapshot["timestamp"]
+            loop_start = snapshot["snapshot_version"] # Use frame_id-mapped time or similar
             
-            # Reconstruct detections from snapshot (needs snapshot upgrade)
-            # For now, if we don't have detections in snapshot, we skip
-            if "detections" not in snapshot:
-                logger.warning("No detections in snapshot. Replay limited.")
+            if "queue" not in snapshot:
+                logger.warning("No state in snapshot. Replay limited.")
                 time.sleep(0.033)
                 continue
-            detections = utils.deserialize_detections(snapshot["detections"])
+            # Note: Replay needs full state reconstruction. For now, we skip detections.
+            detections = sv.Detections.empty() # Placeholder
             frame = np.zeros((720, 1280, 3), dtype=np.uint8)
             time.sleep(0.033)
         elif USE_FAKE_INPUT:
@@ -528,11 +643,11 @@ def main():
             with G_STATE.queue_lock:
                 if G_STATE.queue_manager:
                     q_zones = CONFIG.get("queue_zones", [])
-                    G_STATE.queue_manager.update_queue(detections, q_zones)
+                    G_STATE.queue_manager.update_queue(detections, q_zones, frame_time=loop_start)
                     
                     # --- STAGE 4.5: COLD START SUPPRESSION ---
                     allow_new = (loop_start - G_STATE.startup_time > 2.0)
-                    G_STATE.queue_manager.update_suggestions(G_STATE.slots, allow_new_assignments=allow_new)
+                    G_STATE.queue_manager.update_suggestions(G_STATE.slots, allow_new_assignments=allow_new, frame_time=loop_start)
             
             # --- ASSIGNMENT ---
             matched_slots = set()
@@ -576,7 +691,7 @@ def main():
                         overlap = overlaps[d_idx, s_idx]
                         c_score = centroid_scores[d_idx, s_idx]
                         final_score = 0.7 * overlap + 0.3 * c_score
-                        slot.update_alignment(final_score, {"overlap_ratio": overlap, "centroid_score": c_score})
+                        slot.update_alignment(final_score, {"overlap_ratio": overlap, "centroid_score": c_score}, current_time=loop_start)
                         
                         # --- STATE MACHINE ---
                         if slot.state == SlotState.AUTH_PENDING:
@@ -632,7 +747,7 @@ def main():
                             if not is_auth or not is_aligned:
                                 logger.warning(f"[AUTH] SESSION TERMINATED for Slot {s_idx+1}")
                                 slot.set_state(SlotState.FREE)
-                        slot.handle_occlusion(False)
+                        slot.handle_occlusion(False, current_time=loop_start)
 
             # --- DEPARTURE & GHOST RECOVERY ---
             for i, slot in enumerate(G_STATE.slots):
@@ -652,24 +767,27 @@ def main():
                     else:
                         if hasattr(slot, 'departure_time'): del slot.departure_time
                     if slot.state not in [SlotState.FREE, SlotState.RESERVED]:
-                        slot.handle_occlusion(True)
+                        slot.handle_occlusion(True, current_time=loop_start)
 
-            # --- FINAL SANITY ASSERTIONS ---
             active_ids = set()
             for s_idx, s in enumerate(G_STATE.slots):
                 if s.locked_track_id is not None:
                     if s.locked_track_id in active_ids:
-                        logger.error(f"[INVARIANT] Duplicate ID {s.locked_track_id} on Slot {s_idx+1}")
-                        s.force_safe_state()
+                        trigger_freeze("INTEGRITY_DUPLICATE: Multiple slots assigned same ID")
                     active_ids.add(s.locked_track_id)
+            
+            # 2. Periodic Referential Integrity Audit
+            if frame_id % CONFIG.get("integrity_interval", 30) == 0:
+                 validate_referential_integrity(get_system_snapshot(frame_id, loop_start, debug=False))
             
         # 2. Snapshot Replay Buffer (End of Loop)
         if not G_STATE.is_forensic_frozen:
-            snapshot = get_system_snapshot(debug=True)
-            G_STATE.snapshot_buffer.append(snapshot)
+            snapshot = get_system_snapshot(frame_id, loop_start, debug=True)
+            if snapshot:
+                G_STATE.snapshot_buffer.append(snapshot)
         else:
             # Auto-unfreeze safety (60s)
-            if utils.now() - G_STATE.freeze_start_time > 60.0:
+            if loop_start - G_STATE.freeze_start_time > 60.0:
                 logger.warning("[FORENSICS] Auto-unfreezing buffer (Timeout)")
                 G_STATE.is_forensic_frozen = False
 

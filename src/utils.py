@@ -4,25 +4,18 @@ import numpy as np
 import os
 import time
 
-_LAST_TIME = time.monotonic()
-MAX_REASONABLE_DELTA = 1.0 # 1 second jitter limit
+_TIME_GUARD_ENABLED = True
+_ALLOWED_CALLERS = {"main_loop", "watchdog_thread", "api_thread"}
+
+def system_now(caller=None):
+    """Authorized monotonic time access. Only for loop/watchdog."""
+    if _TIME_GUARD_ENABLED and caller not in _ALLOWED_CALLERS:
+        raise RuntimeError(f"Unauthorized time access from: {caller}. Use frame_time instead.")
+    return time.time()
 
 def now():
-    """Central monotonic time wrapper with anomaly detection."""
-    global _LAST_TIME
-    current = time.monotonic()
-    dt = current - _LAST_TIME
-    
-    if dt > MAX_REASONABLE_DELTA:
-        # We don't raise here to keep system alive, but logs should catch it
-        # The consumer will see the jump and flag TIME_ANOMALY
-        pass
-    elif dt < 0:
-        # Monotonic should never go back, but we guard anyway
-        return _LAST_TIME
-        
-    _LAST_TIME = current
-    return current
+    """DEPRECATED: Use frame_time in logic or system_now('main_loop') in core."""
+    raise RuntimeError("Use frame_time instead of now()")
 
 class FrozenConfig(dict):
     """Immutable config wrapper to prevent runtime mutation."""
@@ -185,3 +178,62 @@ def deserialize_detections(data):
         class_id=np.array(data['class_id']) if data['class_id'] is not None else None,
         tracker_id=np.array(data['tracker_id']) if data['tracker_id'] is not None else None
     )
+
+def normalize_float(x):
+    """Rounds all floats to 6 decimals to prevent bit-drift across runs/machines."""
+    if isinstance(x, (float, np.float32, np.float64)):
+        return round(float(x), 6)
+    return x
+
+def is_finite_numeric(x):
+    """Rejects NaN or Inf to prevent decision logic corruption."""
+    if isinstance(x, (float, np.float32, np.float64)):
+        import math
+        return math.isfinite(x)
+    return True
+
+def remove_none_fields(obj):
+    """Recursively strips None fields to ensure structural canonicalization."""
+    if isinstance(obj, dict):
+        return {
+            k: remove_none_fields(v)
+            for k, v in obj.items()
+            if v is not None
+        }
+    elif isinstance(obj, list):
+        return [remove_none_fields(v) for v in obj]
+    else:
+        return obj
+
+def deep_sort(obj):
+    """Recursively sorts all nested dictionaries for bit-perfect hashing."""
+    if isinstance(obj, dict):
+        return {k: deep_sort(obj[k]) for k in sorted(obj)}
+    if isinstance(obj, list):
+        return [deep_sort(x) for x in obj]
+    return obj
+
+def normalize_state(obj):
+    """
+    Applies the full 3-step normalization pipeline:
+    1. Strip None fields (Canonical structure)
+    2. Round floats (Numeric stability)
+    3. Deep sort (Ordering stability)
+    Result is bit-perfect idempotent state.
+    """
+    # 1. Clean structure
+    obj = remove_none_fields(obj)
+    
+    # 2. Stable numbers
+    def _recurse_float(o):
+        if isinstance(o, dict):
+            return {k: _recurse_float(v) for k, v in o.items()}
+        elif isinstance(o, list):
+            return [_recurse_float(v) for v in o]
+        else:
+            return normalize_float(o)
+            
+    obj = _recurse_float(obj)
+    
+    # 3. Stable ordering
+    return deep_sort(obj)

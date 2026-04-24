@@ -10,7 +10,7 @@ class PriorityEngine:
     def __init__(self, max_dist=1500.0):
         self.max_dist = max_dist
 
-    def compute_priority(self, vehicle_entry, slot):
+    def compute_priority(self, vehicle_entry, slot, now=0.0):
         """
         Computes a normalized priority score [0, 1] for a vehicle-slot pair.
         """
@@ -19,7 +19,7 @@ class PriorityEngine:
         booking_score = 1.0 if vehicle_entry.booking_id is not None else 0.0
         
         # 2. Wait Time Score (Normalized over 120s)
-        wait_time = utils.now() - vehicle_entry.arrival_time
+        wait_time = now - vehicle_entry.arrival_time
         wait_score = min(1.0, wait_time / 120.0)
         
         # 3. Distance Score (Normalized by fixed frame diagonal)

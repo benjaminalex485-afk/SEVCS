@@ -20,7 +20,7 @@ class AuthEngine:
     def to_dict(self):
         """Deep isolation snapshot: returns primitive types only."""
         with self.lock:
-            now = utils.now()
+            now = utils.system_now(caller="api_thread")
             return {
                 "bookings": {
                     int(sid): {
@@ -45,12 +45,12 @@ class AuthEngine:
         with self.lock:
             # ISSUE 1: Prevent silent overwrite
             existing = self.bookings.get(slot_id)
-            if existing and existing["status"] in ["PENDING", "CLAIMED"] and utils.now() < existing["expires_at"]:
+            if existing and existing["status"] in ["PENDING", "CLAIMED"] and utils.system_now(caller="api_thread") < existing["expires_at"]:
                 logger.warning(f"[AUTH] REJECTED: Slot {slot_id+1} already has a valid booking.")
                 return None
 
             code = "".join(random.choices(string.digits, k=6))
-            expires_at = utils.now() + timeout
+            expires_at = utils.system_now(caller="api_thread") + timeout
             
             self.bookings[slot_id] = {
                 "auth_code": code,
@@ -78,7 +78,7 @@ class AuthEngine:
     def record_attempt(self, identifier):
         """Records an API attempt timestamp for rate limiting."""
         with self.lock:
-            now = utils.now()
+            now = utils.system_now(caller="api_thread")
             if identifier not in self.attempts:
                 self.attempts[identifier] = []
             self.attempts[identifier].append(now)
@@ -90,7 +90,7 @@ class AuthEngine:
         with self.lock:
             if identifier not in self.attempts:
                 return True
-            now = utils.now()
+            now = utils.system_now(caller="api_thread")
             recent = [t for t in self.attempts[identifier] if now - t < window]
             return len(recent) <= limit
 
@@ -99,7 +99,7 @@ class AuthEngine:
         IDEMPOTENT: Validates code, expiry, and binds to track_id.
         Transitions PENDING -> CLAIMED
         """
-        now = utils.now()
+        now = utils.system_now(caller="api_thread")
         with self.lock:
             # 1. Check idempotency
             existing = self.authorizations.get(slot_id)
@@ -154,7 +154,7 @@ class AuthEngine:
                 
             # Double check booking expiry even if authorized
             booking = self.bookings.get(slot_id)
-            if not booking or utils.now() > booking["expires_at"]:
+            if not booking or utils.system_now(caller="main_loop") > booking["expires_at"]:
                 logger.warning(f"[AUTH] EXPIRED while authorized for Slot {slot_id+1}")
                 if booking: self.bookings[slot_id]["status"] = "EXPIRED"
                 return False, "EXPIRED"
@@ -166,7 +166,7 @@ class AuthEngine:
             booking = self.bookings.get(slot_id)
             if not booking: return False
             if booking["status"] == "EXPIRED": return True
-            expired = utils.now() > booking["expires_at"]
+            expired = utils.system_now(caller="main_loop") > booking["expires_at"]
             if expired: self.bookings[slot_id]["status"] = "EXPIRED"
             return expired
 

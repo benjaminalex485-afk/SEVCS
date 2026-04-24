@@ -69,15 +69,14 @@ class Slot:
         self.last_evaluation_time = 0.0
         self.misalignment_timer = 0.0
         self.occlusion_timer = 0.0
-        self.state_enter_time = utils.now()
-        self.last_update_time = utils.now()
+        self.state_enter_time = utils.system_now(caller="main_loop")
+        self.last_update_time = utils.system_now(caller="main_loop")
 
-    def update_hold(self):
+    def update_hold(self, now=0.0):
         """FPS-aware HOLD decay logic."""
         if self.hold_track_id is None:
             return
 
-        now = utils.now()
         dt = now - self.last_update_time
         self.last_update_time = now
         
@@ -92,8 +91,8 @@ class Slot:
             self.hold_confidence = 0.0
             self.hold_frames = 0
 
-    def to_dict(self):
-        """Deep isolation snapshot: returns primitive types only."""
+    def to_dict(self, frame_time=0.0):
+        """Pure & Deterministic projection of slot state."""
         return {
             "slot_id": int(self.slot_id),
             "state": self.state.name,
@@ -103,10 +102,10 @@ class Slot:
             "alignment_score": float(self.alignment_score),
             "smoothed_alignment_score": float(self.smoothed_alignment_score),
             "suggestion": {
-                "track_id": self.suggested_track_id,
+                "track_id": int(self.suggested_track_id) if self.suggested_track_id is not None else None,
                 "confidence": float(self.suggestion_confidence),
                 "state": self.suggestion_state.name,
-                "stable_for": float(min(utils.now() - self.suggestion_timestamp, 10.0)) if self.suggestion_timestamp > 0 else 0.0
+                "stable_for": float(min(frame_time - self.suggestion_timestamp, 10.0)) if self.suggestion_timestamp > 0 else 0.0
             },
             "occluded": self.occlusion_timer > 0
         }
@@ -127,7 +126,7 @@ class Slot:
         self.suggestion_timestamp = 0
         self.suggestion_confidence = 0.0
         self.state = SlotState.FREE # Emergency bypass
-        self.state_enter_time = utils.now()
+        self.state_enter_time = utils.system_now(caller="main_loop")
         self.misalignment_timer = 0.0
         self.occlusion_timer = 0.0
 
@@ -162,7 +161,7 @@ class Slot:
 
             logger.info(f"[Slot {self.slot_id+1}] State Change: {self.state.name} -> {new_state.name} | Track: {track_id}")
             self.state = new_state
-            self.state_enter_time = utils.now()
+            self.state_enter_time = utils.system_now(caller="main_loop")
             
             # Atomically update track ID during state transition
             if track_id is not None:
@@ -171,7 +170,7 @@ class Slot:
             return True
         return False
 
-    def update_alignment(self, score, features):
+    def update_alignment(self, score, features, current_time=0.0):
         """
         Updates alignment with temporal smoothing and hysteresis.
         """
@@ -179,7 +178,6 @@ class Slot:
         alpha = 0.3
         self.smoothed_alignment_score = (0.7 * self.smoothed_alignment_score) + (alpha * score)
         
-        current_time = utils.now()
         ALIGN_THRESHOLD_HIGH = 0.75
         ALIGN_THRESHOLD_LOW = 0.45 
         GRACE_PERIOD = 5.0 # Seconds before we declare MISALIGNED
@@ -224,8 +222,7 @@ class Slot:
                 self.alignment_state = AlignmentState.MISALIGNED
                 logger.warning(f"[Slot {self.slot_id+1}] Decision: MISALIGNED (Grace Period Expired)")
 
-    def handle_occlusion(self, is_occluded):
-        current_time = utils.now()
+    def handle_occlusion(self, is_occluded, current_time=0.0):
         if is_occluded:
             if self.occlusion_timer == 0.0:
                 self.occlusion_timer = current_time

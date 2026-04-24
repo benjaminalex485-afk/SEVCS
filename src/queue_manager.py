@@ -12,10 +12,11 @@ import collections
 logger = logging.getLogger(__name__)
 
 class QueueEntry:
-    def __init__(self, track_id, centroid=(0,0)):
+    def __init__(self, track_id, centroid=(0,0), arrival_time=None):
         self.track_id = track_id
-        self.arrival_time = utils.now()
-        self.last_seen_time = utils.now()
+        self.global_id = f"v_{track_id}_{int(arrival_time or 0)}"
+        self.arrival_time = arrival_time or 0.0
+        self.last_seen_time = arrival_time or 0.0
         self.centroid = centroid
         self.user = None
         self.booking_id = None
@@ -33,17 +34,17 @@ class QueueEntry:
         self.decision_reason = "INIT"
 
     def to_dict(self):
-        """Deep isolation snapshot: returns primitive types only."""
+        """Pure & Deterministic projection of entry state."""
         return {
+            "global_id": self.global_id,
             "track_id": int(self.track_id),
             "arrival_time": float(self.arrival_time),
-            "user": self.user,
+            "last_seen_time": float(self.last_seen_time),
             "priority": float(self.priority_score),
             "assigned_slot": self.assigned_slot,
-            "wait_time": float(utils.now() - self.arrival_time),
             "signal_confidence": float(self.smoothed_signal_conf),
-            "decision_reason": self.decision_reason,
-            "drift_score": float(self.drift_score)
+            "drift_score": float(self.drift_score),
+            "decision_reason": str(self.decision_reason)
         }
 
 class QueueManager:
@@ -58,8 +59,8 @@ class QueueManager:
         self.thrash_rate = 0.0 # EWMA
         self.system_mode = SystemMode.FULL
         self.mode_reason = ReasonCode.NONE
-        self.last_update_time = utils.now()
-        self.anomaly_window_start = utils.now()
+        self.last_update_time = utils.system_now(caller="main_loop")
+        self.anomaly_window_start = utils.system_now(caller="main_loop")
         self.has_recent_anomaly = False
         
         # State consistency tracking
@@ -67,17 +68,20 @@ class QueueManager:
         self.hold_timers = {} # slot_id -> (track_id, start_time, confidence)
 
     def to_dict(self):
-        """Deep isolation snapshot: returns primitive types only."""
+        """Pure & Deterministic projection of manager state."""
+        # Sorting for forensic stability (outside live state)
+        sorted_entries = sorted(self.queue.values(), key=lambda x: x.global_id)
         return {
-            "entries": [e.to_dict() for e in self.queue.values()],
-            "count": len(self.queue)
+            "queue": [e.to_dict() for e in sorted_entries],
+            "system_health": float(self.system_health),
+            "thrash_rate": float(self.thrash_rate)
         }
 
     def _update_system_health(self, has_anomaly, dt):
         """Asymmetric health: fast drop, slow recovery with accelerated jump."""
         if has_anomaly:
             self.system_health = max(0.0, self.system_health - 0.2)
-            self.anomaly_window_start = utils.now()
+            self.anomaly_window_start = now
             self.has_recent_anomaly = True
         else:
             # Slow recovery (EWMA-like)
@@ -85,7 +89,7 @@ class QueueManager:
             self.system_health = min(1.0, self.system_health + recovery_rate)
             
             # Accelerated Jump: 5s clean + good signals
-            if utils.now() - self.anomaly_window_start > 5.0:
+            if now - self.anomaly_window_start > 5.0:
                 self.system_health = 1.0
                 self.has_recent_anomaly = False
         
@@ -137,11 +141,30 @@ class QueueManager:
             )
         return self.zone_cache[poly_hash]
 
-    def update_queue(self, detections, queue_zones):
+    def _prune_queue(self, max_tracks):
+        """STRICT Triple-Key Deterministic Pruning: (last_seen, global_id, track_id)"""
+        if len(self.queue) <= max_tracks:
+            return
+            
+        # 1. Sort by deterministic triple-key
+        items = list(self.queue.values())
+        items.sort(key=lambda x: (x.last_seen_time, x.global_id, x.track_id))
+        
+        # 2. Prune oldest N
+        num_to_remove = len(self.queue) - max_tracks
+        removed_ids = [item.track_id for item in items[:num_to_remove]]
+        
+        for tid in removed_ids:
+            logger.warning(f"[PRUNE] Evicting Track {tid} (Deterministic Load Shedding)")
+            del self.queue[tid]
+            if tid in self.entry_stability:
+                del self.entry_stability[tid]
+
+    def update_queue(self, detections, queue_zones, frame_time=0.0):
         """
         Updates the queue based on vehicles in the QUEUE_ZONE.
         """
-        now = utils.now()
+        now = frame_time
         vehicles_in_zone = {} # track_id -> centroid
         
         # 1. Detect vehicles in Queue Zones (Efficiency: Use cached zones)
@@ -182,7 +205,7 @@ class QueueManager:
                 # Only add if stabilized (> 5 frames)
                 if self.entry_stability[tid] > 5:
                     logger.info(f"[QUEUE] {EVENT_BUS.next_id()} Vehicle {tid} ENTERED at {centroid}")
-                    self.queue[tid] = QueueEntry(tid, centroid)
+                    self.queue[tid] = QueueEntry(tid, centroid, arrival_time=now)
             else:
                 # Update existing
                 entry = self.queue[tid]
@@ -208,10 +231,15 @@ class QueueManager:
         for tid in to_remove:
             if tid in self.queue: del self.queue[tid]
             if tid in self.entry_stability: del self.entry_stability[tid]
+            
+        # 4. Deterministic Pruning (Load Shedding Guard)
+        import os
+        MAX_TRACKS = int(os.getenv("SEVCS_MAX_TRACKS", 50))
+        self._prune_queue(MAX_TRACKS)
 
-    def update_suggestions(self, slots, allow_new_assignments=True):
+    def update_suggestions(self, slots, allow_new_assignments=True, frame_time=0.0):
         """Hardened production-grade suggestion engine with industrial reliability."""
-        now = utils.now()
+        now = frame_time
         dt = now - self.last_update_time
         self.last_update_time = now
 
@@ -219,7 +247,7 @@ class QueueManager:
         if not allow_new_assignments:
             # Update holds for slots but don't perform new assignments
             for s in slots:
-                s.update_hold()
+                s.update_hold(now=now)
             return
         
         # 1. Update System Health & Mode Awareness
@@ -248,7 +276,7 @@ class QueueManager:
         for v_idx, entry in enumerate(queue_list):
             for s_idx, slot in enumerate(suggestable_slots):
                 # Priority Engine (Stage 3.5: Geometry only by default)
-                priority = self.priority_engine.compute_priority(entry, slot)
+                priority = self.priority_engine.compute_priority(entry, slot, now=now)
                 # Ensure Geometric Dominance (Intelligence boost handled elsewhere or integrated)
                 cost_matrix[v_idx, s_idx] = 1.0 - priority
 
