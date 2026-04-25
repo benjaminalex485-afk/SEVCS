@@ -10,6 +10,7 @@ from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
 from scipy.optimize import linear_sum_assignment
 import json
+from flask_sock import Sock
 
 # Professional Package-style Imports
 from src.queue_manager import QueueManager
@@ -105,6 +106,25 @@ class GlobalState:
         ]
 
 G_STATE = GlobalState()
+
+# --- WEBSOCKET LAYER ---
+sock = Sock(api_app)
+esp32_clients = set()
+
+@sock.route('/ws/esp32')
+def esp32_ws(ws):
+    esp32_clients.add(ws)
+    logger.info(f"[WS] ESP32 Connected from {request.remote_addr}")
+    try:
+        while True:
+            data = ws.receive()
+            if data:
+                # Optional: Process incoming telemetry from ESP32
+                pass
+    except Exception as e:
+        logger.warning(f"[WS] ESP32 Disconnected: {e}")
+    finally:
+        esp32_clients.discard(ws)
 
 # --- HARDENING HELPERS ---
 def acquire_lock(name, lock):
@@ -790,6 +810,28 @@ def main():
             if loop_start - G_STATE.freeze_start_time > 60.0:
                 logger.warning("[FORENSICS] Auto-unfreezing buffer (Timeout)")
                 G_STATE.is_forensic_frozen = False
+
+        # --- REAL-TIME ESP32 BROADCAST ---
+        if frame_id % 5 == 0: # 6 FPS broadcast
+            for slot_idx, slot in enumerate(G_STATE.slots):
+                if slot_idx + 1 == 1: # Target Slot 1
+                    payload = {
+                        "slot_id": 1,
+                        "command": "SET_STATE",
+                        "state": slot.state.name,
+                        "vehicle_present": slot.locked_track_id is not None,
+                        "confidence": round(slot.smoothed_alignment_score, 2),
+                        "timestamp": int(loop_start)
+                    }
+                    msg = json.dumps(payload)
+                    dead_clients = set()
+                    for client in esp32_clients:
+                        try:
+                            client.send(msg)
+                        except:
+                            dead_clients.add(client)
+                    for dc in dead_clients:
+                        esp32_clients.discard(dc)
 
         if not USE_FAKE_INPUT:
             frame = visualizer.draw_overlays(frame, G_STATE.slots, CONFIG.get('queue_zones', []), {})
