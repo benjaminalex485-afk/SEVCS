@@ -1,4 +1,4 @@
-import { bookSlot } from '../app/api.js';
+import { bookSlot, addSlot, removeSlot, updateSlotType } from '../app/api_v3.js';
 import { events } from '../app/events.js';
 
 export function initGrids() {
@@ -7,28 +7,61 @@ export function initGrids() {
 
     // Delegated click handler for slots
     slotContainer.addEventListener('click', async (e) => {
+        // 1. Booking Action
         const slotCard = e.target.closest('.slot-card');
-        if (!slotCard) return;
-
-        const slotId = slotCard.dataset.id;
-        const isFree = slotCard.classList.contains('free');
-
-        if (isFree) {
+        if (slotCard && slotCard.classList.contains('interactive') && !e.target.closest('button')) {
+            const slotId = slotCard.dataset.id;
             console.log(`[SEVCS] Requesting booking for slot ${slotId}`);
-            const result = await bookSlot(slotId);
-            if (result.status === 'REJECTED') {
-                alert(`Booking failed: ${result.error?.reason || 'System busy'}`);
+            await bookSlot(slotId);
+            return;
+        }
+
+        // 2. Remove Slot (Admin)
+        const btnRemove = e.target.closest('.btn-remove-slot');
+        if (btnRemove) {
+            const slotId = btnRemove.dataset.id;
+            if (confirm(`Remove Slot ${slotId}?`)) {
+                await removeSlot(slotId);
             }
+            return;
+        }
+
+        // 3. Update Type (Admin)
+        const btnType = e.target.closest('.btn-toggle-type');
+        if (btnType) {
+            const slotId = btnType.dataset.id;
+            const currentType = btnType.dataset.type;
+            const nextType = currentType === 'FAST' ? 'STANDARD' : 'FAST';
+            await updateSlotType(slotId, nextType);
+            return;
+        }
+
+        // 4. Global Admin Actions
+        if (e.target.id === 'btn-add-slot') {
+            await addSlot('STANDARD');
         }
     });
 
+    let lastRenderedHash = null;
+
     events.on('STATE_UPDATED', (state) => {
         const snapshot = state.snapshot;
+        const isAdmin = state.uiMode === 'ADMIN';
+
+        // Performance Guard: Only re-render if data has actually changed
+        const currentHash = snapshot ? `${snapshot.state_hash}_${snapshot.snapshot_sequence}_${isAdmin}` : 'empty';
+        if (currentHash === lastRenderedHash) return;
+        lastRenderedHash = currentHash;
 
         // 1. Render Slot Grid
         slotContainer.innerHTML = `
             <div class="card">
-                <h2>Charging Slots</h2>
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem">
+                    <h2 style="margin: 0">Charging Slots</h2>
+                    ${isAdmin ? `
+                        <button class="btn btn-outline btn-small" id="btn-add-slot">+ Add Slot</button>
+                    ` : ''}
+                </div>
                 ${snapshot ? `
                     ${snapshot.slots.length > 0 ? `
                         <div class="grid-container">
@@ -36,9 +69,26 @@ export function initGrids() {
                                 <div class="slot-card ${slot.state.toLowerCase()} ${state.allowActions && slot.state === 'FREE' ? 'interactive' : ''}" 
                                      data-id="${slot.slot_id}"
                                      title="${slot.state === 'FREE' ? 'Click to book' : ''}">
-                                    <div style="font-size: 0.7rem; color: var(--text-secondary)">ID: ${slot.slot_id}</div>
+                                    
+                                    <div style="display: flex; justify-content: space-between; align-items: flex-start">
+                                        <div style="font-size: 0.7rem; color: var(--text-secondary)">ID: ${slot.slot_id}</div>
+                                        ${isAdmin ? `
+                                            <button class="btn-remove-slot" data-id="${slot.slot_id}" title="Remove Slot">×</button>
+                                        ` : ''}
+                                    </div>
+
                                     <div style="font-weight: 700; margin: 4px 0">${slot.state}</div>
                                     <div class="mono" style="font-size: 0.75rem">${slot.assigned_global_id ? 'V-' + slot.assigned_global_id : '---'}</div>
+                                    
+                                    <div class="slot-type-badge ${slot.charger_type?.toLowerCase() || 'standard'}">
+                                        ${slot.charger_type || 'STANDARD'}
+                                    </div>
+
+                                    ${isAdmin ? `
+                                        <button class="btn-toggle-type" data-id="${slot.slot_id}" data-type="${slot.charger_type || 'STANDARD'}">
+                                            ⚙️ Change Type
+                                        </button>
+                                    ` : ''}
                                 </div>
                             `).join('')}
                         </div>

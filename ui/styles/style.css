@@ -200,6 +200,7 @@ body {
     padding: 1rem;
     text-align: center;
     transition: all 0.2s ease;
+    position: relative;
 }
 
 .slot-card.interactive {
@@ -214,6 +215,80 @@ body {
 
 .slot-card.charging { border-color: var(--accent-green); box-shadow: 0 0 10px rgba(16, 185, 129, 0.2); }
 .slot-card.reserved { border-color: var(--accent-blue); }
+
+.slot-type-badge {
+    display: inline-block;
+    font-size: 0.6rem;
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-weight: 800;
+    margin-top: 8px;
+    text-transform: uppercase;
+}
+
+.slot-type-badge.fast {
+    background: rgba(245, 158, 11, 0.2);
+    color: #f59e0b;
+    border: 1px solid rgba(245, 158, 11, 0.3);
+}
+
+.slot-type-badge.standard {
+    background: rgba(59, 130, 246, 0.2);
+    color: #3b82f6;
+    border: 1px solid rgba(59, 130, 246, 0.3);
+}
+
+.btn-remove-slot {
+    background: none;
+    border: none;
+    color: var(--accent-red);
+    cursor: pointer;
+    font-size: 1.2rem;
+    padding: 0 4px;
+    line-height: 1;
+    opacity: 0.5;
+    transition: opacity 0.2s;
+}
+
+.btn-remove-slot:hover {
+    opacity: 1;
+}
+
+.btn-toggle-type {
+    display: block;
+    width: 100%;
+    margin-top: 10px;
+    background: rgba(255,255,255,0.05);
+    border: 1px solid var(--border-color);
+    color: var(--text-secondary);
+    font-size: 0.65rem;
+    padding: 4px;
+    border-radius: 4px;
+    cursor: pointer;
+}
+
+.btn-toggle-type:hover {
+    background: rgba(255,255,255,0.1);
+    color: white;
+}
+
+.btn-toggle-type:focus-visible {
+    outline: 2px solid var(--accent-blue);
+    outline-offset: 2px;
+}
+
+.btn-toggle-type:active {
+    transform: scale(0.95);
+}
+
+.btn:focus-visible {
+    outline: 2px solid var(--accent-blue);
+    outline-offset: 2px;
+}
+
+.btn:active {
+    transform: scale(0.98);
+}
 
 .status-table {
     width: 100%;

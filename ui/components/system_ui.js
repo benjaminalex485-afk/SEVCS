@@ -37,11 +37,16 @@ export function initSystemUI() {
             snapshotInfo.innerText = `Snapshot: v${snapshot.snapshot_version} | Seq #${snapshot.snapshot_sequence}`;
         }
 
-        healthIndicator.className = `health-indicator ${state.uiHealth.toLowerCase()}`;
-        healthIndicator.innerText = `HEALTH: ${state.uiHealth}`;
+        const healthScore = state.healthScore || 0;
+        let healthLabel = 'CRITICAL';
+        if (healthScore > 80) healthLabel = 'GOOD';
+        else if (healthScore > 40) healthLabel = 'DEGRADED';
+        
+        healthIndicator.className = `health-indicator ${healthLabel.toLowerCase()}`;
+        healthIndicator.innerText = `HEALTH: ${healthLabel} (${healthScore}%)`;
 
         // 3. Mode Toggle Protection & Styling
-        const canSwitch = state.uiState === 'SYNCHRONIZED';
+        const canSwitch = state.displayState === 'SYNCHRONIZED';
         btnAdmin.disabled = !canSwitch;
         btnUser.disabled = !canSwitch;
         btnAdmin.className = `btn-toggle ${state.uiMode === 'ADMIN' ? 'active' : ''}`;
@@ -94,8 +99,8 @@ export function initSystemUI() {
                         <div class="mono">
                             <p>Mode: <span style="color: var(--accent-blue)">${snapshot.system_mode}</span></p>
                             <p>Health: ${snapshot.system_health}%</p>
-                            <p>Gap: ${state.hasGap ? 'YES' : 'NO'}</p>
-                            <p>Recovery: ${state.recoveryCounter}/3</p>
+                            <p>Sync Score: ${state.healthScore}%</p>
+                            <p>Stable: ${state.stableFrames}/10</p>
                         </div>
                     ` : '<p class="mono" style="color: var(--text-secondary)">Waiting for backend data...</p>'}
                 </div>
@@ -111,9 +116,9 @@ export function initSystemUI() {
                 <div class="card">
                     <h2>Telemetry</h2>
                     <div class="mono" style="font-size: 0.75rem">
-                        <p>Latency: ${state.latency}ms</p>
-                        <p>Stability: ${state.stabilityCounter} frames</p>
-                        <p>Transition: ${state.transitionLog.length > 0 ? state.transitionLog[state.transitionLog.length-1].transition : '---'}</p>
+                        <p>Latency: ${state.lastSequence !== -1 ? Math.round(performance.now() - state.lastSnapshotMono) : '---'}ms</p>
+                        <p>Stable: ${state.stableFrames} frames</p>
+                        <p>Resyncing: ${state.isResyncing ? 'YES' : 'NO'}</p>
                         <p>Simulation: ${state.isSimulating ? 'ACTIVE' : 'OFF'}</p>
                     </div>
                 </div>

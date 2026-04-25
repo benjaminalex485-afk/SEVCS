@@ -1,5 +1,5 @@
-import { appState } from '../app/state_v3.js';
-import { login, signup } from '../app/api_v3.js';
+import { appState, resync } from '../app/state_v3.js';
+import { login, signup, startPolling } from '../app/api_v3.js';
 import { events } from '../app/events.js';
 
 let lastStatus = null;
@@ -14,7 +14,7 @@ export function renderAuthUI() {
 
     const isStatusSame = appState.authStatus === lastStatus;
     const isModeSame = currentMode === lastMode;
-    const isSyncStateSame = appState.uiState === lastSyncState;
+    const isSyncStateSame = appState.isDesync === lastSyncState;
     const isContainerEmpty = container.innerHTML === '';
 
     if (isStatusSame && isModeSame && !isContainerEmpty) {
@@ -24,7 +24,7 @@ export function renderAuthUI() {
     }
 
     lastStatus = appState.authStatus;
-    lastSyncState = appState.uiState;
+    lastSyncState = appState.isDesync;
     lastMode = currentMode;
 
     if (appState.authStatus === 'AUTHENTICATED') {
@@ -36,7 +36,7 @@ export function renderAuthUI() {
     container.style.display = 'flex';
 
     if (appState.authStatus === 'AUTHENTICATED_PENDING') {
-        if (appState.uiState === 'RESYNC_REQUIRED') {
+        if (appState.isResyncing) {
             container.innerHTML = `
                 <div class="auth-card glass">
                     <div class="error-icon" style="font-size: 3rem; margin-bottom: 1rem;">⚠️</div>
@@ -46,8 +46,8 @@ export function renderAuthUI() {
                 </div>
             `;
             document.getElementById('resync-btn').onclick = () => {
-                import('../app/state.js').then(m => m.resync());
-                import('../app/api.js').then(m => m.startPolling());
+                resync();
+                startPolling();
             };
             return;
         }

@@ -6,10 +6,16 @@ export function initSimulationUI() {
     const container = document.getElementById('simulation-panel-container');
     const actionContainer = document.getElementById('action-panel-container');
 
-    events.on('STATE_UPDATED', render);
+    events.on('STATE_UPDATED', (state) => render(state));
 
-    function render() {
+    let lastRenderedHash = null;
+
+    function render(state = {}) {
         const isAdmin = appState.uiMode === 'ADMIN';
+
+        const currentHash = `${isAdmin}_${appState.isSimulating}_${appState.requestHistory.length}`;
+        if (currentHash === lastRenderedHash) return;
+        lastRenderedHash = currentHash;
 
         if (!isAdmin) {
             container.classList.add('hidden');
@@ -28,7 +34,10 @@ export function initSimulationUI() {
                     <button class="btn" id="btn-auth" ${!appState.allowActions ? 'disabled' : ''}>Authorize</button>
                     <button class="btn" id="btn-book" ${!appState.allowActions ? 'disabled' : ''}>Book Slot</button>
                     <button class="btn" id="btn-release" ${!appState.allowActions ? 'disabled' : ''}>Release Slot</button>
-                    <button class="btn btn-danger" id="btn-stop" ${appState.uiState === 'DISCONNECTED' ? 'disabled' : ''}>EMERGENCY STOP</button>
+                    <button class="btn btn-danger" id="btn-stop" 
+                        ${state.displayState === 'DISCONNECTED' ? 'disabled' : ''}>
+                        ${state.displayState === 'FROZEN' ? '⚠️ SYSTEM HALTED' : 'EMERGENCY STOP'}
+                    </button>
                 </div>
 
                 <h3>Request History</h3>

@@ -10,7 +10,6 @@ export const appState = {
     systemState: 'VALID', // VALID | INVALID (empty queue AND slots)
     
     // Health & Determinism
-    uiState: 'DISCONNECTED', // SYNCHRONIZED | DEGRADED | DESYNCHRONIZED | DISCONNECTED | RESYNC_REQUIRED
     uiHealth: 'CRITICAL', // GOOD | DEGRADED | CRITICAL
     stagnantCounter: 0,
     hasGap: false,
@@ -18,12 +17,15 @@ export const appState = {
     stabilityCounter: 0,
     recoveryCounter: 0, // 3-frame stability for desync recovery
     stableFrames: 0, // Sequence stability counter
-    lastSnapshotTime: 0, // Wall clock for freshness
-    lastDesyncFrameTime: 0,
-    lastUpdateTimestamp: 0,
-    latency: 0,
-    timeOffset: 0, // EMA for long-term clock drift
+    lastSnapshotTime: Date.now(), // Wall clock for freshness
+    lastSnapshotMono: performance.now(),
+    appStartMono: performance.now(),
     lastClockSyncTime: 0,
+    lastHardSyncTime: 0,
+    minAcceptedSequence: -1,
+    isResyncing: false,
+    isDesync: false,
+    healthScore: 100,
     criticalLatencyCycles: 0,
     forceGapSimulation: false,
     
@@ -49,15 +51,20 @@ export const appState = {
     lastSyncVersion: -1,
     lastProcessedSource: null,
     allowActions: false,
+    simSlots: [
+        {slot_id: 1, state: "FREE", charger_type: "FAST", assigned_global_id: null},
+        {slot_id: 2, state: "FREE", charger_type: "STANDARD", assigned_global_id: null}
+    ],
     
     // Constants
     MAX_STAGNANT_FRAMES: 5,
     MAX_LATENCY_THRESHOLD: 1000, 
     BACKEND_STABILITY_FRAMES: 2,
     MAX_SNAPSHOT_AGE: 5000, 
-    SNAPSHOT_FRESHNESS_MS: 1000,
+    SNAPSHOT_FRESHNESS_MS: 3000,
     INTENT_TIMEOUT_MS: 5000,
     MAX_ALLOWED_GAP: 5,
+    MAX_SEQ_JUMP: 20,
     RECOVERY_THRESHOLD: 3,
     PRIORITY: { BACKEND: 2, SIMULATION: 1 }
 };
@@ -74,6 +81,19 @@ function safeClone(obj) {
         }
     } catch (e) {}
     return JSON.parse(JSON.stringify(obj));
+}
+
+/**
+ * Recursive Immutability Guard
+ */
+function deepFreeze(obj) {
+    if (obj && typeof obj === 'object' && !Object.isFrozen(obj)) {
+        Object.freeze(obj);
+        for (const key of Object.keys(obj)) {
+            deepFreeze(obj[key]);
+        }
+    }
+    return obj;
 }
 
 /**
@@ -122,7 +142,7 @@ function adjustClock(serverTs) {
  */
 export function setLatestSnapshot(data, latency) {
     // 0. Synchronization Barrier
-    if (appState.uiState === 'RESYNC_REQUIRED') {
+    if (appState.isResyncing) {
         return; // Ignore all snapshots until manual resync
     }
 
@@ -142,7 +162,12 @@ export function setLatestSnapshot(data, latency) {
 
     // 4. Timestamp Normalization & Directional Guard
     let timestamp = normalized.timestamp;
-    if (timestamp < 1e12) timestamp *= 1000; 
+    
+    // Normalize ONCE and use everywhere
+    if (timestamp < 1e12) {
+        timestamp = timestamp * 1000;
+    }
+    normalized.timestamp = timestamp;
 
     // Simulation Injectors: Controlled gap injection
     if (appState.forceGapSimulation) {
@@ -157,14 +182,14 @@ export function setLatestSnapshot(data, latency) {
 
     // Stale: Reject hard
     if (age > appState.MAX_SNAPSHOT_AGE) {
-        console.warn('[SEVCS] SNAPSHOT REJECTED: Stale Data', { age, offset: appState.timeOffset });
+        console.warn('[SEVCS] SNAPSHOT REJECTED: Stale Data', { age, timestamp, adjustedNow, offset: appState.timeOffset });
         appState.stableBackendFrames = 0; 
         return;
     }
 
     // Future: Reject drift
     if (timestamp - adjustedNow > 3000) {
-        console.error('[SEVCS] SNAPSHOT REJECTED: Future Timestamp');
+        console.error('[SEVCS] SNAPSHOT REJECTED: Future Timestamp', { drift: timestamp - adjustedNow, timestamp, adjustedNow });
         appState.stableBackendFrames = 0; 
         return;
     }
@@ -226,7 +251,7 @@ export function setLatestSnapshot(data, latency) {
 
     // Desync Early Detection (Monotonicity Guard)
     if (appState.snapshot && normalized.snapshot_sequence > appState.lastSequence + 1) {
-        appState.uiState = 'DESYNCHRONIZED';
+        appState.isDesync = true;
         appState.recoveryCounter = 0;
     }
 
@@ -246,9 +271,9 @@ export function setLatestSnapshot(data, latency) {
             appState.simExpired = true;
             appState.blockSimRestart = true;
             appState.simLockoutStartTime = Date.now();
-            appState.uiState = 'DESYNCHRONIZED';
+            appState.isDesync = true;
         } else if (simTime > appState.SIM_WARNING_THRESHOLD) {
-            appState.uiState = 'SIMULATION_EXPIRING';
+            // Simulation expiring warning handled by derived health
         }
     }
 }
@@ -268,12 +293,15 @@ export function checkPendingHardSync() {
 
 export function takeLatestSnapshot() {
     // Audit for persistent desync using deterministic frame time
-    if (appState.uiState === 'DESYNCHRONIZED' && latestIncomingSnapshot) {
+    if (appState.isDesync && latestIncomingSnapshot) {
         if (!appState.lastDesyncFrameTime) appState.lastDesyncFrameTime = latestIncomingSnapshot.timestamp;
         
         // Hysteresis: Only hard sync if no recovery progress is being made
         const desyncDuration = latestIncomingSnapshot.timestamp - appState.lastDesyncFrameTime;
         if (desyncDuration > 2000 && appState.recoveryCounter === 0) {
+            // Cooldown check
+            if (Date.now() - appState.lastHardSyncTime < 3000) return null;
+            
             console.error('[SEVCS] PERSISTENT DESYNC (>2s): Triggering recovery sync');
             performHardSync(null); 
             appState.lastDesyncFrameTime = 0;
@@ -293,181 +321,164 @@ export function commitSnapshot() {
  * Processing Stage: Atomic state commitment.
  */
 export function processSnapshot(data) {
-    const next = {
-        uiState: appState.uiState,
-        uiHealth: appState.uiHealth,
-        systemState: 'VALID',
-        stagnantCounter: appState.stagnantCounter,
-        stabilityCounter: appState.stabilityCounter,
-        recoveryCounter: appState.recoveryCounter,
-        hasGap: appState.hasGap,
-        criticalLatencyCycles: appState.criticalLatencyCycles
-    };
+    // 1. Type-Safe Sequence Guard
+    if (!data || typeof data.snapshot_sequence !== 'number') return;
 
+    // 2. Pipeline Guard: Reject during recovery
+    if (appState.isResyncing) return;
+
+    // 3. Late Packet Protection
     const newSequence = data.snapshot_sequence;
-    const oldSequence = appState.lastSequence;
+    if (appState.minAcceptedSequence !== -1 && newSequence < appState.minAcceptedSequence) {
+        return;
+    }
 
-    // 1. Snapshot Integrity (Monotonicity & User Scoping)
+    // 4. User Scope Guard
     if (data.user_id && appState.session.userId && data.user_id !== appState.session.userId) {
-        console.error('[SEVCS] USER SCOPE VIOLATION: Triggering logout');
+        console.error('[SEVCS] USER SCOPE VIOLATION');
         events.emit('FORCE_LOGOUT');
         return;
     }
 
-    if (newSequence <= oldSequence && oldSequence !== -1) {
-        next.stagnantCounter++;
-        return; 
-    }
+    const oldSequence = appState.lastSequence;
 
-    // 2. Dual-Mode Sequence & Gap Threshold Awareness
-    const gap = newSequence - oldSequence;
-    const isNext = gap === 1 || oldSequence === -1;
-
-    if (isNext) {
-        next.stableFrames++;
-        if (next.uiState === 'DESYNCHRONIZED' && next.stableFrames >= appState.RECOVERY_THRESHOLD) {
-            next.uiState = 'SYNCHRONIZED';
-            next.hasGap = false;
-        }
-        next.isSynchronized = true;
-        next.stagnantCounter = 0;
-    } else if (gap > 1) {
-        next.stableFrames = 0;
-        next.isSynchronized = false;
+    // ✅ BOOTSTRAP (Clean Boundary)
+    if (oldSequence === -1) {
+        appState.snapshot = deepFreeze(data); // Immutable commit
+        appState.lastSequence = newSequence;
+        appState.lastSnapshotTime = Date.now();
+        appState.lastSnapshotMono = performance.now();
         
-        if (gap > appState.MAX_ALLOWED_GAP) {
-            console.warn(`[SEVCS] MASSIVE GAP DETECTED (${gap}): RESYNC REQUIRED`);
-            performHardSync(null);
-            return;
-        } else {
-            next.uiState = 'DESYNCHRONIZED';
-            next.hasGap = true;
+        // Tighten bootstrap boundary
+        if (appState.minAcceptedSequence === -1) {
+            appState.minAcceptedSequence = newSequence;
+        }
+        
+        appState.isDesync = false;
+        appState.stableFrames = 0;
+
+        // ✅ AUTO-PROMOTE AUTH (Hide Splash)
+        if (appState.authStatus === 'AUTHENTICATED_PENDING') {
+            console.log("[SYNC] AUTH PROMOTED -> AUTHENTICATED");
+            appState.authStatus = 'AUTHENTICATED';
+        }
+
+        console.log("[SYNC] BOOTSTRAP:", newSequence);
+        return;
+    }
+
+    // 5. Monotonicity Guard
+    if (newSequence <= oldSequence) {
+        if (newSequence === oldSequence && (Date.now() - appState.lastSnapshotTime) > 1000) {
+            console.warn("[SYNC] SEQUENCE STALL DETECTED");
+        }
+        return;
+    }
+
+    const gap = newSequence - oldSequence;
+
+    // ❗ ATOMIC HARD DESYNC
+    if (gap > (appState.MAX_SEQ_JUMP ?? 20)) {
+        performHardSync({ reason: 'SEQUENCE_JUMP', gap });
+        return;
+    }
+
+    // ✅ ATOMIC COMMIT
+    const nowMono = performance.now();
+    let delta = nowMono - appState.lastSnapshotMono;
+    
+    // ❗ Defensive Delta Clamping (Tab suspend guard)
+    if (!Number.isFinite(delta) || delta < 0 || delta > 60000) delta = 0;
+
+    appState.snapshot = deepFreeze(data); // Immutable commit
+    appState.lastSequence = newSequence;
+    appState.lastSnapshotTime = Date.now();
+    appState.lastSnapshotMono = nowMono;
+    
+    console.log("[PIPELINE] ACCEPTING SNAPSHOT:", newSequence);
+    
+    // 🩺 Asymmetric Health Metric (Fast recovery, smoothed decay)
+    const instantHealth = Math.max(0, 100 - Math.floor(delta / 50));
+    if (instantHealth > (appState.healthScore || 0)) {
+        appState.healthScore = Math.min(100, (appState.healthScore || 0) + 2);
+    } else {
+        appState.healthScore = Math.round(0.8 * (appState.healthScore || 100) + 0.2 * instantHealth);
+    }
+
+    // ✅ HYSTERESIS
+    if (gap === 1) {
+        appState.stableFrames = Math.min((appState.stableFrames || 0) + 1, 10);
+        if (appState.stableFrames >= 3) {
+            appState.isDesync = false;
+        }
+    } else {
+        appState.stableFrames = 0;
+        if (!appState.isDesync) {
+            appState.isDesync = true;
         }
     }
 
-    // 3. Stability Tracking
-    const stateChanged = (
-        !appState.snapshot ||
-        data.snapshot_sequence !== appState.lastSequence ||
-        data.snapshot_version !== appState.snapshotVersion ||
-        data.state_hash !== appState.snapshot.state_hash
-    );
-    if (!stateChanged) {
-        next.stabilityCounter++;
-    } else {
-        next.stabilityCounter = 0;
-    }
-
-    // 4. Latency Classification (Smoothed)
-    appState.latencyBuffer.push(data.latency);
-    if (appState.latencyBuffer.length > 10) appState.latencyBuffer.shift();
-    
-    const avgLatency = appState.latencyBuffer.reduce((a, b) => a + b, 0) / appState.latencyBuffer.length;
-    
-    if (avgLatency < 150) next.uiHealth = 'GOOD';
-    else if (avgLatency < 400) next.uiHealth = 'DEGRADED';
-    else next.uiHealth = 'CRITICAL';
-
-    if (next.uiHealth === 'CRITICAL') {
-        next.criticalLatencyCycles++;
-    } else {
-        next.criticalLatencyCycles = 0;
-    }
-
-    // 5. Empty State Handling
-    const queueEmpty = data.queue.length === 0;
-    const slotsEmpty = data.slots.length === 0;
-    if (queueEmpty && slotsEmpty) {
-        next.systemState = 'INVALID';
-    }
-
-    // 6. Transition Logging
-    if (oldSequence !== -1) {
-        appState.transitionLog.push({
-            prev_sequence: oldSequence,
-            new_sequence: newSequence,
-            delta: newSequence - oldSequence,
-            transition: `${appState.uiState} -> ${next.uiState}`,
-            timestamp: Date.now()
+    // Rate-limited logging (1/10 frames)
+    if (newSequence % 10 === 0) {
+        console.log("[SYNC]", {
+            type: "ACCEPTED",
+            seq: newSequence,
+            gap,
+            delta,
+            stable: appState.stableFrames,
+            desync: appState.isDesync,
+            user: data.user_id || 'NA'
         });
-        if (appState.transitionLog.length > 50) appState.transitionLog.shift();
     }
-
-    // 7. Atomic Commit
-    appState.snapshot = data;
-    appState.lastSequence = newSequence;
-    appState.snapshotVersion = data.snapshot_version;
-    appState.lastProcessedSource = data.source;
-    appState.lastUpdateTimestamp = Date.now();
-    appState.lastSnapshotTime = Date.now(); // Wall clock freshness
-    appState.latency = data.latency; // Deterministic latency mapping
-    
-    appState.uiState = next.uiState;
-    appState.uiHealth = next.uiHealth;
-    appState.systemState = next.systemState;
-    appState.stagnantCounter = next.stagnantCounter;
-    appState.stabilityCounter = next.stabilityCounter;
-    appState.recoveryCounter = next.recoveryCounter;
-    appState.stableFrames = next.stableFrames;
-    appState.isSynchronized = next.isSynchronized;
-    appState.hasGap = next.hasGap;
-    appState.criticalLatencyCycles = next.criticalLatencyCycles;
-
-    // First Valid Snapshot Transition
-    if (appState.authStatus === 'AUTHENTICATED_PENDING' && appState.isSynchronized) {
-        appState.authStatus = 'AUTHENTICATED';
-    }
-
-    // 8. Interlocks (Strict Deterministic Gate)
-    appState.allowActions = (
-        appState.authStatus === 'AUTHENTICATED' &&
-        appState.isSynchronized &&
-        !data.freeze_state &&
-        (Date.now() - appState.lastSnapshotTime < appState.SNAPSHOT_FRESHNESS_MS)
-    );
 }
 
 /**
  * Hard Sync: System-triggered lock on major inconsistency.
  */
-function performHardSync(authoritativeData) {
-    if (authoritativeData && appState.lastSyncVersion === authoritativeData.snapshot_version) return;
+function performHardSync(meta) {
+    if (appState.isResyncing) return;
 
-    console.warn('[SEVCS] HARD SYNC: Transitioning to RESYNC_REQUIRED');
+    // 🔥 SET FLAG FIRST (Atomic Boundary)
+    appState.isResyncing = true;
+    appState.isDesync = true;
+    appState.stableFrames = 0;
+
+    console.warn('[SEVCS] HARD SYNC: Transitioning to RESYNC_REQUIRED', meta);
     
+    // Stop Polling BEFORE establishing boundary
+    import('./api_v3.js').then(m => m.stopPolling());
+
+    appState.minAcceptedSequence = Number.MAX_SAFE_INTEGER; // Hard Barrier
     latestIncomingSnapshot = null; 
 
-    // Lock UI
-    appState.isSynchronized = false;
-    appState.uiState = 'RESYNC_REQUIRED';
+    // Lock UI state for computation
     appState.snapshot = null;
     appState.lastSequence = -1;
-    appState.stableFrames = 0;
     
-    // Reset Derived State
-    appState.isSimulating = false;
-    appState.stableBackendFrames = 0;
-    appState.stabilityCounter = 0;
-    appState.stagnantCounter = 0;
-    appState.recoveryCounter = 0;
-    appState.hasGap = false;
-    appState.lastSyncVersion = authoritativeData ? authoritativeData.snapshot_version : -1;
-    
-    events.emit('RESYNC_REQUIRED');
+    events.emit('RESYNC_REQUIRED', meta);
 }
 
 /**
  * Resync: User-triggered recovery without killing session.
  */
 export function resync() {
+    if (!appState.isResyncing) return;
+
     console.warn('[SEVCS] USER RESYNC: Re-initializing pipeline');
+    
+    // Reset AUTHORITATIVE Boundary FIRST
     appState.snapshot = null;
     appState.lastSequence = -1;
     appState.stableFrames = 0;
-    appState.isSynchronized = false;
-    appState.uiState = 'DISCONNECTED';
+    appState.minAcceptedSequence = -1; // Unlock Boundary
     
-    // Explicitly preserve session and restart polling
+    // UNLOCK BEFORE POLLING
+    appState.isResyncing = false;
+    appState.isDesync = false;
+    appState.stableFrames = 0;
+    
+    import('./api_v3.js').then(m => m.startPolling());
+    
     events.emit('RESYNC_STARTED');
 }
 
@@ -490,7 +501,6 @@ export function performHardReset() {
     appState.transitionLog = [];
     appState.pendingActions.clear();
     appState.pendingIntents.clear();
-    appState.uiState = 'DISCONNECTED';
     appState.isSynchronized = false;
     
     // 3. Clear Token
@@ -603,7 +613,6 @@ function startSimulation(forceOverride = false) {
     
     appState.isSimulating = true;
     appState.simStartTime = now;
-    appState.uiState = 'DEGRADED';
     
     simInterval = setInterval(() => {
         if (!appState.isSimulating) {
@@ -620,10 +629,7 @@ function startSimulation(forceOverride = false) {
             system_mode: "SIMULATION",
             system_health: 95,
             freeze_state: false,
-            slots: [
-                {slot_id: 1, state: "CHARGING", assigned_global_id: 999},
-                {slot_id: 2, state: "FREE", assigned_global_id: null}
-            ],
+            slots: appState.simSlots.map(s => ({...s})),
             queue: [],
             timestamp: Date.now() / 1000,
             state_hash: "SIM_HASH_" + Date.now()

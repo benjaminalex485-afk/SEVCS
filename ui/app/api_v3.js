@@ -94,64 +94,71 @@ export async function signup(profile) {
 /**
  * Polling loop with single-instance guard and auth gate.
  */
-export async function startPolling() {
-    if (pollingInterval) return;
+const fetchStatus = async () => {
+    if (appState.authStatus === 'GUEST' || appState.isSimulating) return;
 
-    const fetchStatus = async () => {
-        if (appState.authStatus === 'GUEST' || appState.isSimulating) return;
+    const currentTimeout = Math.min(MAX_TIMEOUT, Math.max(MIN_TIMEOUT, avgLatency * 3));
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), currentTimeout);
+    const start = Date.now();
 
-        const currentTimeout = Math.min(MAX_TIMEOUT, Math.max(MIN_TIMEOUT, avgLatency * 3));
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), currentTimeout);
-        const start = Date.now();
+    try {
+        const data = await safeFetch(`${BASE_URL}/api/status`, { signal: controller.signal });
+        clearTimeout(timeoutId);
+        if (!data) return;
 
-        try {
-            const data = await safeFetch(`${BASE_URL}/api/status`, { signal: controller.signal });
-            clearTimeout(timeoutId);
-            if (!data) return;
-
-            // Overlap Guard: Reject if sequence is old
-            if (appState.lastSequence !== -1 && data.snapshot_sequence <= appState.lastSequence) {
-                return;
-            }
-
-            let latency = Date.now() - start;
-            if (latency >= 10) {
-                latency = Math.min(5000, latency);
-                avgLatency = (EMA_ALPHA * latency) + ((1 - EMA_ALPHA) * avgLatency);
-            }
-
-            setLatestSnapshot(data, latency);
-            
-            currentRetryDelay = POLL_INTERVAL;
-            consecutiveFailures = 0;
-        } catch (error) {
-            clearTimeout(timeoutId);
-            const isTimeout = error.name === 'AbortError';
-            consecutiveFailures++;
-            
-            const errorObj = {
-                code: isTimeout ? 'TIMEOUT' : 'NETWORK_ERROR',
-                retryable: true,
-                message: isTimeout ? 'Polling timed out' : error.message
-            };
-
-            if (isTimeout && avgLatency > 0) appState.uiState = 'DEGRADED';
-            else appState.uiState = 'DISCONNECTED';
-            
-            const jitter = (appState.lastSequence % 5) * 40; 
-            currentRetryDelay = Math.min(currentRetryDelay * 2, MAX_BACKOFF) + jitter;
-
-            events.emit('API_ERROR', errorObj);
+        let latency = Date.now() - start;
+        if (latency >= 10) {
+            latency = Math.min(5000, latency);
+            avgLatency = (EMA_ALPHA * latency) + ((1 - EMA_ALPHA) * avgLatency);
         }
-    };
 
-    pollingInterval = setInterval(fetchStatus, POLL_INTERVAL);
+        setLatestSnapshot(data, latency);
+        
+        currentRetryDelay = POLL_INTERVAL;
+        consecutiveFailures = 0;
+    } catch (error) {
+        clearTimeout(timeoutId);
+        const isTimeout = error.name === 'AbortError';
+        consecutiveFailures++;
+        
+        const errorObj = {
+            code: isTimeout ? 'TIMEOUT' : 'NETWORK_ERROR',
+            retryable: true,
+            message: isTimeout ? 'Polling timed out' : error.message
+        };
+
+        if (isTimeout && avgLatency > 0) {
+            // Derived health will handle this
+        } else {
+            // Derived health will handle this
+        }
+        
+        const jitter = (appState.lastSequence % 5) * 40; 
+        currentRetryDelay = Math.min(currentRetryDelay * 2, MAX_BACKOFF) + jitter;
+
+        events.emit('API_ERROR', errorObj);
+    }
+};
+
+let isPolling = false;
+
+export async function startPolling() {
+    if (isPolling) return;
+    isPolling = true;
+
+    async function pollLoop() {
+        if (!isPolling) return;
+        await fetchStatus();
+        pollingInterval = setTimeout(pollLoop, currentRetryDelay);
+    }
+    pollLoop();
 }
 
 export function stopPolling() {
+    isPolling = false;
     if (pollingInterval) {
-        clearInterval(pollingInterval);
+        clearTimeout(pollingInterval);
         pollingInterval = null;
     }
 }
@@ -186,6 +193,38 @@ export async function executeAction(endpoint, payload, intentKey = null) {
     const requestId = crypto.randomUUID();
 
     registerAction(requestId, versionAtClick, endpoint, intentKey);
+
+    // Simulation Intercept (Admin Infrastructure)
+    if (appState.isSimulating) {
+        let success = false;
+        if (endpoint === 'admin_add_slot') {
+            const newId = appState.simSlots.length > 0 ? Math.max(...appState.simSlots.map(s => s.slot_id)) + 1 : 1;
+            appState.simSlots.push({ slot_id: newId, state: 'FREE', charger_type: payload.charger_type || 'STANDARD', assigned_global_id: null });
+            success = true;
+        } else if (endpoint === 'admin_remove_slot') {
+            appState.simSlots = appState.simSlots.filter(s => s.slot_id != payload.slot_id);
+            success = true;
+        } else if (endpoint === 'admin_update_slot_type') {
+            const slot = appState.simSlots.find(s => s.slot_id == payload.slot_id);
+            if (slot) {
+                slot.charger_type = payload.charger_type;
+                success = true;
+            }
+        }
+
+        if (success) {
+            console.log(`[SEVCS ADMIN] ${endpoint} SUCCESS - Local State Updated`);
+            // Instant local feedback
+            events.emit('STATE_UPDATED', appState);
+            
+            setTimeout(() => {
+                const response = { status: 'OK', snapshot_version: appState.snapshotVersion + 1, snapshot_sequence: appState.lastSequence + 1 };
+                events.emit('ACTION_RESPONSE', { requestId, endpoint, status: 'NEW', ...response, payload: response });
+                resolveAction(requestId, response);
+            }, 500);
+            return;
+        }
+    }
 
     try {
         const data = await safeFetch(`${BASE_URL}/api/${endpoint}`, {
@@ -228,6 +267,21 @@ export async function executeAction(endpoint, payload, intentKey = null) {
 
 export async function bookSlot(slotId) {
     return executeAction('book_slot', { slot_id: slotId }, `book_slot_${slotId}`);
+}
+
+/**
+ * Administrative Infrastructure Management
+ */
+export async function addSlot(chargerType = 'STANDARD') {
+    return executeAction('admin_add_slot', { charger_type: chargerType });
+}
+
+export async function removeSlot(slotId) {
+    return executeAction('admin_remove_slot', { slot_id: slotId });
+}
+
+export async function updateSlotType(slotId, chargerType) {
+    return executeAction('admin_update_slot_type', { slot_id: slotId, charger_type: chargerType });
 }
 
 /**

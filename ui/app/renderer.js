@@ -47,7 +47,9 @@ export function startRenderer() {
 
             // 2. INPUT (Commit-After-Use Buffer Pull)
             const snapshot = takeLatestSnapshot();
+            
             if (snapshot) {
+                console.log("[RENDER] Consuming snapshot:", snapshot.snapshot_sequence);
                 const identityKey = `${snapshot.state_hash}_${snapshot.snapshot_sequence}`;
                 
                 if (identityKey === lastIdentity) {
@@ -108,23 +110,33 @@ export function startRenderer() {
  * Centralized UI State Priority Engine
  */
 function computeUIState() {
-    const flags = {
-        isFrozen: appState.snapshot?.freeze_state,
-        isDesync: appState.uiState === 'DESYNCHRONIZED' || appState.uiState === 'RESYNC_REQUIRED',
-        isDisconnected: appState.uiState === 'DISCONNECTED',
-        isDegraded: appState.uiHealth === 'CRITICAL' || appState.uiHealth === 'DEGRADED',
-        isUnknown: Array.from(appState.pendingIntents.values()).some(i => i.status === 'UNKNOWN')
-    };
+    // 0. Hard Guards
+    if (appState.isResyncing) return 'RESYNC_REQUIRED';
 
-    if (flags.isFrozen) {
-        if (flags.isUnknown) return 'FROZEN_UNKNOWN';
-        return 'FROZEN';
+    if (!appState.snapshot) {
+        const sinceStart = performance.now() - appState.appStartMono;
+        if (sinceStart > 5000) return 'DISCONNECTED';
+        return 'INITIALIZING';
     }
-    if (appState.uiState === 'RESYNC_REQUIRED') return 'RESYNC_REQUIRED';
-    if (flags.isDesync) return 'DESYNCHRONIZED';
-    if (flags.isDisconnected) return 'DISCONNECTED';
-    if (flags.isDegraded) return 'DEGRADED';
-    
+
+    const delta = performance.now() - appState.lastSnapshotMono;
+
+    // 1. Critical: Freeze
+    if (appState.snapshot?.freeze_state) return 'FROZEN';
+
+    // 2. Link Failure (Hard Threshold)
+    if (delta > appState.SNAPSHOT_FRESHNESS_MS + 1000) {
+        return 'DISCONNECTED';
+    }
+
+    // 3. Warning: Sequence Integrity
+    if (appState.isDesync) return 'DESYNCHRONIZED';
+
+    // 4. Link Health (Soft Threshold)
+    if (delta > appState.SNAPSHOT_FRESHNESS_MS) {
+        return 'DEGRADED';
+    }
+
     return 'SYNCHRONIZED';
 }
 
@@ -148,6 +160,7 @@ function safeDraw() {
         
         events.emit('STATE_UPDATED', stateToEmit);
     } catch (e) {
-        console.error('[SEVCS] RENDER FAILURE', e);
+        console.error('[SEVCS] KERNEL CRASH', e);
+        events.emit('RENDER_FALLBACK', e);
     }
 }

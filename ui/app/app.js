@@ -26,36 +26,10 @@ function bootstrap() {
     }
 
     // 2. Mode Toggling
-    document.getElementById('btn-mode-admin').onclick = () => {
-        if (appState.uiState !== 'SYNCHRONIZED') return;
-        appState.uiMode = 'ADMIN';
-        events.emit('STATE_UPDATED', appState);
-    };
-
-    document.getElementById('btn-mode-user').onclick = () => {
-        if (appState.uiState !== 'SYNCHRONIZED') return;
-        appState.uiMode = 'USER';
-        events.emit('STATE_UPDATED', appState);
-    };
-
-    document.getElementById('btn-logout').onclick = () => {
-        performHardReset();
-    };
-
-    // 3. Auth Persistence Check
-    const token = localStorage.getItem('sevcs_token');
-    if (token) {
-        // Simple recovery - in production this would verify the token
-        appState.session.token = token;
-        appState.authStatus = 'AUTHENTICATED_PENDING';
-        startPolling();
-    }
-
-    // 4. Start Render Tick
-    startRenderer();
-
-    // UI Reactivity
+    let lastDisplayState = 'INITIALIZING';
     events.on('STATE_UPDATED', (state) => {
+        lastDisplayState = state.displayState;
+        
         // Toggle logout button
         document.getElementById('btn-logout').style.display = 
             state.authStatus !== 'GUEST' ? 'block' : 'none';
@@ -69,6 +43,33 @@ function bootstrap() {
         document.getElementById('admin-controls').classList.toggle('hidden', !isAdmin);
         document.getElementById('user-ui-container').classList.toggle('hidden', isAdmin);
     });
+
+    document.getElementById('btn-mode-admin').onclick = () => {
+        if (lastDisplayState !== 'SYNCHRONIZED') return;
+        appState.uiMode = 'ADMIN';
+        events.emit('STATE_UPDATED', appState);
+    };
+
+    document.getElementById('btn-mode-user').onclick = () => {
+        if (lastDisplayState !== 'SYNCHRONIZED') return;
+        appState.uiMode = 'USER';
+        events.emit('STATE_UPDATED', appState);
+    };
+
+    document.getElementById('btn-logout').onclick = () => {
+        performHardReset();
+    };
+
+    // 3. Auth Persistence Check
+    const token = localStorage.getItem('sevcs_token');
+    if (token) {
+        appState.session.token = token;
+        appState.authStatus = 'AUTHENTICATED_PENDING';
+        startPolling();
+    }
+
+    // 4. Start Render Tick
+    startRenderer();
 
     events.on('API_ERROR', (error) => {
         console.error(`[SEVCS UI ERROR] ${error.code}: ${error.message}`);

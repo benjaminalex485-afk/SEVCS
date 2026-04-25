@@ -7,7 +7,8 @@ export function initUserUI() {
     let isLoading = false;
     let lastResult = null;
 
-    function render() {
+    function render(state = {}) {
+        const displayState = state.displayState || 'INITIALIZING';
         const isUser = appState.uiMode === 'USER' && appState.authStatus !== 'GUEST';
         if (!isUser) {
             container.classList.add('hidden');
@@ -17,7 +18,7 @@ export function initUserUI() {
         container.classList.remove('hidden');
 
         // 0. Synchronization Check
-        if (appState.uiState === 'RESYNC_REQUIRED') {
+        if (appState.isResyncing) {
             container.innerHTML = `
                 <div class="auth-card glass" style="max-width: 600px; margin: 2rem auto; text-align: center;">
                     <div class="error-icon" style="font-size: 3rem; margin-bottom: 1rem;">⚠️</div>
@@ -178,8 +179,8 @@ export function initUserUI() {
         }
     });
 
-    events.on('STATE_UPDATED', render);
-    events.on('ACTIONS_CHANGED', render);
+    events.on('STATE_UPDATED', (state) => render(state));
+    events.on('ACTIONS_CHANGED', () => render());
     events.on('API_ERROR', () => {
         isLoading = false;
         render();
