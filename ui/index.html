@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SEVCS | Deterministic Control Surface</title>
+    <link rel="stylesheet" href="styles/style.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+</head>
+<body class="dark-theme">
+    <!-- Freeze/Desync Warning Banner -->
+    <div id="status-banner" class="banner hidden">
+        <span id="banner-message">SYSTEM FROZEN</span>
+    </div>
+
+    <header class="main-header">
+        <div class="logo-area">
+            <h1>SEVCS <span>Smart EV Charging System</span></h1>
+            <div id="ui-confidence-tag" class="confidence-tag disconnected">DISCONNECTED</div>
+        </div>
+        
+        <div class="header-center">
+            <div id="snapshot-info" class="mono header-info">
+                Snapshot: v0 | Seq #0
+            </div>
+            <div id="ui-health-indicator" class="health-indicator critical">
+                HEALTH: CRITICAL
+            </div>
+        </div>
+
+        <div class="header-actions">
+            <div class="mode-toggle">
+                <button id="btn-mode-admin" class="btn-toggle active">ADMIN</button>
+                <button id="btn-mode-user" class="btn-toggle">USER</button>
+            </div>
+            <div id="header-status" class="header-status">
+                <!-- Polling Indicator & Latency -->
+            </div>
+        </div>
+    </header>
+
+    <main class="dashboard">
+        <!-- Left Column: Live Status & Actions -->
+        <section class="control-panel">
+            <div id="live-status-container"></div>
+            <div id="action-panel-container"></div>
+            <div id="simulation-panel-container"></div>
+            <div id="debug-panel-container"></div>
+        </section>
+
+        <!-- Right Column: Grids & Tables -->
+        <section class="data-panel">
+            <div id="slot-grid-container"></div>
+            <div id="queue-table-container"></div>
+            <div id="user-ui-container"></div>
+        </section>
+    </main>
+
+    <script type="module" src="app/app.js"></script>
+</body>
+</html>
