@@ -4,6 +4,7 @@
 #include <Arduino.h>
 
 void wifi_init();
+void wifi_init_ap();
 bool wifi_is_connected();
 void wifi_loop();
 

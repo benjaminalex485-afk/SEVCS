@@ -1,15 +1,18 @@
 #include <Arduino.h>
+#include <WiFi.h>
 #include "config.h"
 #include "wifi_manager.h"
 #include "websocket_manager.h"
 #include "hardware_control.h"
 #include "safety_manager.h"
 #include "message_handler.h"
+#include "web_server_manager.h"
 
 // --- RTOS Tasks ---
 void TaskWebSocket(void *pvParameters) {
     for (;;) {
         ws_loop();
+        web_server_loop();
         vTaskDelay(pdMS_TO_TICKS(10)); // Yield to other tasks
     }
 }
@@ -33,21 +36,27 @@ void TaskStatusReport(void *pvParameters) {
 
 void setup() {
     Serial.begin(115200);
+    delay(5000); // 5-second power stabilization delay
+    Serial.println("\n\n####################################");
+    Serial.println("[DEBUG] FIRMWARE_V3_RELOADED");
+    Serial.println("####################################\n");
     
     // Initialize Modules
     hw_init();
     safety_init();
     wifi_init();
     ws_init();
+    web_server_init();
 
     Serial.println("[MAIN] System Modules Initialized.");
 
-    // Create FreeRTOS Tasks
-    xTaskCreatePinnedToCore(TaskWebSocket, "WS_Task", 8192, NULL, 2, NULL, 1);
-    xTaskCreatePinnedToCore(TaskSafety, "Safety_Task", 4096, NULL, 3, NULL, 1);
-    xTaskCreatePinnedToCore(TaskStatusReport, "Status_Task", 4096, NULL, 1, NULL, 1);
+    // Create FreeRTOS Tasks (Pinned to Core 0 for Single-Core C3)
+    xTaskCreatePinnedToCore(TaskWebSocket, "WS_Task", 8192, NULL, 2, NULL, 0);
+    xTaskCreatePinnedToCore(TaskSafety, "Safety_Task", 4096, NULL, 3, NULL, 0);
+    xTaskCreatePinnedToCore(TaskStatusReport, "Status_Task", 4096, NULL, 1, NULL, 0);
     
     Serial.println("[MAIN] RTOS Tasks Started.");
+    hw_set_led(LED_BLINK_FAST);
 }
 
 void loop() {

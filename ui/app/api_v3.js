@@ -1,7 +1,7 @@
 import { appState, setLatestSnapshot, registerAction, resolveAction } from './state_v3.js';
 import { events } from './events.js';
 
-const BASE_URL = 'http://localhost:5001'; 
+const BASE_URL = window.location.origin; // Use the ESP32 as a proxy gateway
 const POLL_INTERVAL = 300;
 const MAX_BACKOFF = 3000;
 const MIN_TIMEOUT = 1500;

@@ -11,8 +11,8 @@
 #define WS_SERVER_PATH "/ws/esp32"
 
 // Hardware Configuration
-#define PIN_RELAY 18
-#define PIN_LED_STATUS 2
+#define PIN_RELAY 2
+#define PIN_LED_STATUS 3
 #define SLOT_ID 1
 
 // Safety Parameters

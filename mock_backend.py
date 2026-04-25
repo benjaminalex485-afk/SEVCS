@@ -8,7 +8,7 @@ app = Flask(__name__)
 
 # --- CONFIGURATION ---
 PORT = 5001
-ALLOWED_ORIGIN = "http://localhost:5500"
+ALLOWED_ORIGIN = "*" 
 
 # Strict CORS Hardening
 CORS(app, resources={
@@ -259,4 +259,4 @@ if __name__ == '__main__':
     print(f"--- SEVCS MOCK BACKEND STARTING ---")
     print(f"Origin Allowlist: {ALLOWED_ORIGIN}")
     print(f"Listening on: http://localhost:{PORT}")
-    app.run(port=PORT, debug=True)
+    app.run(host='0.0.0.0', port=PORT, debug=True)

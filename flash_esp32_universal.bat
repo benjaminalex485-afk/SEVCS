@@ -11,7 +11,7 @@ setlocal enabledelayedexpansion
 
 set "PORT=COM3"
 set "FQBN=esp32:esp32:esp32"
-set "SKETCH_DIR=ev_charging_sim"
+set "SKETCH_DIR=ev_charging_esp32_flash"
 set "DATA_DIR=%SKETCH_DIR%\data"
 set "OFFSET=0x290000"
 set "FS_SIZE=1441792"

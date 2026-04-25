@@ -3,9 +3,25 @@
 #include <WiFi.h>
 
 void wifi_init() {
-    WiFi.mode(WIFI_STA);
+    Serial.println("[WiFi] Starting Production Dual-Mode (AP+STA)...");
+    WiFi.mode(WIFI_AP_STA); 
+    delay(2000); 
+    
+    // Max power for industrial environments
+    WiFi.setTxPower(WIFI_POWER_19_5dBm);
+    
+    // Start AP (No password for easy testing)
+    WiFi.softAP("SEVCS-PROD-AP", NULL); 
+    Serial.print("[WiFi] AP Started. IP: ");
+    Serial.println(WiFi.softAPIP());
+
+    // Connect to Vision PC
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-    Serial.println("[WiFi] Connecting...");
+    Serial.println("[WiFi] Searching for Vision PC...");
+}
+
+void wifi_init_ap() {
+    // This is now integrated into wifi_init() for atomicity
 }
 
 bool wifi_is_connected() {
@@ -14,12 +30,10 @@ bool wifi_is_connected() {
 
 void wifi_loop() {
     static unsigned long last_check = 0;
-    if (millis() - last_check > 5000) {
+    if (millis() - last_check > 10000) {
         last_check = millis();
-        if (!wifi_is_connected()) {
-            Serial.println("[WiFi] Disconnected. Reconnecting...");
-            WiFi.disconnect();
-            WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+        if (WiFi.status() != WL_CONNECTED) {
+            Serial.println("[WiFi] Station not connected. AP is still active.");
         }
     }
 }
