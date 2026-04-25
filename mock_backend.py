@@ -15,7 +15,7 @@ CORS(app, resources={
     r"/api/*": {
         "origins": [ALLOWED_ORIGIN],
         "methods": ["GET", "POST"],
-        "allow_headers": ["Content-Type"]
+        "allow_headers": ["Content-Type", "Authorization"]
     }
 })
 
@@ -35,6 +35,27 @@ class MockSystemState:
         self.queue = [
             {"global_id": 105, "track_id": 55, "state": "WAITING", "confidence": 0.98}
         ]
+        self.users = {
+            "test@example.com": {
+                "id": 123,
+                "name": "Test User",
+                "password": "password",
+                "role": "USER",
+                "wallet": {"balance": 100.0, "currency": "USD"}
+            },
+            "admin@sevcs.com": {
+                "id": 1,
+                "name": "System Admin",
+                "password": "admin",
+                "role": "ADMIN",
+                "wallet": {"balance": 0.0, "currency": "USD"}
+            }
+        }
+        self.sessions = {} # token -> user_id
+        
+        # Stress Simulation Flags
+        self.stress_mode = None # "JUMP" | "TIMEOUT" | "FREEZE_RACE"
+        self.freeze_requested = False
 
     def tick(self):
         self.sequence += 1
@@ -87,32 +108,81 @@ def validate_contract(f):
         return response
     return decorated_function
 
+def require_auth(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        auth_header = request.headers.get("Authorization")
+        if not auth_header or not auth_header.startswith("Bearer "):
+            return jsonify({"status": "ERROR", "message": "Unauthorized"}), 401
+        
+        token = auth_header.split(" ")[1]
+        if token not in G_STATE.sessions:
+            return jsonify({"status": "ERROR", "message": "Invalid or expired token"}), 401
+        
+        return f(*args, **kwargs)
+    return decorated
+
 import json
 import hashlib
 
-# --- ENDPOINTS ---
+# --- AUTH ENDPOINTS ---
+@app.route('/api/signup', methods=['POST'])
+def signup():
+    data = request.json
+    email = data.get("email")
+    if email in G_STATE.users:
+        return jsonify({"success": False, "message": "User already exists"}), 400
+    
+    user_id = random.randint(1000, 9999)
+    G_STATE.users[email] = {
+        "id": user_id,
+        "name": data.get("name"),
+        "password": data.get("password"),
+        "role": "USER",
+        "wallet": {"balance": 100.0, "currency": "USD"}
+    }
+    return jsonify({"success": True, "user_id": user_id})
+
+@app.route('/api/login', methods=['POST'])
+def login():
+    data = request.json
+    email = data.get("email")
+    password = data.get("password")
+    
+    user = G_STATE.users.get(email)
+    if not user or user["password"] != password:
+        return jsonify({"success": False, "message": "Invalid credentials"}), 401
+    
+    token = hashlib.sha256(f"{email}{time.time()}".encode()).hexdigest()
+    G_STATE.sessions[token] = user["id"]
+    return jsonify({
+        "success": True, 
+        "token": token, 
+        "user_id": user["id"],
+        "role": user["role"]
+    })
+
+# --- SYSTEM ENDPOINTS ---
 @app.route('/api/status', methods=['GET'])
+@require_auth
 @validate_contract
 def get_status():
+    token = request.headers.get("Authorization").split(" ")[1]
+    user_id = G_STATE.sessions[token]
+    user = next((u for u in G_STATE.users.values() if u["id"] == user_id), None)
+
+    if G_STATE.stress_mode == "TIMEOUT":
+        time.sleep(6) # Trigger client timeout
+        G_STATE.stress_mode = None
+
     G_STATE.tick()
+    
+    if G_STATE.stress_mode == "JUMP":
+        G_STATE.sequence += 50
+        G_STATE.stress_mode = None
+
     timestamp = int(time.time() * 1000)
     
-    # 1. Construct Canonical Dictionary for Hashing (Strict Identity)
-    canonical = {
-        "sequence": G_STATE.sequence,
-        "version": G_STATE.version,
-        "timestamp": timestamp,
-        "mode": G_STATE.mode,
-        "health": G_STATE.health,
-        "slots": G_STATE.slots,
-        "queue": G_STATE.queue
-    }
-    
-    # 2. Compute Identity Hash
-    hash_input = json.dumps(canonical, sort_keys=True, separators=(",", ":"))
-    state_hash = hashlib.sha256(hash_input.encode()).hexdigest()
-
-    # 3. Construct Full Contract Payload
     payload = {
         "snapshot_sequence": G_STATE.sequence,
         "snapshot_version": G_STATE.version,
@@ -123,20 +193,67 @@ def get_status():
         "freeze_state": G_STATE.freeze_state,
         "timestamp": timestamp,
         "source": "BACKEND",
-        "state_hash": state_hash
+        "user_id": user_id,
+        "user_wallet": user["wallet"] if user else None
     }
     
     return jsonify(payload)
 
-@app.route('/api/authorize', methods=['POST'])
-def authorize():
+@app.route('/api/book_slot', methods=['POST'])
+@require_auth
+def book_slot():
     data = request.json
-    # Simulate processing
-    return jsonify({
-        "status": "OK",
-        "snapshot_version": G_STATE.version,
-        "replayed": False
-    })
+    slot_id = int(data.get("payload", {}).get("slot_id"))
+    
+    if G_STATE.freeze_requested:
+        G_STATE.freeze_state = True
+        G_STATE.freeze_requested = False
+
+    # Simulate processing delay
+    time.sleep(0.5)
+
+    for slot in G_STATE.slots:
+        if slot["slot_id"] == slot_id:
+            if slot["state"] == "FREE":
+                slot["state"] = "RESERVED"
+                slot["assigned_global_id"] = 123 # Mock ID
+                return jsonify({
+                    "status": "OK",
+                    "snapshot_version": G_STATE.version,
+                    "snapshot_sequence": G_STATE.sequence,
+                    "replayed": False
+                })
+            return jsonify({"status": "REJECTED", "error": {"reason": "Slot already occupied"}})
+    
+    return jsonify({"status": "REJECTED", "error": {"reason": "Invalid slot ID"}})
+
+@app.route('/api/recharge', methods=['POST'])
+@require_auth
+def recharge():
+    token = request.headers.get("Authorization").split(" ")[1]
+    user_id = G_STATE.sessions[token]
+    user = next((u for u in G_STATE.users.values() if u["id"] == user_id), None)
+    
+    amount = request.json.get("payload", {}).get("amount", 0)
+    if user:
+        time.sleep(1) # Intent visibility test
+        user["wallet"]["balance"] += amount
+        return jsonify({
+            "status": "OK", 
+            "snapshot_version": G_STATE.version,
+            "snapshot_sequence": G_STATE.sequence
+        })
+    
+    return jsonify({"status": "REJECTED", "message": "User not found"}), 404
+
+# --- STRESS CONTROL ---
+@app.route('/api/debug/stress', methods=['POST'])
+def set_stress():
+    mode = request.json.get("mode")
+    G_STATE.stress_mode = mode
+    if mode == "FREEZE_RACE":
+        G_STATE.freeze_requested = True
+    return jsonify({"status": "OK", "active_mode": mode})
 
 if __name__ == '__main__':
     print(f"--- SEVCS MOCK BACKEND STARTING ---")

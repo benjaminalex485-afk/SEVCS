@@ -1,5 +1,5 @@
-import { executeAction } from '../app/api.js';
-import { appState } from '../app/state.js';
+import { executeAction, startPolling } from '../app/api_v3.js';
+import { appState, resync } from '../app/state_v3.js';
 import { events } from '../app/events.js';
 
 export function initUserUI() {
@@ -8,71 +8,153 @@ export function initUserUI() {
     let lastResult = null;
 
     function render() {
-        const isUser = appState.uiMode === 'USER';
+        const isUser = appState.uiMode === 'USER' && appState.authStatus !== 'GUEST';
         if (!isUser) {
             container.classList.add('hidden');
             return;
         }
 
         container.classList.remove('hidden');
+
+        // 0. Synchronization Check
+        if (appState.uiState === 'RESYNC_REQUIRED') {
+            container.innerHTML = `
+                <div class="auth-card glass" style="max-width: 600px; margin: 2rem auto; text-align: center;">
+                    <div class="error-icon" style="font-size: 3rem; margin-bottom: 1rem;">⚠️</div>
+                    <h2>Resync Required</h2>
+                    <p>System state discontinuity detected. A manual re-initialization is required to ensure deterministic safety.</p>
+                    <button class="primary-btn" id="resync-btn" style="margin-top: 1.5rem">Initialize Resync Pipeline</button>
+                </div>
+            `;
+            document.getElementById('resync-btn').onclick = () => {
+                resync();
+                startPolling();
+            };
+            return;
+        }
+
+        if (appState.authStatus === 'AUTHENTICATED_PENDING' || !appState.snapshot) {
+            container.innerHTML = `
+                <div class="card glass" style="text-align: center; padding: 4rem;">
+                    <div class="spinner"></div>
+                    <h2 style="margin-top: 1rem">Syncing System Data...</h2>
+                    <p>Waiting for first valid monotonic snapshot from backend.</p>
+                </div>
+            `;
+            return;
+        }
+
+        const snapshot = appState.snapshot;
+        const wallet = snapshot.user_wallet || { balance: 0, currency: 'USD' };
+        
+        // Sorting: Ensure stable DOM order
+        const sortedSlots = [...snapshot.slots].sort((a, b) => a.slot_id - b.slot_id);
+        const sortedQueue = [...snapshot.queue].sort((a, b) => (a.global_id || 0) - (b.global_id || 0));
+
         container.innerHTML = `
-            <div class="card">
-                <h2>User Interface</h2>
-                <div class="form-group">
-                    <label>Vehicle Type</label>
-                    <select id="user-vehicle" ${isLoading ? 'disabled' : ''}>
-                        <option value="SUV">SUV</option>
-                        <option value="Sedan">Sedan</option>
-                        <option value="Truck">Truck</option>
-                    </select>
+            <div class="user-dashboard-grid">
+                <!-- Wallet Section -->
+                <div class="card wallet-card glass">
+                    <div class="wallet-header">
+                        <h3>Your Wallet</h3>
+                        <span class="wallet-id">ID: ${appState.session.userId}</span>
+                    </div>
+                    <div class="balance-area">
+                        <span class="currency">$</span>
+                        <span class="balance">${wallet.balance.toFixed(2)}</span>
+                    </div>
+                    <div class="wallet-actions">
+                        <button class="primary-btn btn-small" id="btn-recharge" 
+                            ${!appState.allowActions || appState.pendingIntents.has('recharge') ? 'disabled' : ''}>
+                            ${appState.pendingIntents.get('recharge')?.status === 'PENDING' ? 'PROCESSING...' : 'Quick Recharge $50'}
+                        </button>
+                    </div>
+                    ${appState.pendingIntents.get('recharge')?.status === 'UNKNOWN' ? `
+                        <p class="status-msg warning">⚠️ Last recharge status unknown. Please verify state.</p>
+                    ` : ''}
                 </div>
-                <div class="form-group">
-                    <label>Charging Type</label>
-                    <select id="user-charge" ${isLoading ? 'disabled' : ''}>
-                        <option value="FAST">Fast Charge (DC)</option>
-                        <option value="SLOW">Standard (AC)</option>
-                    </select>
-                </div>
-                <div class="form-group">
-                    <label>Urgency</label>
-                    <select id="user-urgency" ${isLoading ? 'disabled' : ''}>
-                        <option value="LOW">Low</option>
-                        <option value="HIGH">High</option>
-                    </select>
-                </div>
-                <button class="btn btn-outline" style="width: 100%" id="btn-find-slot" 
-                    ${!appState.allowActions || isLoading ? 'disabled' : ''}>
-                    ${isLoading ? 'PROCESING...' : 'Find Best Slot'}
-                </button>
-                
-                <div id="user-result-area" style="margin-top: 1.5rem">
-                    ${lastResult ? `
-                        <div class="card" style="background: rgba(0,0,0,0.2); border-color: ${lastResult.success ? 'var(--accent-green)' : 'var(--accent-red)'}">
-                            <h3 style="font-size: 0.75rem; margin-bottom: 0.5rem">${lastResult.success ? 'ALLOCATION SUCCESS' : 'ALLOCATION FAILED'}</h3>
-                            <div class="mono" style="font-size: 0.8rem">
-                                ${lastResult.success ? `
-                                    <p>Assigned Slot: <span style="color: var(--accent-green)">${lastResult.assigned_slot}</span></p>
-                                    <p>Status: ${lastResult.status}</p>
-                                    <p>Snapshot: v${lastResult.version}</p>
+
+                <!-- Slot Overview -->
+                <div class="card slots-card glass">
+                    <div class="card-header">
+                        <h3>Available Slots</h3>
+                        <span class="count-badge">${snapshot.slots.filter(s => s.state === 'FREE').length} Free</span>
+                    </div>
+                    <div class="slot-grid">
+                        ${sortedSlots.map(slot => `
+                            <div class="slot-item ${slot.state.toLowerCase()}">
+                                <div class="slot-info">
+                                    <span class="slot-label">Slot ${slot.slot_id}</span>
+                                    <span class="slot-status">${slot.state}</span>
+                                </div>
+                                ${slot.state === 'FREE' ? `
+                                    <button class="btn-charge" data-slot-id="${slot.slot_id}"
+                                        ${!appState.allowActions || appState.pendingIntents.has(`book_slot_${slot.slot_id}`) ? 'disabled' : ''}>
+                                        ${appState.pendingIntents.get(`book_slot_${slot.slot_id}`)?.status === 'PENDING' ? '...' : 'Charge'}
+                                    </button>
                                 ` : `
-                                    <p style="color: var(--accent-red)">Error: ${lastResult.error}</p>
+                                    <div class="assigned-user">ID: ${slot.assigned_global_id || '---'}</div>
                                 `}
                             </div>
-                        </div>
-                    ` : ''}
+                        `).join('')}
+                    </div>
+                </div>
+
+                <!-- Allocation Controls -->
+                <div class="card actions-card glass">
+                    <h3>Smart Allocation</h3>
+                    <div class="form-group">
+                        <label>Vehicle Type</label>
+                        <select id="user-vehicle" ${isLoading ? 'disabled' : ''}>
+                            <option value="SUV">SUV</option>
+                            <option value="Sedan">Sedan</option>
+                            <option value="Truck">Truck</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label>Urgency</label>
+                        <select id="user-urgency" ${isLoading ? 'disabled' : ''}>
+                            <option value="LOW">Low</option>
+                            <option value="HIGH">High</option>
+                        </select>
+                    </div>
+                    <button class="primary-btn" id="btn-find-slot" 
+                        ${!appState.allowActions || isLoading ? 'disabled' : ''}>
+                        ${isLoading ? 'PROCESSING...' : 'Find Best Slot'}
+                    </button>
+                    
+                    <div id="user-result-area">
+                        ${lastResult ? `
+                            <div class="result-box ${lastResult.success ? 'success' : 'fail'}">
+                                <h4>${lastResult.success ? 'ALLOCATION SUCCESS' : 'ALLOCATION FAILED'}</h4>
+                                <p>${lastResult.success ? `Slot ${lastResult.assigned_slot} reserved` : lastResult.error}</p>
+                            </div>
+                        ` : ''}
+                    </div>
                 </div>
             </div>
         `;
+
+        // Event Listeners
+        document.getElementById('btn-recharge')?.addEventListener('click', () => {
+            executeAction('recharge', { amount: 50 }, 'recharge');
+        });
+
+        document.querySelectorAll('.btn-charge').forEach(btn => {
+            btn.onclick = () => {
+                const slotId = btn.dataset.slotId;
+                executeAction('book_slot', { slot_id: slotId }, `book_slot_${slotId}`);
+            };
+        });
 
         document.getElementById('btn-find-slot')?.addEventListener('click', () => {
             isLoading = true;
             render();
             const payload = {
                 type: document.getElementById('user-vehicle').value,
-                charge: document.getElementById('user-charge').value,
                 urgency: document.getElementById('user-urgency').value
             };
-            executeAction('find_slot', payload);
+            executeAction('find_slot', payload, 'find_slot');
         });
     }
 
@@ -97,5 +179,10 @@ export function initUserUI() {
     });
 
     events.on('STATE_UPDATED', render);
+    events.on('ACTIONS_CHANGED', render);
+    events.on('API_ERROR', () => {
+        isLoading = false;
+        render();
+    });
     render();
 }

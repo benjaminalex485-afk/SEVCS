@@ -1,6 +1,6 @@
 import { events } from '../app/events.js';
-import { executeAction } from '../app/api.js';
-import { appState } from '../app/state.js';
+import { executeAction } from '../app/api_v3.js';
+import { appState } from '../app/state_v3.js';
 
 export function initSimulationUI() {
     const container = document.getElementById('simulation-panel-container');

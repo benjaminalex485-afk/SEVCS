@@ -1,24 +1,31 @@
+import { bookSlot } from '../app/api.js';
 import { events } from '../app/events.js';
 
 export function initGrids() {
     const slotContainer = document.getElementById('slot-grid-container');
     const queueContainer = document.getElementById('queue-table-container');
 
+    // Delegated click handler for slots
+    slotContainer.addEventListener('click', async (e) => {
+        const slotCard = e.target.closest('.slot-card');
+        if (!slotCard) return;
+
+        const slotId = slotCard.dataset.id;
+        const isFree = slotCard.classList.contains('free');
+
+        if (isFree) {
+            console.log(`[SEVCS] Requesting booking for slot ${slotId}`);
+            const result = await bookSlot(slotId);
+            if (result.status === 'REJECTED') {
+                alert(`Booking failed: ${result.error?.reason || 'System busy'}`);
+            }
+        }
+    });
+
     events.on('STATE_UPDATED', (state) => {
         const snapshot = state.snapshot;
-        const isAdmin = state.uiMode === 'ADMIN';
 
-        // 1. Visibility Guard
-        if (!isAdmin) {
-            slotContainer.classList.add('hidden');
-            queueContainer.classList.add('hidden');
-            return;
-        }
-
-        slotContainer.classList.remove('hidden');
-        queueContainer.classList.remove('hidden');
-
-        // 2. Render Slot Grid
+        // 1. Render Slot Grid
         slotContainer.innerHTML = `
             <div class="card">
                 <h2>Charging Slots</h2>
@@ -26,7 +33,9 @@ export function initGrids() {
                     ${snapshot.slots.length > 0 ? `
                         <div class="grid-container">
                             ${snapshot.slots.map(slot => `
-                                <div class="slot-card ${slot.state.toLowerCase()}">
+                                <div class="slot-card ${slot.state.toLowerCase()} ${state.allowActions && slot.state === 'FREE' ? 'interactive' : ''}" 
+                                     data-id="${slot.slot_id}"
+                                     title="${slot.state === 'FREE' ? 'Click to book' : ''}">
                                     <div style="font-size: 0.7rem; color: var(--text-secondary)">ID: ${slot.slot_id}</div>
                                     <div style="font-weight: 700; margin: 4px 0">${slot.state}</div>
                                     <div class="mono" style="font-size: 0.75rem">${slot.assigned_global_id ? 'V-' + slot.assigned_global_id : '---'}</div>
@@ -38,7 +47,7 @@ export function initGrids() {
             </div>
         `;
 
-        // 3. Render Queue Table
+        // 2. Render Queue Table
         queueContainer.innerHTML = `
             <div class="card">
                 <h2>Vehicle Queue</h2>

@@ -1,6 +1,7 @@
 import { events } from './events.js';
-import { resetPendingActions } from './api.js';
+import { resetPendingActions } from './api_v3.js';
 
+console.log('[SEVCS] STATE_V3 LOADED - VERIFYING LATENCY FIX AT L402');
 export const appState = {
     // System Status
     snapshot: null,

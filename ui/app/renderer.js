@@ -1,4 +1,4 @@
-import { appState, takeLatestSnapshot, commitSnapshot, processSnapshot, checkPendingHardSync } from './state.js';
+import { appState, takeLatestSnapshot, commitSnapshot, processSnapshot, checkPendingHardSync } from './state_v3.js';
 import { events } from './events.js';
 
 let lastRenderTime = Date.now();
@@ -45,10 +45,9 @@ export function startRenderer() {
                 return; 
             }
 
-            // 2. INPUT (Commit-After-Use with TTL Blacklist)
+            // 2. INPUT (Commit-After-Use Buffer Pull)
             const snapshot = takeLatestSnapshot();
             if (snapshot) {
-                // Identity Cache: Include sequence to prevent hash collisions
                 const identityKey = `${snapshot.state_hash}_${snapshot.snapshot_sequence}`;
                 
                 if (identityKey === lastIdentity) {
@@ -63,7 +62,7 @@ export function startRenderer() {
 
                 try {
                     processSnapshot(snapshot);
-                    commitSnapshot(); 
+                    commitSnapshot();
                     retryCount = 0; 
                     lastIdentity = identityKey;
                 } catch (e) {
@@ -73,11 +72,8 @@ export function startRenderer() {
                     if (retryCount >= MAX_RETRY) {
                         console.error('[SEVCS] TOXIC SNAPSHOT IDENTIFIED: Blacklisting for 30s', identityKey);
                         toxicFrames.set(identityKey, Date.now());
-                        
-                        // Memory leak guard
                         if (toxicFrames.size > 100) toxicFrames.clear();
-
-                        commitSnapshot(); 
+                        commitSnapshot();
                         retryCount = 0;
                     }
                     throw e; 
@@ -108,28 +104,50 @@ export function startRenderer() {
 /**
  * Fail-Safe Drawing
  */
+/**
+ * Centralized UI State Priority Engine
+ */
+function computeUIState() {
+    const flags = {
+        isFrozen: appState.snapshot?.freeze_state,
+        isDesync: appState.uiState === 'DESYNCHRONIZED' || appState.uiState === 'RESYNC_REQUIRED',
+        isDisconnected: appState.uiState === 'DISCONNECTED',
+        isDegraded: appState.uiHealth === 'CRITICAL' || appState.uiHealth === 'DEGRADED',
+        isUnknown: Array.from(appState.pendingIntents.values()).some(i => i.status === 'UNKNOWN')
+    };
+
+    if (flags.isFrozen) {
+        if (flags.isUnknown) return 'FROZEN_UNKNOWN';
+        return 'FROZEN';
+    }
+    if (appState.uiState === 'RESYNC_REQUIRED') return 'RESYNC_REQUIRED';
+    if (flags.isDesync) return 'DESYNCHRONIZED';
+    if (flags.isDisconnected) return 'DISCONNECTED';
+    if (flags.isDegraded) return 'DEGRADED';
+    
+    return 'SYNCHRONIZED';
+}
+
+/**
+ * Fail-Safe Drawing
+ */
 function safeDraw() {
     try {
-        // Enforce Stable DOM Ordering WITHOUT Mutating Live State
-        // We use a local sorted copy for the event emission
-        let stateToEmit = appState;
+        const displayState = computeUIState();
         
-        if (appState.snapshot) {
-            stateToEmit = {
-                ...appState,
-                snapshot: {
-                    ...appState.snapshot,
-                    slots: appState.snapshot.slots ? [...appState.snapshot.slots].sort((a, b) => a.slot_id - b.slot_id) : [],
-                    queue: appState.snapshot.queue ? [...appState.snapshot.queue].sort((a, b) => a.global_id - b.global_id) : []
-                }
-            };
-        }
+        // Final Display Synthesis
+        const stateToEmit = {
+            ...appState,
+            displayState,
+            snapshot: appState.snapshot ? {
+                ...appState.snapshot,
+                slots: [...appState.snapshot.slots].sort((a, b) => a.slot_id - b.slot_id),
+                queue: [...appState.snapshot.queue].sort((a, b) => (a.global_id || 0) - (b.global_id || 0))
+            } : null
+        };
         
         events.emit('STATE_UPDATED', stateToEmit);
     } catch (e) {
-        console.error('[SEVCS] RENDER FAILURE: Dashboard components crashed', e);
-        events.emit('RENDER_FALLBACK', {
-            timestamp: Date.now()
-        });
+        console.error('[SEVCS] RENDER FAILURE', e);
     }
 }

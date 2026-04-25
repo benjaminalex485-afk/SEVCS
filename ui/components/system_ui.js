@@ -7,39 +7,31 @@ export function initSystemUI() {
     const bannerMsg = document.getElementById('banner-message');
     const confidenceTag = document.getElementById('ui-confidence-tag');
     
-    // Header elements
     const snapshotInfo = document.getElementById('snapshot-info');
     const healthIndicator = document.getElementById('ui-health-indicator');
+    const modeToggle = document.querySelector('.mode-toggle');
     const btnAdmin = document.getElementById('btn-mode-admin');
     const btnUser = document.getElementById('btn-mode-user');
-
-    // Mode Toggle Logic
-    btnAdmin.addEventListener('click', () => {
-        if (appState.uiState === 'SYNCHRONIZED') {
-            appState.uiMode = 'ADMIN';
-            updateModeUI();
-        }
-    });
-    btnUser.addEventListener('click', () => {
-        if (appState.uiState === 'SYNCHRONIZED') {
-            appState.uiMode = 'USER';
-            updateModeUI();
-        }
-    });
-
-    function updateModeUI() {
-        btnAdmin.className = `btn-toggle ${appState.uiMode === 'ADMIN' ? 'active' : ''}`;
-        btnUser.className = `btn-toggle ${appState.uiMode === 'USER' ? 'active' : ''}`;
-        // Force immediate render of other components
-        events.emit('STATE_UPDATED', appState);
-    }
-
+    const adminControls = document.getElementById('admin-controls');
     events.on('STATE_UPDATED', (state) => {
         const snapshot = state.snapshot;
         
-        // 1. Header Global Info
-        confidenceTag.className = `confidence-tag ${state.uiState.toLowerCase()}`;
-        confidenceTag.innerText = state.uiState;
+        // 2. Role-Based Visibility Pruning
+        const isAdmin = state.uiMode === 'ADMIN';
+        
+        if (isAdmin) {
+            snapshotInfo?.classList.remove('hidden');
+            healthIndicator?.classList.remove('hidden');
+            confidenceTag?.classList.remove('hidden');
+            modeToggle?.classList.add('hidden'); // Permanently hidden as requested
+            adminControls?.classList.remove('hidden');
+        } else {
+            snapshotInfo?.classList.add('hidden');
+            healthIndicator?.classList.add('hidden');
+            confidenceTag?.classList.add('hidden');
+            modeToggle?.classList.add('hidden');
+            adminControls?.classList.add('hidden');
+        }
 
         if (snapshot) {
             snapshotInfo.innerText = `Snapshot: v${snapshot.snapshot_version} | Seq #${snapshot.snapshot_sequence}`;
@@ -48,35 +40,44 @@ export function initSystemUI() {
         healthIndicator.className = `health-indicator ${state.uiHealth.toLowerCase()}`;
         healthIndicator.innerText = `HEALTH: ${state.uiHealth}`;
 
-        // 2. Mode Toggle Protection
+        // 3. Mode Toggle Protection & Styling
         const canSwitch = state.uiState === 'SYNCHRONIZED';
         btnAdmin.disabled = !canSwitch;
         btnUser.disabled = !canSwitch;
+        btnAdmin.className = `btn-toggle ${state.uiMode === 'ADMIN' ? 'active' : ''}`;
+        btnUser.className = `btn-toggle ${state.uiMode === 'USER' ? 'active' : ''}`;
 
-        // 3. Priority Banner System: FROZEN > DESYNC > DEGRADED > DISCONNECTED
+        // 3. Priority Banner System: FROZEN_UNKNOWN > FROZEN > DESYNC > DEGRADED > DISCONNECTED
         let bannerActive = true;
-        if (snapshot && snapshot.freeze_state) {
+        const displayState = state.displayState;
+
+        if (displayState === 'FROZEN_UNKNOWN') {
             banner.className = 'banner banner-frozen';
-            bannerMsg.innerText = `SYSTEM FROZEN: ${snapshot.freeze_reason || 'EMERGENCY STOP'}`;
-        } else if (state.uiState === 'DESYNCHRONIZED') {
+            bannerMsg.innerText = 'SYSTEM FROZEN - Last action status unknown. Verify state after recovery.';
+        } else if (displayState === 'FROZEN') {
+            banner.className = 'banner banner-frozen';
+            bannerMsg.innerText = `SYSTEM FROZEN: ${snapshot?.freeze_reason || 'EMERGENCY STOP'}`;
+        } else if (displayState === 'RESYNC_REQUIRED') {
+            banner.className = 'banner banner-desync';
+            bannerMsg.innerText = 'CRITICAL DESYNC: MANUAL RESYNC REQUIRED';
+        } else if (displayState === 'DESYNCHRONIZED') {
             banner.className = 'banner banner-desync';
             bannerMsg.innerText = 'UI DESYNCHRONIZED - MONOTONICITY GAP DETECTED';
         } else if (state.systemState === 'INVALID') {
             banner.className = 'banner banner-invalid';
             bannerMsg.innerText = '🛑 CRITICAL: NO SLOTS OR QUEUE - SYSTEM INVALID';
-        } else if (snapshot && snapshot.slots.length === 0) {
-            banner.className = 'banner banner-frozen';
-            bannerMsg.innerText = '🚨 NO AVAILABLE SLOTS - SYSTEM DEGRADED';
-        } else if (snapshot && snapshot.queue.length === 0) {
-            banner.className = 'banner banner-desync';
-            bannerMsg.innerText = '⚠ EMPTY QUEUE - NO ACTIVE TRACKS';
-        } else if (state.uiState === 'DEGRADED') {
+        } else if (displayState === 'DEGRADED') {
             banner.className = 'banner banner-desync';
             bannerMsg.innerText = 'NETWORK DEGRADED - ADAPTIVE TIMEOUT ACTIVE';
-        } else if (state.uiState === 'DISCONNECTED') {
+        } else if (displayState === 'DISCONNECTED' && state.authStatus !== 'GUEST') {
             banner.className = 'banner banner-frozen';
             bannerMsg.innerText = 'BACKEND DISCONNECTED - SEARCHING FOR COORDINATOR';
         } else {
+            bannerActive = false;
+        }
+
+        // Final Banner Guard (Admin Only for desync info)
+        if (!isAdmin && (displayState === 'DESYNCHRONIZED' || displayState === 'DEGRADED')) {
             bannerActive = false;
         }
 

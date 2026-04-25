@@ -15,6 +15,8 @@
         <span id="banner-message">SYSTEM FROZEN</span>
     </div>
 
+    <div id="auth-container" class="auth-overlay" style="display: none;"></div>
+
     <header class="main-header">
         <div class="logo-area">
             <h1>SEVCS <span>Smart EV Charging System</span></h1>
@@ -35,15 +37,16 @@
                 <button id="btn-mode-admin" class="btn-toggle active">ADMIN</button>
                 <button id="btn-mode-user" class="btn-toggle">USER</button>
             </div>
+            <button id="btn-logout" class="btn-logout" style="display: none;">Logout</button>
             <div id="header-status" class="header-status">
                 <!-- Polling Indicator & Latency -->
             </div>
         </div>
     </header>
 
-    <main class="dashboard">
+    <main class="dashboard" id="main-dashboard">
         <!-- Left Column: Live Status & Actions -->
-        <section class="control-panel">
+        <section class="control-panel" id="admin-controls">
             <div id="live-status-container"></div>
             <div id="action-panel-container"></div>
             <div id="simulation-panel-container"></div>
@@ -54,10 +57,10 @@
         <section class="data-panel">
             <div id="slot-grid-container"></div>
             <div id="queue-table-container"></div>
-            <div id="user-ui-container"></div>
+            <div id="user-ui-container" class="hidden"></div>
         </section>
     </main>
 
-    <script type="module" src="app/app.js"></script>
+    <script type="module" src="app/app.js?v=3"></script>
 </body>
 </html>
