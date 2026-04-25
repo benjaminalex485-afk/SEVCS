@@ -8,7 +8,7 @@ app = Flask(__name__)
 
 # --- CONFIGURATION ---
 PORT = 5001
-ALLOWED_ORIGIN = "http://localhost:8000"
+ALLOWED_ORIGIN = "http://localhost:5500"
 
 # Strict CORS Hardening
 CORS(app, resources={
