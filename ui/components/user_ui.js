@@ -10,7 +10,14 @@ export function initUserUI() {
         open: false,
         loading: false,
         error: null,
-        success: null
+        success: null,
+        form: {
+            amount: '50',
+            cardNumber: '',
+            cardHolder: '',
+            cardExpiry: '',
+            cardCvv: ''
+        }
     };
 
     const initialFlowData = () => ({
@@ -82,24 +89,24 @@ export function initUserUI() {
                 <div class="mono" style="margin-bottom:8px;">Add funds with card</div>
                 <div class="form-group">
                     <label>Amount (USD)</label>
-                    <input type="number" id="recharge-amount" min="1" max="5000" step="1" value="50" ${rechargeFlowState.loading ? 'disabled' : ''} />
+                    <input type="number" id="recharge-amount" min="1" max="5000" step="1" value="${rechargeFlowState.form.amount}" ${rechargeFlowState.loading ? 'disabled' : ''} />
                 </div>
                 <div class="form-group">
                     <label>Card Number</label>
-                    <input type="text" id="recharge-card-number" placeholder="4111 1111 1111 1111" ${rechargeFlowState.loading ? 'disabled' : ''} />
+                    <input type="text" id="recharge-card-number" placeholder="4111 1111 1111 1111" value="${rechargeFlowState.form.cardNumber}" ${rechargeFlowState.loading ? 'disabled' : ''} />
                 </div>
                 <div class="form-group">
                     <label>Name on Card</label>
-                    <input type="text" id="recharge-card-holder" placeholder="Your full name" ${rechargeFlowState.loading ? 'disabled' : ''} />
+                    <input type="text" id="recharge-card-holder" placeholder="Your full name" value="${rechargeFlowState.form.cardHolder}" ${rechargeFlowState.loading ? 'disabled' : ''} />
                 </div>
                 <div class="wallet-recharge-inline-row">
                     <div class="form-group" style="margin:0;">
                         <label>Expiry (MM/YY)</label>
-                        <input type="text" id="recharge-card-expiry" placeholder="12/30" ${rechargeFlowState.loading ? 'disabled' : ''} />
+                        <input type="text" id="recharge-card-expiry" placeholder="12/30" value="${rechargeFlowState.form.cardExpiry}" ${rechargeFlowState.loading ? 'disabled' : ''} />
                     </div>
                     <div class="form-group" style="margin:0;">
                         <label>CVV</label>
-                        <input type="text" id="recharge-card-cvv" placeholder="123" ${rechargeFlowState.loading ? 'disabled' : ''} />
+                        <input type="text" id="recharge-card-cvv" placeholder="123" value="${rechargeFlowState.form.cardCvv}" ${rechargeFlowState.loading ? 'disabled' : ''} />
                     </div>
                 </div>
                 ${rechargeFlowState.error ? `<p class="status-msg warning" style="margin-top:8px;">${rechargeFlowState.error}</p>` : ''}
@@ -454,11 +461,11 @@ export function initUserUI() {
                 return;
             }
             if (walletAction === 'confirm-recharge') {
-                const amount = Number(document.getElementById('recharge-amount')?.value || 0);
-                const cardNumber = document.getElementById('recharge-card-number')?.value?.trim() || '';
-                const cardHolder = document.getElementById('recharge-card-holder')?.value?.trim() || '';
-                const cardExpiry = document.getElementById('recharge-card-expiry')?.value?.trim() || '';
-                const cardCvv = document.getElementById('recharge-card-cvv')?.value?.trim() || '';
+                const amount = Number(rechargeFlowState.form.amount || 0);
+                const cardNumber = rechargeFlowState.form.cardNumber.trim();
+                const cardHolder = rechargeFlowState.form.cardHolder.trim();
+                const cardExpiry = rechargeFlowState.form.cardExpiry.trim();
+                const cardCvv = rechargeFlowState.form.cardCvv.trim();
 
                 if (!Number.isFinite(amount) || amount <= 0) {
                     rechargeFlowState.error = 'Please enter a valid recharge amount';
@@ -487,6 +494,7 @@ export function initUserUI() {
                 if (res?.status === 'success') {
                     rechargeFlowState.success = `Payment successful. Wallet recharged by $${amount.toFixed(2)}.`;
                     rechargeFlowState.error = null;
+                    rechargeFlowState.form = { amount: '50', cardNumber: '', cardHolder: '', cardExpiry: '', cardCvv: '' };
                 } else {
                     rechargeFlowState.error = res?.message || res?.error || 'Recharge failed';
                     rechargeFlowState.success = null;
@@ -647,6 +655,16 @@ export function initUserUI() {
                 return;
             }
         });
+
+        container.addEventListener('input', (e) => {
+            const target = e.target;
+            if (!(target instanceof HTMLInputElement)) return;
+            if (target.id === 'recharge-amount') rechargeFlowState.form.amount = target.value;
+            if (target.id === 'recharge-card-number') rechargeFlowState.form.cardNumber = target.value;
+            if (target.id === 'recharge-card-holder') rechargeFlowState.form.cardHolder = target.value;
+            if (target.id === 'recharge-card-expiry') rechargeFlowState.form.cardExpiry = target.value;
+            if (target.id === 'recharge-card-cvv') rechargeFlowState.form.cardCvv = target.value;
+        });
     }
 
     function update() {
@@ -664,7 +682,6 @@ export function initUserUI() {
         if (balanceEl) balanceEl.innerText = wallet.balance.toFixed(2);
         const userIdEl = document.getElementById('wallet-user-id');
         if (userIdEl) userIdEl.innerText = `ID: ${appState.session.userId}`;
-        renderWalletRechargePanel();
 
         const slotGridArea = document.getElementById('slot-grid-area');
         if (slotGridArea) {

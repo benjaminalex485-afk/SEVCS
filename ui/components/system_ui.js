@@ -60,53 +60,8 @@ export function initSystemUI() {
         btnAdmin.className = `btn-toggle ${state.uiMode === 'ADMIN' ? 'active' : ''}`;
         btnUser.className = `btn-toggle ${state.uiMode === 'USER' ? 'active' : ''}`;
 
-        // 3. Priority Banner System: FROZEN_UNKNOWN > FROZEN > DESYNC > DEGRADED > DISCONNECTED
-        let bannerActive = true;
-        const displayState = state.displayState;
-
-        if (displayState === 'INITIALIZING') {
-            banner.className = 'banner banner-desync';
-            bannerMsg.innerText = 'Initializing...';
-        } else if (displayState === 'WAITING_FOR_CAMERA') {
-            banner.className = 'banner banner-frozen';
-            bannerMsg.innerText = 'Waiting for camera...';
-        } else if (displayState === 'DEGRADED_MODE') {
-            banner.className = 'banner banner-frozen';
-            bannerMsg.innerText = 'Degraded mode';
-        } else if (displayState === 'SYNCHRONIZED') {
-            bannerActive = false; // Camera status is shown inside the user dashboard card.
-        } else if (displayState === 'FROZEN_UNKNOWN') {
-            banner.className = 'banner banner-frozen';
-            bannerMsg.innerText = 'SYSTEM FROZEN - Last action status unknown. Verify state after recovery.';
-        } else if (displayState === 'FROZEN') {
-            banner.className = 'banner banner-frozen';
-            bannerMsg.innerText = `SYSTEM FROZEN: ${snapshot?.freeze_reason || 'EMERGENCY STOP'}`;
-        } else if (displayState === 'RESYNC_REQUIRED') {
-            banner.className = 'banner banner-desync';
-            bannerMsg.innerText = 'CRITICAL DESYNC: MANUAL RESYNC REQUIRED';
-        } else if (displayState === 'DESYNCHRONIZED') {
-            banner.className = 'banner banner-desync';
-            bannerMsg.innerText = 'UI DESYNCHRONIZED - MONOTONICITY GAP DETECTED';
-        } else if (state.systemState === 'INVALID') {
-            banner.className = 'banner banner-invalid';
-            bannerMsg.innerText = '🛑 CRITICAL: NO SLOTS OR QUEUE - SYSTEM INVALID';
-        } else if (displayState === 'DEGRADED') {
-            banner.className = 'banner banner-desync';
-            bannerMsg.innerText = 'NETWORK DEGRADED - ADAPTIVE TIMEOUT ACTIVE';
-        } else if (displayState === 'DISCONNECTED' && state.authStatus !== 'GUEST') {
-            banner.className = 'banner banner-frozen';
-            bannerMsg.innerText = 'BACKEND DISCONNECTED - SEARCHING FOR COORDINATOR';
-        } else {
-            bannerActive = false;
-        }
-
-        // Final Banner Guard (Admin Only for desync info)
-        if (!isAdmin && (displayState === 'DESYNCHRONIZED' || displayState === 'DEGRADED')) {
-            bannerActive = false;
-        }
-
-        if (bannerActive) banner.classList.remove('hidden');
-        else banner.classList.add('hidden');
+        // Top banner is intentionally disabled for all states.
+        banner.classList.add('hidden');
 
         // 4. Render Status Panel (ADMIN ONLY)
         if (state.uiMode === 'ADMIN') {
