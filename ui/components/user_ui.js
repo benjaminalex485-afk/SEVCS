@@ -6,6 +6,12 @@ export function initUserUI() {
     const container = document.getElementById('user-ui-container');
     let isLoading = false;
     let lastSlotHash = "";
+    const rechargeFlowState = {
+        open: false,
+        loading: false,
+        error: null,
+        success: null
+    };
 
     const initialFlowData = () => ({
         slot_id: null,
@@ -50,6 +56,60 @@ export function initUserUI() {
         console.error(`[ChargeFlow] ERROR: ${message}`);
         console.log(`[ChargeFlow] STEP_CHANGE: ${sourceStep} -> ERROR`);
         renderChargeFlow();
+    }
+
+    function validateCardInputs(cardNumber, cardHolder, cardExpiry, cardCvv) {
+        const digitsOnlyCard = (cardNumber || '').replace(/\D/g, '');
+        const expiryOk = /^(0[1-9]|1[0-2])\/\d{2}$/.test(cardExpiry || '');
+        const cvvOk = /^\d{3,4}$/.test(cardCvv || '');
+        if (!cardHolder || digitsOnlyCard.length < 12 || digitsOnlyCard.length > 19 || !expiryOk || !cvvOk) {
+            return 'Please fill valid card details';
+        }
+        return null;
+    }
+
+    function renderWalletRechargePanel() {
+        const panel = document.getElementById('wallet-recharge-area');
+        if (!panel) return;
+        if (!rechargeFlowState.open) {
+            panel.classList.add('hidden');
+            panel.innerHTML = '';
+            return;
+        }
+        panel.classList.remove('hidden');
+        panel.innerHTML = `
+            <div class="wallet-recharge-panel">
+                <div class="mono" style="margin-bottom:8px;">Add funds with card</div>
+                <div class="form-group">
+                    <label>Amount (USD)</label>
+                    <input type="number" id="recharge-amount" min="1" max="5000" step="1" value="50" ${rechargeFlowState.loading ? 'disabled' : ''} />
+                </div>
+                <div class="form-group">
+                    <label>Card Number</label>
+                    <input type="text" id="recharge-card-number" placeholder="4111 1111 1111 1111" ${rechargeFlowState.loading ? 'disabled' : ''} />
+                </div>
+                <div class="form-group">
+                    <label>Name on Card</label>
+                    <input type="text" id="recharge-card-holder" placeholder="Your full name" ${rechargeFlowState.loading ? 'disabled' : ''} />
+                </div>
+                <div class="wallet-recharge-inline-row">
+                    <div class="form-group" style="margin:0;">
+                        <label>Expiry (MM/YY)</label>
+                        <input type="text" id="recharge-card-expiry" placeholder="12/30" ${rechargeFlowState.loading ? 'disabled' : ''} />
+                    </div>
+                    <div class="form-group" style="margin:0;">
+                        <label>CVV</label>
+                        <input type="text" id="recharge-card-cvv" placeholder="123" ${rechargeFlowState.loading ? 'disabled' : ''} />
+                    </div>
+                </div>
+                ${rechargeFlowState.error ? `<p class="status-msg warning" style="margin-top:8px;">${rechargeFlowState.error}</p>` : ''}
+                ${rechargeFlowState.success ? `<p class="mono" style="margin-top:8px; color:#22c55e;">${rechargeFlowState.success}</p>` : ''}
+                <div class="wallet-recharge-actions">
+                    <button class="primary-btn btn-small" data-wallet-action="confirm-recharge" ${rechargeFlowState.loading ? 'disabled' : ''}>${rechargeFlowState.loading ? 'Processing...' : 'Confirm Payment'}</button>
+                    <button class="primary-btn btn-small wallet-cancel-btn" data-wallet-action="cancel-recharge" ${rechargeFlowState.loading ? 'disabled' : ''}>Cancel</button>
+                </div>
+            </div>
+        `;
     }
 
     function renderChargeFlow() {
@@ -322,6 +382,17 @@ export function initUserUI() {
                         <span class="balance" id="user-balance">0.00</span>
                     </div>
                     <button class="primary-btn btn-small" id="btn-recharge">Quick Recharge $50</button>
+                    <div id="wallet-recharge-area" class="hidden"></div>
+                </div>
+                <div class="card camera-card glass" id="camera-status-card">
+                    <div class="wallet-header">
+                        <h3>Camera Status</h3>
+                        <span class="wallet-id" id="camera-status-mode">--</span>
+                    </div>
+                    <div class="camera-status-line">
+                        <span class="status-dot status-dot-amber" id="camera-status-dot" aria-hidden="true"></span>
+                        <div class="mono camera-status-text-amber" id="camera-status-text">Waiting for status...</div>
+                    </div>
                 </div>
                 <div class="card slots-card glass">
                     <div class="card-header">
@@ -358,7 +429,7 @@ export function initUserUI() {
         `;
 
         container.addEventListener('click', async (e) => {
-            const btn = e.target.closest('.btn-charge, #btn-recharge, #btn-find-slot, [data-flow-action]');
+            const btn = e.target.closest('.btn-charge, #btn-recharge, #btn-find-slot, [data-flow-action], [data-wallet-action]');
             if (!btn) return;
             const rawSlotId = btn.dataset.slotId;
             const slotId = rawSlotId === undefined || rawSlotId === '' ? NaN : Number(rawSlotId);
@@ -366,8 +437,61 @@ export function initUserUI() {
             const flowAction = btn.dataset.flowAction;
 
             if (btn.id === 'btn-recharge') {
-                const res = await executeAction('recharge', { amount: 50, username: appState.session.userId }, 'recharge');
-                if (res?.status === 'success') alert('Recharge successful');
+                rechargeFlowState.open = true;
+                rechargeFlowState.error = null;
+                rechargeFlowState.success = null;
+                renderWalletRechargePanel();
+                return;
+            }
+
+            const walletAction = btn.dataset.walletAction;
+            if (walletAction === 'cancel-recharge') {
+                rechargeFlowState.open = false;
+                rechargeFlowState.loading = false;
+                rechargeFlowState.error = null;
+                rechargeFlowState.success = null;
+                renderWalletRechargePanel();
+                return;
+            }
+            if (walletAction === 'confirm-recharge') {
+                const amount = Number(document.getElementById('recharge-amount')?.value || 0);
+                const cardNumber = document.getElementById('recharge-card-number')?.value?.trim() || '';
+                const cardHolder = document.getElementById('recharge-card-holder')?.value?.trim() || '';
+                const cardExpiry = document.getElementById('recharge-card-expiry')?.value?.trim() || '';
+                const cardCvv = document.getElementById('recharge-card-cvv')?.value?.trim() || '';
+
+                if (!Number.isFinite(amount) || amount <= 0) {
+                    rechargeFlowState.error = 'Please enter a valid recharge amount';
+                    rechargeFlowState.success = null;
+                    renderWalletRechargePanel();
+                    return;
+                }
+                const cardError = validateCardInputs(cardNumber, cardHolder, cardExpiry, cardCvv);
+                if (cardError) {
+                    rechargeFlowState.error = cardError;
+                    rechargeFlowState.success = null;
+                    renderWalletRechargePanel();
+                    return;
+                }
+
+                rechargeFlowState.loading = true;
+                rechargeFlowState.error = null;
+                rechargeFlowState.success = null;
+                renderWalletRechargePanel();
+                const res = await executeAction(
+                    'recharge',
+                    { amount, username: appState.session.userId },
+                    `recharge_${appState.session.userId}`
+                );
+                rechargeFlowState.loading = false;
+                if (res?.status === 'success') {
+                    rechargeFlowState.success = `Payment successful. Wallet recharged by $${amount.toFixed(2)}.`;
+                    rechargeFlowState.error = null;
+                } else {
+                    rechargeFlowState.error = res?.message || res?.error || 'Recharge failed';
+                    rechargeFlowState.success = null;
+                }
+                renderWalletRechargePanel();
                 return;
             }
 
@@ -413,11 +537,9 @@ export function initUserUI() {
                 const cardHolder = document.getElementById('mock-card-holder')?.value?.trim() || '';
                 const cardExpiry = document.getElementById('mock-card-expiry')?.value?.trim() || '';
                 const cardCvv = document.getElementById('mock-card-cvv')?.value?.trim() || '';
-                const digitsOnlyCard = cardNumber.replace(/\D/g, '');
-                const expiryOk = /^(0[1-9]|1[0-2])\/\d{2}$/.test(cardExpiry);
-                const cvvOk = /^\d{3,4}$/.test(cardCvv);
-                if (!cardHolder || digitsOnlyCard.length < 12 || digitsOnlyCard.length > 19 || !expiryOk || !cvvOk) {
-                    setFlowError('Please fill valid card details');
+                const cardError = validateCardInputs(cardNumber, cardHolder, cardExpiry, cardCvv);
+                if (cardError) {
+                    setFlowError(cardError);
                     return;
                 }
                 const resultArea = document.getElementById('user-result-area');
@@ -542,6 +664,7 @@ export function initUserUI() {
         if (balanceEl) balanceEl.innerText = wallet.balance.toFixed(2);
         const userIdEl = document.getElementById('wallet-user-id');
         if (userIdEl) userIdEl.innerText = `ID: ${appState.session.userId}`;
+        renderWalletRechargePanel();
 
         const slotGridArea = document.getElementById('slot-grid-area');
         if (slotGridArea) {
@@ -575,6 +698,42 @@ export function initUserUI() {
         // Do not tie to allowActions: it flips with camera/sync (~100ms) and makes the button unusable.
         // find_slot is allowed while waiting for vision (see api_v3 executeAction allowlist).
         if (findBtn) findBtn.disabled = isLoading;
+
+        const camMode = snapshot.system_mode || snapshot.mode || 'UNKNOWN';
+        const displayState = appState.displayState || '';
+        const camModeEl = document.getElementById('camera-status-mode');
+        const camDotEl = document.getElementById('camera-status-dot');
+        const camTextEl = document.getElementById('camera-status-text');
+        if (camModeEl) camModeEl.textContent = camMode;
+        if (camTextEl) {
+            let statusColor = 'green';
+            let statusText = 'Camera active and streaming.';
+
+            if (displayState === 'WAITING_FOR_CAMERA' || displayState === 'INITIALIZING' || camMode === 'WAITING_FOR_CAMERA') {
+                statusColor = 'amber';
+                statusText = 'Camera is waiting to initialize.';
+            } else if (
+                displayState === 'DISCONNECTED' ||
+                displayState === 'FROZEN' ||
+                displayState === 'FROZEN_UNKNOWN' ||
+                displayState === 'DESYNCHRONIZED' ||
+                displayState === 'DEGRADED' ||
+                displayState === 'DEGRADED_MODE' ||
+                camMode === 'DEGRADED'
+            ) {
+                statusColor = 'red';
+                statusText = 'Camera signal is unstable. Some actions may be limited.';
+            }
+
+            camTextEl.textContent = statusText;
+            camTextEl.classList.remove('camera-status-text-green', 'camera-status-text-amber', 'camera-status-text-red');
+            camTextEl.classList.add(`camera-status-text-${statusColor}`);
+
+            if (camDotEl) {
+                camDotEl.classList.remove('status-dot-green', 'status-dot-amber', 'status-dot-red');
+                camDotEl.classList.add(`status-dot-${statusColor}`);
+            }
+        }
 
         const bookingsTable = document.getElementById('user-bookings-table');
         if (bookingsTable) {

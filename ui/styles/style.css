@@ -37,12 +37,21 @@ body {
     text-align: center;
     font-weight: 700;
     font-size: 0.9rem;
-    z-index: 1000;
-    position: sticky;
+    z-index: 1200;
+    position: fixed;
+    left: 0;
+    right: 0;
     top: 0;
+    transform: translateY(0);
+    opacity: 1;
+    transition: opacity 160ms ease, transform 160ms ease;
 }
 
-.banner.hidden { display: none; }
+.banner.hidden {
+    opacity: 0;
+    transform: translateY(-100%);
+    pointer-events: none;
+}
 .banner-frozen { background-color: var(--accent-red); color: white; }
 .banner-desync { background-color: var(--accent-orange); color: white; }
 .banner-invalid { background-color: #000; color: var(--accent-red); border: 2px solid var(--accent-red); }
@@ -546,6 +555,11 @@ body {
     grid-row: 1;
 }
 
+.camera-card {
+    grid-column: 1;
+    grid-row: 2;
+}
+
 .slots-card {
     grid-column: 2;
     grid-row: 1;
@@ -560,6 +574,42 @@ body {
 .wallet-id { font-size: 0.7rem; color: var(--text-secondary); }
 .balance-area { font-size: 2.5rem; font-weight: 800; margin: 1rem 0; }
 .currency { color: var(--accent-green); font-size: 1.5rem; vertical-align: top; margin-right: 4px; }
+.camera-status-line { display: flex; align-items: center; gap: 8px; }
+.status-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    display: inline-block;
+    flex: 0 0 10px;
+}
+.status-dot-green { background: #22c55e; box-shadow: 0 0 8px rgba(34, 197, 94, 0.6); }
+.status-dot-amber { background: #f59e0b; box-shadow: 0 0 8px rgba(245, 158, 11, 0.6); }
+.status-dot-red { background: #ef4444; box-shadow: 0 0 8px rgba(239, 68, 68, 0.65); }
+.camera-status-text-green { color: #22c55e; }
+.camera-status-text-amber { color: #f59e0b; }
+.camera-status-text-red { color: #ef4444; }
+.wallet-recharge-panel {
+    margin-top: 10px;
+    border-top: 1px solid var(--border-color);
+    padding-top: 10px;
+}
+.wallet-recharge-inline-row {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+    margin-bottom: 8px;
+}
+.wallet-recharge-actions {
+    display: flex;
+    gap: 8px;
+    margin-top: 8px;
+}
+.wallet-recharge-actions .primary-btn {
+    flex: 1;
+}
+.wallet-cancel-btn {
+    background: rgba(255, 255, 255, 0.08);
+}
 
 .slot-grid {
     display: grid;

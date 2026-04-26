@@ -74,8 +74,7 @@ export function initSystemUI() {
             banner.className = 'banner banner-frozen';
             bannerMsg.innerText = 'Degraded mode';
         } else if (displayState === 'SYNCHRONIZED') {
-            banner.className = 'banner banner-desync';
-            bannerMsg.innerText = 'Camera Active';
+            bannerActive = false; // Camera status is shown inside the user dashboard card.
         } else if (displayState === 'FROZEN_UNKNOWN') {
             banner.className = 'banner banner-frozen';
             bannerMsg.innerText = 'SYSTEM FROZEN - Last action status unknown. Verify state after recovery.';
