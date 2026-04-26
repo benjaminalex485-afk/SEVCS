@@ -78,14 +78,13 @@ export function startRenderer() {
                         commitSnapshot();
                         retryCount = 0;
                     }
-                    throw e; 
                 }
             }
             
             // 3. RENDER
             safeDraw();
         } catch (e) {
-            // Kernel crash protection
+            console.error('[SEVCS] RENDER TICK CRASH:', e);
         } finally {
             isRendering = false;
         }

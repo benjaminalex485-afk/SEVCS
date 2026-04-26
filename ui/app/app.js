@@ -1,3 +1,4 @@
+console.log('[SEVCS] APP.JS LOADED');
 import { executeAction, startPolling } from './api_v3.js';
 import { startRenderer } from './renderer.js';
 import { initSystemUI } from '../components/system_ui.js';
@@ -14,13 +15,34 @@ import { appState, performHardReset } from './state_v3.js';
 function bootstrap() {
     console.log('[SEVCS] Initializing Deterministic UI...');
 
+    // 0. Emergency Catch-All
+    const resetBtn = document.getElementById('btn-hard-reset');
+    if (resetBtn) {
+        console.log('[SEVCS] Emergency Reset Button Found');
+        resetBtn.addEventListener('click', () => {
+            console.warn('[SEVCS] Emergency Reset Triggered');
+            if (confirm('Clear all local session data and reload?')) {
+                localStorage.clear();
+                location.reload();
+            }
+        });
+        // Visual indicator that it's wired
+        resetBtn.style.border = '2px solid white';
+    }
+
     // 1. Initialize Components
     try {
+        console.log('[SEVCS] Initializing System UI...');
         initSystemUI();
+        console.log('[SEVCS] Initializing Grids...');
         initGrids();
+        console.log('[SEVCS] Initializing Simulation UI...');
         initSimulationUI();
+        console.log('[SEVCS] Initializing User UI...');
         initUserUI();
+        console.log('[SEVCS] Initializing Auth UI...');
         renderAuthUI();
+        console.log('[SEVCS] Component Initialization Complete.');
     } catch (e) {
         console.error('[SEVCS] Component Initialization Failed:', e);
     }
@@ -35,8 +57,14 @@ function bootstrap() {
             state.authStatus !== 'GUEST' ? 'block' : 'none';
         
         // Hide/Show main dashboard based on auth
-        document.getElementById('main-dashboard').style.visibility = 
-            state.authStatus === 'AUTHENTICATED' ? 'visible' : 'hidden';
+        const isAuth = state.authStatus === 'AUTHENTICATED' || (state.authStatus === 'AUTHENTICATED_PENDING' && state.lastSequence > -1);
+        document.getElementById('main-dashboard').style.visibility = isAuth ? 'visible' : 'hidden';
+        
+        if (state.authStatus === 'GUEST') {
+            document.getElementById('auth-container').style.display = 'flex';
+        } else {
+            document.getElementById('auth-container').style.display = 'none';
+        }
 
         // Toggle Admin/User sections
         const isAdmin = state.uiMode === 'ADMIN';
@@ -55,7 +83,7 @@ function bootstrap() {
         appState.uiMode = 'USER';
         events.emit('STATE_UPDATED', appState);
     };
-
+    
     document.getElementById('btn-logout').onclick = () => {
         performHardReset();
     };

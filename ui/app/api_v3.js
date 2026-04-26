@@ -103,7 +103,11 @@ const fetchStatus = async () => {
     const start = Date.now();
 
     try {
-        const data = await safeFetch(`${BASE_URL}/api/status`, { signal: controller.signal });
+        const url = new URL(`${BASE_URL}/api/status`);
+        if (appState.session.userId) {
+            url.searchParams.append('username', appState.session.userId);
+        }
+        const data = await safeFetch(url.toString(), { signal: controller.signal });
         clearTimeout(timeoutId);
         if (!data) return;
 
@@ -161,10 +165,25 @@ export function stopPolling() {
         clearTimeout(pollingInterval);
         pollingInterval = null;
     }
+    console.log('[SEVCS API] Polling STOPPED');
+}
+
+export async function resync() {
+    console.log('[SEVCS API] Initiating Resync...');
+    try {
+        await fetchStatus();
+        console.log('[SEVCS API] Resync SUCCESS');
+    } catch (e) {
+        console.error('[SEVCS API] Resync FAILED:', e);
+        throw e;
+    }
 }
 
 events.on('STOP_POLLING', stopPolling);
-events.on('RESYNC_STARTED', startPolling);
+events.on('RESYNC_STARTED', () => {
+    stopPolling();
+    resync().then(() => startPolling());
+});
 
 /**
  * Execute a mutative action with deterministic bindings.
@@ -172,8 +191,16 @@ events.on('RESYNC_STARTED', startPolling);
 const ACTION_TIMEOUT_MS = appState.INTENT_TIMEOUT_MS;
 
 export async function executeAction(endpoint, payload, intentKey = null) {
-    if (!appState.allowActions) {
-        events.emit('API_ERROR', { code: 'NOT_SYNCHRONIZED', retryable: false, message: 'System not synchronized or action disallowed' });
+    // 0. Policy Guard: Allow financial actions even during desync
+    const isCriticalVisionAction = !['recharge', 'login', 'signup'].includes(endpoint);
+    
+    if (isCriticalVisionAction && !appState.allowActions) {
+        console.warn(`[SEVCS API] Action ${endpoint} blocked: System not synchronized.`);
+        events.emit('API_ERROR', { 
+            code: 'NOT_SYNCHRONIZED', 
+            retryable: false, 
+            message: 'System not synchronized. Please wait for health indicator to turn Green.' 
+        });
         return;
     }
 
@@ -190,8 +217,9 @@ export async function executeAction(endpoint, payload, intentKey = null) {
 
     // Click-Time Version Binding
     const versionAtClick = appState.snapshotVersion;
-    const requestId = crypto.randomUUID();
+    const requestId = `req_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
 
+    console.log(`[SEVCS API] Executing ${endpoint} (ID: ${requestId})`);
     registerAction(requestId, versionAtClick, endpoint, intentKey);
 
     // Simulation Intercept (Admin Infrastructure)

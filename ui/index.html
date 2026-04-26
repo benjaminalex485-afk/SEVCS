@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>SEVCS | Deterministic Control Surface</title>
-    <link rel="stylesheet" href="styles/style.css">
+    <link rel="stylesheet" href="styles/style.css?v=2">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
@@ -35,12 +35,13 @@
         <div class="header-actions">
             <div class="mode-toggle">
                 <button id="btn-mode-admin" class="btn-toggle active">ADMIN</button>
-                <button id="btn-mode-user" class="btn-toggle">USER</button>
+                <button class="btn-toggle" id="btn-mode-user">USER</button>
             </div>
-            <button id="btn-logout" class="btn-logout" style="display: none;">Logout</button>
-            <div id="header-status" class="header-status">
-                <!-- Polling Indicator & Latency -->
-            </div>
+            <button class="btn-logout" id="btn-logout" style="display: none;">Logout</button>
+            <button class="btn-logout" id="btn-hard-reset" title="Clear all local data and logout">Emergency Reset</button>
+        </div>
+        <div id="header-status" class="header-status">
+            <!-- Polling Indicator & Latency -->
         </div>
     </header>
 
@@ -61,6 +62,22 @@
         </section>
     </main>
 
-    <script type="module" src="app/app.js?v=3"></script>
+    <script>
+        // Emergency Reset - Standalone Logic
+        document.addEventListener('DOMContentLoaded', () => {
+            const btn = document.getElementById('btn-hard-reset');
+            if (btn) {
+                btn.style.border = '3px solid yellow'; // High visibility
+                btn.onclick = (e) => {
+                    e.preventDefault();
+                    if (confirm('CLEAR LOCAL STORAGE AND RELOAD?')) {
+                        localStorage.clear();
+                        window.location.href = window.location.pathname + '?reset=' + Date.now();
+                    }
+                };
+            }
+        });
+    </script>
+    <script type="module" src="app/app.js?v=9"></script>
 </body>
 </html>

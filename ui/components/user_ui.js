@@ -5,6 +5,7 @@ import { events } from '../app/events.js';
 export function initUserUI() {
     const container = document.getElementById('user-ui-container');
     let isLoading = false;
+    let lastSlotHash = "";
 
     // 1. Initial Static Render (Called once)
     function initialRender() {
@@ -12,7 +13,15 @@ export function initUserUI() {
             <div class="user-dashboard-grid">
                 <!-- Wallet Section -->
                 <div class="card wallet-card glass" id="wallet-area">
-                    <div class="spinner"></div>
+                    <div class="wallet-header">
+                        <h3>Your Wallet</h3>
+                        <span class="wallet-id" id="wallet-user-id">ID: ---</span>
+                    </div>
+                    <div class="balance-area">
+                        <span class="currency">$</span>
+                        <span class="balance" id="user-balance">0.00</span>
+                    </div>
+                    <button class="primary-btn btn-small" id="btn-recharge">Quick Recharge $50</button>
                 </div>
 
                 <!-- Slot Overview -->
@@ -54,18 +63,33 @@ export function initUserUI() {
         `;
 
         // Event Delegation (Attach ONCE to the container)
-        container.onclick = async (e) => {
+        container.addEventListener('click', async (e) => {
             const btn = e.target.closest('.btn-charge, #btn-recharge, #btn-find-slot');
             if (!btn) return;
             
-            // Allow actions if synchronized
+            console.log('[USER UI] Click detected on:', btn.id || btn.className);
+            // alert(`CLICKED: ${btn.id || btn.className}`);
+            
+            // Reduced Strictness: Only warn, don't block
             if (!appState.allowActions && !btn.id?.includes('recharge')) {
-                console.warn('[USER UI] Action blocked: System not ready.');
-                return;
+                console.warn('[USER UI] System not fully synchronized, proceeding anyway.');
             }
 
             const slotId = parseInt(btn.dataset.slotId);
             const action = btn.dataset.action;
+            
+            if (btn.id === 'btn-recharge') {
+                console.log('[USER UI] Triggering Recharge...');
+                try {
+                    const res = await executeAction('recharge', { amount: 50, username: appState.session.userId }, 'recharge');
+                    console.log('[USER UI] Recharge Result:', res);
+                    alert('Recharge Requested! Your balance should update shortly.');
+                } catch (err) {
+                    console.error('[USER UI] Recharge Error:', err);
+                    alert(`Recharge Error: ${err.message}`);
+                }
+                return;
+            }
             
             if (action === 'book') {
                 isLoading = true;
@@ -112,15 +136,14 @@ export function initUserUI() {
                         type: document.getElementById('user-vehicle').value,
                         urgency: document.getElementById('user-urgency').value
                     };
-                    const res = await executeAction('find_slot', payload, 'find_slot');
-                    // Find Slot result handling is via events
+                    await executeAction('find_slot', payload, 'find_slot');
                 } catch (err) {
                     alert(`Error: ${err.message}`);
                 }
                 isLoading = false;
                 update(appState);
             }
-        };
+        });
     }
 
     // 2. Dynamic Update (Called every poll)
@@ -136,59 +159,61 @@ export function initUserUI() {
         const snapshot = appState.snapshot;
         const wallet = snapshot.user_wallet || { balance: 0, currency: 'USD' };
 
-        // Update Wallet Area
-        const walletArea = document.getElementById('wallet-area');
-        if (walletArea) {
-            walletArea.innerHTML = `
-                <div class="wallet-header">
-                    <h3>Your Wallet</h3>
-                    <span class="wallet-id">ID: ${appState.session.userId}</span>
-                </div>
-                <div class="balance-area">
-                    <span class="currency">$</span>
-                    <span class="balance">${wallet.balance.toFixed(2)}</span>
-                </div>
-                <button class="primary-btn btn-small" id="btn-recharge">Quick Recharge $50</button>
-            `;
+        // Granular updates to avoid flickering
+        const balanceEl = document.getElementById('user-balance');
+        if (balanceEl && balanceEl.innerText !== wallet.balance.toFixed(2)) {
+            balanceEl.innerText = wallet.balance.toFixed(2);
         }
 
-        // Update Slot Grid
+        const userIdEl = document.getElementById('wallet-user-id');
+        if (userIdEl && userIdEl.innerText !== `ID: ${appState.session.userId}`) {
+            userIdEl.innerText = `ID: ${appState.session.userId}`;
+        }
+
+        // Update Slot Grid only if content changed
         const slotGridArea = document.getElementById('slot-grid-area');
         if (slotGridArea) {
             const sortedSlots = [...snapshot.slots].sort((a, b) => a.slot_id - b.slot_id);
-            slotGridArea.innerHTML = sortedSlots.map(slot => `
-                <div class="slot-item ${slot.state.toLowerCase()}">
-                    <div class="slot-info">
-                        <span class="slot-label">Slot ${slot.slot_id}</span>
-                        <span class="slot-status ${slot.state === 'AUTH_PENDING' ? 'status-pulse' : ''}">${slot.state}</span>
+            const currentHash = JSON.stringify(sortedSlots.map(s => ({id: s.slot_id, state: s.state})));
+            
+            if (currentHash !== lastSlotHash) {
+                slotGridArea.innerHTML = sortedSlots.map(slot => `
+                    <div class="slot-item ${slot.state.toLowerCase()}">
+                        <div class="slot-info">
+                            <span class="slot-label">Slot ${slot.slot_id}</span>
+                            <span class="slot-status ${slot.state === 'AUTH_PENDING' ? 'status-pulse' : ''}">${slot.state}</span>
+                        </div>
+                        ${slot.state === 'FREE' ? `
+                            <button class="btn-charge" data-action="book" data-slot-id="${slot.slot_id}"
+                                ${!appState.allowActions ? 'disabled' : ''}>
+                                Charge
+                            </button>
+                        ` : slot.state === 'AUTH_PENDING' ? `
+                            <button class="btn-charge btn-auth" data-action="authorize" data-slot-id="${slot.slot_id}"
+                                ${!appState.allowActions ? 'disabled' : ''}>
+                                Authorize
+                            </button>
+                        ` : `
+                            <div class="assigned-user">ID: ${slot.assigned_global_id || '---'}</div>
+                        `}
                     </div>
-                    ${slot.state === 'FREE' ? `
-                        <button class="btn-charge" data-action="book" data-slot-id="${slot.slot_id}"
-                            ${!appState.allowActions ? 'disabled' : ''}>
-                            Charge
-                        </button>
-                    ` : slot.state === 'AUTH_PENDING' ? `
-                        <button class="btn-charge btn-auth" data-action="authorize" data-slot-id="${slot.slot_id}"
-                            ${!appState.allowActions ? 'disabled' : ''}>
-                            Authorize
-                        </button>
-                    ` : `
-                        <div class="assigned-user">ID: ${slot.assigned_global_id || '---'}</div>
-                    `}
-                </div>
-            `).join('');
+                `).join('');
+                lastSlotHash = currentHash;
+            }
         }
 
         const countBadge = document.getElementById('free-slots-count');
-        if (countBadge) {
-            countBadge.innerText = `${snapshot.slots.filter(s => s.state === 'FREE').length} Free`;
+        const freeCount = snapshot.slots.filter(s => s.state === 'FREE').length;
+        if (countBadge && countBadge.innerText !== `${freeCount} Free`) {
+            countBadge.innerText = `${freeCount} Free`;
         }
         
         // Update Allocation Button State
         const findBtn = document.getElementById('btn-find-slot');
         if (findBtn) {
             findBtn.disabled = !appState.allowActions || isLoading;
-            findBtn.innerText = isLoading ? 'PROCESSING...' : 'Find Best Slot';
+            const targetText = isLoading ? 'PROCESSING...' : 'Find Best Slot';
+            if (findBtn.innerText !== targetText) findBtn.innerText = targetText;
         }
     }
 

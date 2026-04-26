@@ -103,8 +103,13 @@ class GlobalState:
         
         self.users_db = [
             {"username": "admin", "password": "admin", "role": "admin"},
-            {"username": "user", "password": "user", "role": "user"}
+            {"username": "user", "password": "user", "role": "user"},
+            {"username": "test3@gmail.com", "password": "123", "role": "user"},
+            {"username": "test4@gmail.com", "password": "123", "role": "user"}
         ]
+        self.wallets = collections.defaultdict(lambda: {"balance": 0.0, "currency": "USD"})
+        # Pre-seed some balance for testing
+        self.wallets["test3@gmail.com"]["balance"] = 100.0
 
 G_STATE = GlobalState()
 
@@ -396,9 +401,12 @@ def get_request_data():
 # --- API SERVER ---
 @api_app.route('/api/status', methods=['GET'])
 def get_status():
+    username = request.args.get('username', 'Anonymous')
     if G_STATE.snapshot_buffer:
         snapshot = copy.deepcopy(G_STATE.snapshot_buffer[-1])
-        # Ensure latest timestamp for UI freshness check
+        # Inject the correct wallet and user ID for this specific session
+        snapshot["user_id"] = username
+        snapshot["user_wallet"] = G_STATE.wallets.get(username, {"balance": 0.0, "currency": "USD"})
         snapshot["timestamp"] = utils.system_now(caller="api_thread")
         return jsonify(snapshot)
     return jsonify({"error": "No snapshots available", "source": "BACKEND"}), 503
@@ -613,6 +621,38 @@ def book_slot_api():
         timeout = data.get('timeout', 600)
         code = G_STATE.auth_engine.generate_booking(assigned_idx, username, timeout=timeout)
         return jsonify({"status": "success", "slot_id": assigned_idx + 1, "auth_code": code})
+    return jsonify({"status": "error", "message": "No slots available"}), 400
+
+@api_app.route('/api/recharge', methods=['POST'])
+def recharge_api():
+    data = get_request_data()
+    username = data.get('username', "Anonymous")
+    amount = float(data.get('amount', 0))
+    
+    if amount <= 0:
+        return jsonify({"status": "error", "message": "Invalid amount"}), 400
+        
+    G_STATE.wallets[username]["balance"] += amount
+    logger.info(f"[WALLET] User {username} recharged ${amount}. New balance: ${G_STATE.wallets[username]['balance']}")
+    
+    # Force a version bump so UI sees the change immediately
+    G_STATE.last_snapshot_version += 1
+    return jsonify({"status": "success", "balance": G_STATE.wallets[username]["balance"]})
+
+@api_app.route('/api/find_slot', methods=['POST'])
+def find_slot_api():
+    data = get_request_data()
+    v_type = data.get('type', 'SUV')
+    urgency = data.get('urgency', 'LOW')
+    
+    logger.info(f"[ALLOCATION] Finding slot for {v_type} with {urgency} urgency")
+    
+    # Simplified logic: find first FREE slot
+    with G_STATE.vision_lock:
+        for i, slot in enumerate(G_STATE.slots):
+            if slot.state == SlotState.FREE:
+                return jsonify({"status": "success", "slot_id": i + 1})
+                
     return jsonify({"status": "error", "message": "No slots available"}), 400
 
 @api_app.route('/api/authorize', methods=['POST'])
@@ -1018,12 +1058,35 @@ def main():
                     for dc in dead_clients:
                         esp32_clients.discard(dc)
 
-        if not USE_FAKE_INPUT:
             # --- OVERLAYS ---
             frame = visualizer.draw_overlays(frame, G_STATE.slots, CONFIG.get('queue_zones', []), {})
             frame = visualizer.draw_detections(frame, detections)
             frame = visualizer.draw_sidebar(frame, G_STATE.queue_manager)
             
+            # --- SNAPSHOT GENERATION ---
+            G_STATE.snapshot_sequence += 1
+            snapshot = {
+                "snapshot_version": G_STATE.last_snapshot_version,
+                "snapshot_sequence": G_STATE.snapshot_sequence,
+                "timestamp": loop_start,
+                "freeze_state": G_STATE.is_forensic_frozen,
+                "user_id": "Anonymous",
+                "slots": [],
+                "queue": [], 
+                "user_wallet": {"balance": 0, "currency": "USD"} # Placeholder, injected by /api/status
+            }
+            
+            for i, slot in enumerate(G_STATE.slots):
+                snapshot["slots"].append({
+                    "slot_id": i,
+                    "state": slot.state.name,
+                    "alignment_score": round(slot.smoothed_alignment_score, 2),
+                    "assigned_global_id": slot.locked_track_id
+                })
+            
+            with G_STATE.snapshot_lock:
+                G_STATE.snapshot_buffer.append(snapshot)
+
             cv2.imshow("Smart EV Charging", frame)
             key = cv2.waitKey(1) & 0xFF
             if key != 255:

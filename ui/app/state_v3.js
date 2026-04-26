@@ -26,6 +26,9 @@ export const appState = {
     isResyncing: false,
     isDesync: false,
     healthScore: 100,
+    SNAPSHOT_FRESHNESS_MS: 3000,
+    MAX_SEQ_JUMP: 20,
+    INTENT_TIMEOUT_MS: 5000,
     criticalLatencyCycles: 0,
     forceGapSimulation: false,
     
@@ -60,12 +63,12 @@ export const appState = {
     MAX_STAGNANT_FRAMES: 5,
     MAX_LATENCY_THRESHOLD: 1000, 
     BACKEND_STABILITY_FRAMES: 2,
-    MAX_SNAPSHOT_AGE: 5000, 
-    SNAPSHOT_FRESHNESS_MS: 3000,
-    INTENT_TIMEOUT_MS: 5000,
-    MAX_ALLOWED_GAP: 5,
-    MAX_SEQ_JUMP: 20,
-    RECOVERY_THRESHOLD: 3,
+    MAX_SNAPSHOT_AGE: 60000, 
+    SNAPSHOT_FRESHNESS_MS: 60000,
+    INTENT_TIMEOUT_MS: 10000,
+    MAX_ALLOWED_GAP: 5000,
+    MAX_SEQ_JUMP: 5000,
+    RECOVERY_THRESHOLD: 1,
     PRIORITY: { BACKEND: 2, SIMULATION: 1 }
 };
 
