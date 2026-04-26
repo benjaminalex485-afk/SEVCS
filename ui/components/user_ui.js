@@ -194,26 +194,15 @@ export function initUserUI() {
                 `;
                 break;
             case "PAYMENT":
+                const walletBalance = Number(appState.snapshot?.user_wallet?.balance ?? 0);
+                const payable = Number(chargeFlowState.data.quote?.total_price ?? 0);
+                const hasFunds = walletBalance >= payable;
                 resultArea.innerHTML = `
-                    <div class="mono">Payment Portal</div>
-                    <div class="form-group">
-                        <label>Card Number</label>
-                        <input type="text" id="mock-card-number" placeholder="4242 4242 4242 4242" maxlength="19" />
-                    </div>
-                    <div class="form-group">
-                        <label>Card Holder</label>
-                        <input type="text" id="mock-card-holder" placeholder="John Doe" />
-                    </div>
-                    <div class="form-group">
-                        <label>Expiry</label>
-                        <input type="text" id="mock-card-expiry" placeholder="MM/YY" maxlength="5" />
-                    </div>
-                    <div class="form-group">
-                        <label>CVV</label>
-                        <input type="password" id="mock-card-cvv" placeholder="123" maxlength="4" />
-                    </div>
-                    <p class="mono">Amount: $${chargeFlowState.data.quote.total_price.toFixed(2)}</p>
-                    <button class="primary-btn btn-small" data-flow-action="pay-confirm">Pay Now</button>
+                    <div class="mono">Pay with Wallet</div>
+                    <p class="mono">Amount: $${payable.toFixed(2)}</p>
+                    <p class="mono">Wallet Balance: $${walletBalance.toFixed(2)}</p>
+                    ${hasFunds ? '' : `<p class="mono" style="color: var(--accent-red)">Insufficient balance. Please recharge your wallet first.</p>`}
+                    <button class="primary-btn btn-small" data-flow-action="pay-confirm" ${hasFunds ? '' : 'disabled'}>Pay from Wallet</button>
                     <button class="primary-btn btn-small" data-flow-action="pay-cancel" style="margin-top:8px;">Back to Quote</button>
                 `;
                 break;
@@ -296,10 +285,10 @@ export function initUserUI() {
         const payment = await processMockPayment({
             quote_id: chargeFlowState.data.quote.quote_id,
             username: appState.session.userId,
-            method: 'MOCK_CARD'
+            method: 'WALLET'
         });
         chargeFlowState.data.payment = payment;
-        console.log('[ChargeFlow] API_SUCCESS: payment_mock');
+        console.log('[ChargeFlow] API_SUCCESS: payment_wallet');
     }
 
     async function finalizeBooking() {
@@ -541,17 +530,8 @@ export function initUserUI() {
                 return;
             }
             if (flowAction === 'pay-confirm') {
-                const cardNumber = document.getElementById('mock-card-number')?.value?.trim() || '';
-                const cardHolder = document.getElementById('mock-card-holder')?.value?.trim() || '';
-                const cardExpiry = document.getElementById('mock-card-expiry')?.value?.trim() || '';
-                const cardCvv = document.getElementById('mock-card-cvv')?.value?.trim() || '';
-                const cardError = validateCardInputs(cardNumber, cardHolder, cardExpiry, cardCvv);
-                if (cardError) {
-                    setFlowError(cardError);
-                    return;
-                }
                 const resultArea = document.getElementById('user-result-area');
-                if (resultArea) resultArea.innerHTML = `<p class="mono">Processing payment...</p>`;
+                if (resultArea) resultArea.innerHTML = `<p class="mono">Processing wallet payment...</p>`;
                 try {
                     await handlePayment();
                     await finalizeBooking();

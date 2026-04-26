@@ -8,6 +8,7 @@ class_ids:
 - 7
 conf_threshold: 0.15
 debug_locks: false
+detect_every_n_frames: 2
 distance_normalization: 1500.0
 model_path: models/yolov8n-seg.pt
 queue_zones:

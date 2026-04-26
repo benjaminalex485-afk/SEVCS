@@ -963,7 +963,7 @@ def payment_mock_api():
     data = get_request_data()
     quote_id = data.get("quote_id")
     username = data.get("username", "Anonymous")
-    method = data.get("method", "MOCK_CARD")
+    method = data.get("method", "WALLET")
     if not quote_id:
         return jsonify({"status": "error", "message": "quote_id is required"}), 400
     with G_STATE.vision_lock:
@@ -976,10 +976,21 @@ def payment_mock_api():
             return jsonify({"status": "error", "message": "Quote expired"}), 400
         if quote.get("consumed", False):
             return jsonify({"status": "error", "message": "Quote already used"}), 409
+        if quote.get("paid", False):
+            return jsonify({"status": "error", "message": "Quote already paid"}), 409
         reservation_key = _reservation_key(quote.get("slot_id"), quote.get("date"), quote.get("time_window"))
         existing_res = G_STATE.slot_time_reservations.get(reservation_key)
         if existing_res and existing_res.get("quote_id") != quote_id:
             return jsonify({"status": "error", "message": "Slot already booked for selected date/time"}), 409
+        total_price = float(quote.get("total_price", 0.0))
+        wallet = G_STATE.wallets[username]
+        balance = float(wallet.get("balance", 0.0))
+        if balance < total_price:
+            return jsonify({
+                "status": "error",
+                "message": f"Insufficient wallet balance. Required ${total_price:.2f}, available ${balance:.2f}"
+            }), 400
+        wallet["balance"] = round(balance - total_price, 2)
         payment_id = f"pay_{int(utils.system_now(caller='api_thread')*1000)}"
         quote["paid"] = True
     receipt = {
@@ -987,10 +998,13 @@ def payment_mock_api():
         "payment_id": payment_id,
         "quote_id": quote_id,
         "method": method,
+        "amount": total_price,
+        "wallet_balance": wallet["balance"],
         "processed_at": utils.system_now(caller="api_thread")
     }
     G_STATE.payment_receipts[payment_id] = receipt
-    logger.info(f"[CHARGE_FLOW] payment_mock_result payment_id={payment_id} quote_id={quote_id}")
+    G_STATE.last_snapshot_version += 1
+    logger.info(f"[CHARGE_FLOW] payment_wallet_result payment_id={payment_id} quote_id={quote_id} user={username} amount={total_price} balance={wallet['balance']}")
     return jsonify(receipt)
 
 @api_app.route('/api/admin_add_slot', methods=['POST'])
@@ -1312,11 +1326,18 @@ def main():
     overflow_start_frame_time = 0.0
     track_ages = {}
     STRICT_MODE = CONFIG.get('strict_mode', False)
+    detect_every_n = max(1, int(CONFIG.get('detect_every_n_frames', 2)))
+    last_tracker_detections = sv.Detections.empty()
+    last_detect_duration = 0.0
+    ui_fps_ema = 0.0
     while True:
         frame_id += 1
         loop_start = utils.system_now(caller="main_loop")
         dt = loop_start - last_loop_time
         last_loop_time = loop_start
+        if dt > 0:
+            inst_fps = 1.0 / max(dt, 1e-6)
+            ui_fps_ema = inst_fps if ui_fps_ema == 0.0 else (0.9 * ui_fps_ema + 0.1 * inst_fps)
         
         # 1. Dual-Condition Watchdog (Stagnation OR Compute Hang)
         is_replay = CONFIG.get("replay_mode", False)
@@ -1409,19 +1430,28 @@ def main():
                 with G_STATE.vision_lock:
                     G_STATE.camera_online = True
                 t_grab = time.time() - t0
-                
-                # 2. Detect (AI)
-                try:
-                    t1 = time.time()
-                    detections = tracker.update_with_detections(detector.detect(frame, conf=0.15))
-                    t_detect = time.time() - t1
-                except Exception as e:
-                    logger.error(f"[VISION] Detection error: {e}")
-                    detections = sv.Detections.empty()
-                    t_detect = 0
+
+                # 2. Detect (AI) with configurable frame skipping for responsiveness.
+                do_detect = (frame_id % detect_every_n == 0) or len(last_tracker_detections) == 0
+                if do_detect:
+                    try:
+                        t1 = time.time()
+                        detections = tracker.update_with_detections(detector.detect(frame, conf=0.15))
+                        t_detect = time.time() - t1
+                        last_detect_duration = t_detect
+                        last_tracker_detections = detections
+                    except Exception as e:
+                        logger.error(f"[VISION] Detection error: {e}")
+                        detections = sv.Detections.empty()
+                        t_detect = 0
+                        last_detect_duration = t_detect
+                        last_tracker_detections = detections
+                else:
+                    detections = last_tracker_detections
+                    t_detect = last_detect_duration
                     
                 if frame_id % 30 == 0:
-                    logger.info(f"[PERF] Frame {frame_id}: Grab {t_grab:.3f}s | Detect {t_detect:.3f}s")
+                    logger.info(f"[PERF] Frame {frame_id}: Grab {t_grab:.3f}s | Detect {t_detect:.3f}s | FPS~{ui_fps_ema:.1f} | DetectEvery={detect_every_n}")
         
         # --- ATOMIC FRAME PROCESSING ---
         with G_STATE.vision_lock:
@@ -1661,6 +1691,14 @@ def main():
         frame = visualizer.draw_overlays(frame, G_STATE.slots, CONFIG.get('queue_zones', []), {})
         frame = visualizer.draw_detections(frame, detections)
         frame = visualizer.draw_sidebar(frame, G_STATE.queue_manager)
+        perf_lines = [
+            f"FPS: {ui_fps_ema:.1f}",
+            f"Detect: {last_detect_duration*1000:.0f} ms",
+            f"Detect Every: {detect_every_n} frame(s)"
+        ]
+        cv2.rectangle(frame, (10, 10), (300, 86), (0, 0, 0), -1)
+        for i, text in enumerate(perf_lines):
+            cv2.putText(frame, text, (18, 32 + (i * 18)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (80, 255, 120), 1, cv2.LINE_AA)
 
         if cap is not None:
             cv2.imshow("Smart EV Charging", frame)
