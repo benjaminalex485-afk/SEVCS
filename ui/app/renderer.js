@@ -110,34 +110,23 @@ export function startRenderer() {
  * Centralized UI State Priority Engine
  */
 function computeUIState() {
-    // 0. Hard Guards
-    if (appState.isResyncing) return 'RESYNC_REQUIRED';
+    const displayState = (() => {
+        if (appState.isResyncing) return 'RESYNC_REQUIRED';
+        if (!appState.snapshot) {
+            const sinceStart = performance.now() - appState.appStartMono;
+            if (sinceStart > 5000) return 'DISCONNECTED';
+            return 'INITIALIZING';
+        }
+        const delta = performance.now() - appState.lastSnapshotMono;
+        if (appState.snapshot?.freeze_state) return 'FROZEN';
+        if (delta > appState.SNAPSHOT_FRESHNESS_MS + 1000) return 'DISCONNECTED';
+        if (appState.isDesync) return 'DESYNCHRONIZED';
+        if (delta > appState.SNAPSHOT_FRESHNESS_MS) return 'DEGRADED';
+        return 'SYNCHRONIZED';
+    })();
 
-    if (!appState.snapshot) {
-        const sinceStart = performance.now() - appState.appStartMono;
-        if (sinceStart > 5000) return 'DISCONNECTED';
-        return 'INITIALIZING';
-    }
-
-    const delta = performance.now() - appState.lastSnapshotMono;
-
-    // 1. Critical: Freeze
-    if (appState.snapshot?.freeze_state) return 'FROZEN';
-
-    // 2. Link Failure (Hard Threshold)
-    if (delta > appState.SNAPSHOT_FRESHNESS_MS + 1000) {
-        return 'DISCONNECTED';
-    }
-
-    // 3. Warning: Sequence Integrity
-    if (appState.isDesync) return 'DESYNCHRONIZED';
-
-    // 4. Link Health (Soft Threshold)
-    if (delta > appState.SNAPSHOT_FRESHNESS_MS) {
-        return 'DEGRADED';
-    }
-
-    return 'SYNCHRONIZED';
+    appState.allowActions = (displayState === 'SYNCHRONIZED' || displayState === 'DEGRADED');
+    return displayState;
 }
 
 /**

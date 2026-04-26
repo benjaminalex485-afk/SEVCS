@@ -1,3 +1,5 @@
+auth_timeout: 60.0
+booking_timeout: 600.0
 camera_index: 1
 class_ids:
 - 2
@@ -5,21 +7,20 @@ class_ids:
 - 5
 - 7
 conf_threshold: 0.15
-model_path: models/yolov8n-seg.pt
-
-# Hardening & Policy
-strict_mode: False
-debug_locks: False
+debug_locks: false
 distance_normalization: 1500.0
-auth_timeout: 60.0
-booking_timeout: 600.0
+model_path: models/yolov8n-seg.pt
+queue_zones:
+- - - 0
+    - 400
+  - - 1280
+    - 400
+  - - 1280
+    - 720
+  - - 0
+    - 720
 rate_limit_attempts: 5
 rate_limit_window: 60.0
-
-# Vision Zones
-queue_zones:
-  - [[0, 400], [1280, 400], [1280, 720], [0, 720]]
-
 slots:
 - - - 351
     - 99
@@ -53,3 +54,12 @@ slots:
     - 241
   - - 212
     - 285
+- - - 438
+    - 255
+  - - 441
+    - 333
+  - - 533
+    - 324
+  - - 535
+    - 256
+strict_mode: false

@@ -144,49 +144,83 @@ def release_lock(name, lock):
     lock.release()
 
 # --- INTERACTIVE CALIBRATION ---
-INTERACTIVE_POINTS = []
-INTERACTIVE_MODE = None # 'SLOT', 'QUEUE', None
 
-def on_mouse(event, x, y, flags, param):
-    global INTERACTIVE_POINTS
-    if event == cv2.EVENT_LBUTTONDOWN:
-        INTERACTIVE_POINTS.append([x, y])
-        logger.info(f"[CALIB] Point added: ({x}, {y})")
 
-def calibrate_zones(frame, mode='SLOT'):
-    """Dedicated window for calibration as per user request."""
-    global INTERACTIVE_POINTS
-    INTERACTIVE_POINTS = []
-    window_name = f"CALIBRATION - {mode}"
+def select_zones(cap, title="Selection Mode", current_zones=None, mode="slot"):
+    """
+    Opens an interactive window to define polygons.
+    mode: "slot" (Green) or "queue" (Blue)
+    Matches earlier implementation in reference/src/utils.py
+    """
+    if current_zones is None:
+        current_zones = []
+    
+    # Freeze the frame for calibration
+    ret, frame = cap.read()
+    if not ret:
+        logger.error("[CALIB] Could not read from camera for calibration.")
+        return current_zones
+    
+    temp_zones = copy.deepcopy(current_zones)
+    current_polygon = []
+    
+    window_name = title
     cv2.namedWindow(window_name)
-    cv2.setMouseCallback(window_name, on_mouse)
-    
-    logger.info(f"[CALIB] Starting {mode} calibration. Click points, then press 'ENTER' to save or 'ESC' to cancel.")
-    
+
+    def mouse_callback(event, x, y, flags, param):
+        nonlocal current_polygon
+        if event == cv2.EVENT_LBUTTONDOWN:
+            current_polygon.append([x, y])
+            logger.info(f"[CALIB] Point added: ({x}, {y})")
+        elif event == cv2.EVENT_RBUTTONDOWN:
+            if len(current_polygon) > 2:
+                temp_zones.append(current_polygon.copy())
+                current_polygon = []
+                logger.info(f"[CALIB] Polygon completed. Total zones: {len(temp_zones)}")
+
+    cv2.setMouseCallback(window_name, mouse_callback)
+
+    color_map = {"slot": (0, 255, 0), "queue": (255, 0, 0)} # Green, Blue
+    draw_color = color_map.get(mode.lower(), (0, 255, 0))
+
     while True:
-        display = frame.copy()
-        # Draw instructions
-        cv2.putText(display, f"MODE: {mode} | Points: {len(INTERACTIVE_POINTS)}", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        cv2.putText(display, "Click points, then ENTER to Save, ESC to Cancel", (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        display_frame = frame.copy()
         
-        for pt in INTERACTIVE_POINTS:
-            cv2.circle(display, tuple(pt), 5, (0, 0, 255), -1)
-        if len(INTERACTIVE_POINTS) >= 2:
-            cv2.polylines(display, [np.array(INTERACTIVE_POINTS, np.int32)], mode == 'SLOT' and len(INTERACTIVE_POINTS) >= 4, (0, 255, 255), 2)
-            
-        cv2.imshow(window_name, display)
-        key = cv2.waitKey(30) & 0xFF
-        if key == 13: # ENTER
-            if len(INTERACTIVE_POINTS) >= 3:
-                break
-            else:
-                logger.warning("[CALIB] Need at least 3 points to save.")
-        elif key == 27: # ESC
-            INTERACTIVE_POINTS = []
+        # Draw existing zones
+        for zone in temp_zones:
+            pts = np.array(zone, np.int32).reshape((-1, 1, 2))
+            cv2.polylines(display_frame, [pts], isClosed=True, color=draw_color, thickness=2)
+
+        # Draw current polygon in progress
+        if len(current_polygon) > 0:
+            pts = np.array(current_polygon, np.int32).reshape((-1, 1, 2))
+            cv2.polylines(display_frame, [pts], isClosed=False, color=(0, 0, 255), thickness=1)
+            for pt in current_polygon:
+                cv2.circle(display_frame, tuple(pt), 3, (0, 0, 255), -1)
+
+        # Instructions overlay
+        cv2.putText(display_frame, f"MODE: {mode.upper()}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, draw_color, 2)
+        cv2.putText(display_frame, "L-Click: Add Point | R-Click: Close Polygon", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        cv2.putText(display_frame, "'z': Undo | 'c': Clear | 'q'/ESC: Save & Quit", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+        cv2.imshow(window_name, display_frame)
+        key = cv2.waitKey(1) & 0xFF
+
+        if key == ord('q') or key == 27: # ESC
+            if len(current_polygon) > 2:
+                 temp_zones.append(current_polygon)
             break
-            
+        elif key == ord('z'):
+            if current_polygon:
+                current_polygon.pop()
+            elif temp_zones:
+                temp_zones.pop()
+        elif key == ord('c'):
+            temp_zones = []
+            current_polygon = []
+
     cv2.destroyWindow(window_name)
-    return INTERACTIVE_POINTS
+    return temp_zones
 
 def trigger_freeze(reason):
     """Idempotent freeze trigger with priority and diagnostic logging."""
@@ -679,7 +713,7 @@ def main():
                 return
         logger.info("[CAMERA] Camera opened successfully.")
         cv2.namedWindow("Smart EV Charging")
-        cv2.setMouseCallback("Smart EV Charging", on_mouse)
+
     else:
         cap = None
     
@@ -990,13 +1024,6 @@ def main():
             frame = visualizer.draw_detections(frame, detections)
             frame = visualizer.draw_sidebar(frame, G_STATE.queue_manager)
             
-            # Draw Calibration Preview
-            global INTERACTIVE_POINTS, INTERACTIVE_MODE
-            for pt in INTERACTIVE_POINTS:
-                cv2.circle(frame, tuple(pt), 4, (0, 0, 255), -1)
-            if len(INTERACTIVE_POINTS) >= 2:
-                cv2.polylines(frame, [np.array(INTERACTIVE_POINTS)], False, (0, 255, 255), 2)
-
             cv2.imshow("Smart EV Charging", frame)
             key = cv2.waitKey(1) & 0xFF
             if key != 255:
@@ -1016,25 +1043,50 @@ def main():
                 logger.info("[SYSTEM] Quitting...")
                 break
             elif key == ord('s'):
-                pts = calibrate_zones(frame, mode='SLOT')
-                if len(pts) >= 3:
-                    new_slot = Slot(len(G_STATE.slots), np.array(pts, np.int32))
+                logger.info("[CALIB] Entering Slot Selection Mode...")
+                new_slots = select_zones(cap, "Select Charging Slots", current_zones=CONFIG.get('slots', []), mode="slot")
+                if new_slots:
+                    CONFIG['slots'] = new_slots
+                    # Immediate Persistence
+                    try:
+                        with open("config.yaml", 'w') as f:
+                            yaml.dump(CONFIG, f)
+                        logger.info(f"[CONFIG] Saved {len(new_slots)} slots.")
+                    except Exception as e:
+                        logger.error(f"[CONFIG] Auto-save failed: {e}")
+                    
+                    # Live State Update
                     with G_STATE.vision_lock:
-                        G_STATE.slots.append(new_slot)
-                    logger.info(f"[CALIB] Slot {len(G_STATE.slots)} added and synced.")
+                        G_STATE.slots = [Slot(i, np.array(poly, np.int32)) for i, poly in enumerate(new_slots)]
+                    logger.info(f"[CALIB] Live state synchronized with {len(new_slots)} slots.")
+
             elif key == ord('z'):
-                pts = calibrate_zones(frame, mode='QUEUE')
-                if len(pts) >= 3:
-                    q_zones = CONFIG.get('queue_zones', [])
-                    q_zones.append(pts)
-                    CONFIG['queue_zones'] = q_zones
-                    logger.info(f"[CALIB] Queue zone added.")
+                logger.info("[CALIB] Entering Queue Zone Selection Mode...")
+                new_zones = select_zones(cap, "Select Queue Zones", current_zones=CONFIG.get('queue_zones', []), mode="queue")
+                if new_zones:
+                    CONFIG['queue_zones'] = new_zones
+                    try:
+                        with open("config.yaml", 'w') as f:
+                            yaml.dump(CONFIG, f)
+                        logger.info(f"[CONFIG] Saved {len(new_zones)} queue zones.")
+                    except Exception as e:
+                        logger.error(f"[CONFIG] Auto-save failed: {e}")
+
             elif key == ord('c'):
+                logger.info("[CALIB] Clearing all zones as per earlier reference behavior...")
+                CONFIG['slots'] = []
+                CONFIG['queue_zones'] = []
+                try:
+                    with open("config.yaml", 'w') as f:
+                        yaml.dump(CONFIG, f)
+                    logger.info("[CONFIG] Config cleared.")
+                except Exception as e:
+                    logger.error(f"[CONFIG] Clear-save failed: {e}")
+                
                 with G_STATE.vision_lock:
                     G_STATE.slots = []
-                    CONFIG['slots'] = []
-                    CONFIG['queue_zones'] = []
-                logger.info("[CALIB] All zones cleared.")
+                logger.info("[CALIB] Live state cleared.")
+
         else:
             # Already slept at the top of the loop in FAKE mode
             pass
