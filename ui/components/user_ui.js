@@ -1,5 +1,5 @@
-import { executeAction, startPolling } from '../app/api_v3.js';
-import { appState, resync } from '../app/state_v3.js';
+import { executeAction, getAvailability, getPricingQuote, processMockPayment } from '../app/api_v3.js';
+import { appState } from '../app/state_v3.js';
 import { events } from '../app/events.js';
 
 export function initUserUI() {
@@ -7,11 +7,270 @@ export function initUserUI() {
     let isLoading = false;
     let lastSlotHash = "";
 
-    // 1. Initial Static Render (Called once)
+    const initialFlowData = () => ({
+        slot_id: null,
+        charger_type: null,
+        date: null,
+        time_window: null,
+        quote: null,
+        payment: null,
+        auth_code: null,
+        available_slots: []
+    });
+
+    const chargeFlowState = {
+        step: "IDLE",
+        previousStep: "IDLE",
+        data: initialFlowData(),
+        error: null
+    };
+
+    function resetFlow() {
+        chargeFlowState.step = "IDLE";
+        chargeFlowState.previousStep = "IDLE";
+        chargeFlowState.data = initialFlowData();
+        chargeFlowState.error = null;
+    }
+
+    function setFlowError(message) {
+        const sourceStep = chargeFlowState.step;
+        chargeFlowState.error = message;
+        chargeFlowState.step = "ERROR";
+        console.error(`[ChargeFlow] ERROR: ${message}`);
+        console.log(`[ChargeFlow] STEP_CHANGE: ${sourceStep} -> ERROR`);
+        renderChargeFlow();
+    }
+
+    function renderChargeFlow() {
+        const resultArea = document.getElementById('user-result-area');
+        if (!resultArea) return;
+        switch (chargeFlowState.step) {
+            case "IDLE":
+                resultArea.innerHTML = "";
+                break;
+            case "INIT":
+                resultArea.innerHTML = `<p class="mono">Checking availability...</p>`;
+                break;
+            case "SELECT_SLOT":
+                resultArea.innerHTML = `
+                    <div class="mono">Select Slot</div>
+                    ${chargeFlowState.data.available_slots.map(s => `
+                        <button class="primary-btn btn-small" data-flow-action="slot" data-slot-id="${s.slot_id}" data-charger-type="${s.charger_type}">
+                            Slot ${s.slot_id} (${s.charger_type})
+                        </button>
+                    `).join('')}
+                `;
+                break;
+            case "SELECT_TIME": {
+                const savedDate = chargeFlowState.data.date || "";
+                const savedWindow = chargeFlowState.data.time_window || "00:00-06:00";
+                resultArea.innerHTML = `
+                    <div class="mono">Selected Slot ${chargeFlowState.data.slot_id} (${chargeFlowState.data.charger_type})</div>
+                    <div class="form-group">
+                        <label>Date</label>
+                        <input type="date" id="charge-date" />
+                    </div>
+                    <div class="form-group">
+                        <label>Time Window</label>
+                        <select id="charge-time-window">
+                            <option value="00:00-06:00">00:00-06:00</option>
+                            <option value="06:00-12:00">06:00-12:00</option>
+                            <option value="12:00-18:00">12:00-18:00</option>
+                            <option value="18:00-24:00">18:00-24:00</option>
+                        </select>
+                    </div>
+                    <button class="primary-btn btn-small" data-flow-action="quote">Get Quote</button>
+                `;
+                const dateEl = document.getElementById("charge-date");
+                if (dateEl && savedDate) dateEl.value = savedDate;
+                const tw = document.getElementById("charge-time-window");
+                if (tw) tw.value = savedWindow;
+                break;
+            }
+            case "QUOTE":
+                resultArea.innerHTML = `
+                    <p class="mono">Quote generated</p>
+                    <p class="mono">Price: $${chargeFlowState.data.quote.total_price.toFixed(2)}</p>
+                    <p class="mono">Multiplier: ${chargeFlowState.data.quote.multiplier}</p>
+                    <p class="mono">Expiry: ${new Date(chargeFlowState.data.quote.expires_at * 1000).toLocaleTimeString()}</p>
+                    <button class="primary-btn btn-small" data-flow-action="pay">Proceed to Payment</button>
+                `;
+                break;
+            case "PAYMENT":
+                resultArea.innerHTML = `
+                    <div class="mono">Payment Portal</div>
+                    <div class="form-group">
+                        <label>Card Number</label>
+                        <input type="text" id="mock-card-number" placeholder="4242 4242 4242 4242" maxlength="19" />
+                    </div>
+                    <div class="form-group">
+                        <label>Card Holder</label>
+                        <input type="text" id="mock-card-holder" placeholder="John Doe" />
+                    </div>
+                    <div class="form-group">
+                        <label>Expiry</label>
+                        <input type="text" id="mock-card-expiry" placeholder="MM/YY" maxlength="5" />
+                    </div>
+                    <div class="form-group">
+                        <label>CVV</label>
+                        <input type="password" id="mock-card-cvv" placeholder="123" maxlength="4" />
+                    </div>
+                    <p class="mono">Amount: $${chargeFlowState.data.quote.total_price.toFixed(2)}</p>
+                    <button class="primary-btn btn-small" data-flow-action="pay-confirm">Pay Now</button>
+                    <button class="primary-btn btn-small" data-flow-action="pay-cancel" style="margin-top:8px;">Back to Quote</button>
+                `;
+                break;
+            case "COMPLETE":
+                resultArea.innerHTML = `
+                    <p class="mono">Booking complete</p>
+                    <p class="mono">Auth Code: ${chargeFlowState.data.auth_code}</p>
+                    <button class="primary-btn btn-small" data-flow-action="close">Done</button>
+                `;
+                break;
+            case "ERROR":
+                resultArea.innerHTML = `
+                    <p class="mono" style="color: var(--accent-red)">Error: ${chargeFlowState.error}</p>
+                    <button class="primary-btn btn-small" data-flow-action="retry">Retry</button>
+                `;
+                break;
+            default:
+                resultArea.innerHTML = `<p class="mono">Unknown flow state</p>`;
+        }
+    }
+
+    async function startChargeFlow(slotId = null, chargerType = null) {
+        resetFlow();
+        if (slotId != null && !Number.isNaN(Number(slotId))) {
+            chargeFlowState.data.slot_id = Number(slotId);
+            chargeFlowState.data.charger_type = chargerType || null;
+        }
+        console.log('[ChargeFlow] STEP_CHANGE: IDLE -> SELECT_SLOT');
+        await transitionTo('SELECT_SLOT');
+    }
+
+    async function handleAvailability() {
+        const payload = await getAvailability(appState.session.userId);
+        chargeFlowState.data.available_slots = payload.slots || [];
+        console.log('[ChargeFlow] API_SUCCESS: availability');
+        if (chargeFlowState.data.available_slots.length === 0) {
+            setFlowError('No slots available right now');
+            return;
+        }
+        if (chargeFlowState.data.slot_id !== null && !Number.isNaN(Number(chargeFlowState.data.slot_id))) {
+            const selected = chargeFlowState.data.available_slots.find(s => Number(s.slot_id) === Number(chargeFlowState.data.slot_id));
+            if (selected) {
+                chargeFlowState.data.charger_type = selected.charger_type;
+                // Must be SELECT_SLOT before SELECT_TIME — transition guard only allows SELECT_SLOT -> SELECT_TIME.
+                chargeFlowState.step = 'SELECT_SLOT';
+                await transitionTo('SELECT_TIME');
+                return;
+            }
+        }
+        chargeFlowState.step = 'SELECT_SLOT';
+        renderChargeFlow();
+    }
+
+    async function handleQuote() {
+        const quote = await getPricingQuote({
+            slot_id: chargeFlowState.data.slot_id,
+            date: chargeFlowState.data.date,
+            time_window: chargeFlowState.data.time_window,
+            username: appState.session.userId
+        });
+        chargeFlowState.data.quote = quote;
+        console.log('[ChargeFlow] API_SUCCESS: pricing_quote');
+        chargeFlowState.step = 'QUOTE';
+        renderChargeFlow();
+    }
+
+    async function handlePayment() {
+        chargeFlowState.step = 'PAYMENT';
+        renderChargeFlow();
+        const payment = await processMockPayment({
+            quote_id: chargeFlowState.data.quote.quote_id,
+            username: appState.session.userId,
+            method: 'MOCK_CARD'
+        });
+        chargeFlowState.data.payment = payment;
+        console.log('[ChargeFlow] API_SUCCESS: payment_mock');
+    }
+
+    async function finalizeBooking() {
+        const res = await executeAction('book', {
+            slot_id: chargeFlowState.data.slot_id,
+            username: appState.session.userId,
+            quote_id: chargeFlowState.data.quote.quote_id,
+            date: chargeFlowState.data.date,
+            time_window: chargeFlowState.data.time_window
+        }, 'charge_flow_book');
+        if (res?.status !== 'success') {
+            throw new Error(res?.message || res?.error || 'Booking failed');
+        }
+        chargeFlowState.data.auth_code = res.auth_code || 'N/A';
+        console.log('[ChargeFlow] API_SUCCESS: book');
+    }
+
+    async function transitionTo(step) {
+        const fromStep = chargeFlowState.step;
+        const validTransitions = {
+            IDLE: ['SELECT_SLOT'],
+            INIT: ['SELECT_SLOT'],
+            SELECT_SLOT: ['SELECT_TIME', 'ERROR'],
+            SELECT_TIME: ['QUOTE', 'ERROR'],
+            QUOTE: ['PAYMENT', 'ERROR'],
+            PAYMENT: ['COMPLETE', 'ERROR'],
+            COMPLETE: [],
+            ERROR: ['SELECT_SLOT', 'SELECT_TIME', 'QUOTE', 'PAYMENT']
+        };
+        const allowed = validTransitions[fromStep] || [];
+        if (!allowed.includes(step)) {
+            console.warn(`[ChargeFlow] invalid transition blocked: ${fromStep} -> ${step}`);
+            return;
+        }
+        if (fromStep !== 'ERROR') {
+            // Starting from IDLE (dashboard) is not a meaningful retry target; treat as slot step.
+            chargeFlowState.previousStep = fromStep === 'IDLE' ? 'SELECT_SLOT' : fromStep;
+        }
+        console.log(`[ChargeFlow] STEP_CHANGE: ${fromStep} -> ${step}`);
+
+        try {
+            if (step === 'SELECT_SLOT') {
+                chargeFlowState.step = 'INIT';
+                renderChargeFlow();
+                await handleAvailability();
+                return;
+            }
+            if (step === 'SELECT_TIME') {
+                const sid = chargeFlowState.data.slot_id;
+                if (sid == null || Number.isNaN(Number(sid))) throw new Error('Please select a slot first');
+                chargeFlowState.step = 'SELECT_TIME';
+                renderChargeFlow();
+                return;
+            }
+            if (step === 'QUOTE') {
+                const sid = chargeFlowState.data.slot_id;
+                if (sid == null || Number.isNaN(Number(sid)) || !chargeFlowState.data.date || !chargeFlowState.data.time_window) {
+                    throw new Error('Please select slot, date and time');
+                }
+                await handleQuote();
+                return;
+            }
+            if (step === 'PAYMENT') {
+                if (!chargeFlowState.data.quote) throw new Error('Quote missing');
+                chargeFlowState.step = 'PAYMENT';
+                renderChargeFlow();
+                return;
+            }
+            chargeFlowState.step = step;
+            renderChargeFlow();
+        } catch (err) {
+            setFlowError(err.message || 'Flow failed');
+        }
+    }
+
     function initialRender() {
         container.innerHTML = `
             <div class="user-dashboard-grid">
-                <!-- Wallet Section -->
                 <div class="card wallet-card glass" id="wallet-area">
                     <div class="wallet-header">
                         <h3>Your Wallet</h3>
@@ -23,19 +282,13 @@ export function initUserUI() {
                     </div>
                     <button class="primary-btn btn-small" id="btn-recharge">Quick Recharge $50</button>
                 </div>
-
-                <!-- Slot Overview -->
                 <div class="card slots-card glass">
                     <div class="card-header">
                         <h3>Available Slots</h3>
                         <span class="count-badge" id="free-slots-count">0 Free</span>
                     </div>
-                    <div class="slot-grid" id="slot-grid-area">
-                        <!-- Dynamic Slots -->
-                    </div>
+                    <div class="slot-grid" id="slot-grid-area"></div>
                 </div>
-
-                <!-- Allocation Controls -->
                 <div class="card actions-card glass">
                     <h3>Smart Allocation</h3>
                     <div class="form-group">
@@ -53,131 +306,137 @@ export function initUserUI() {
                             <option value="HIGH">High</option>
                         </select>
                     </div>
-                    <button class="primary-btn" id="btn-find-slot">
-                        Find Best Slot
-                    </button>
-                    
+                    <button class="primary-btn" id="btn-find-slot">Find Best Slot</button>
                     <div id="user-result-area"></div>
+                    <div class="booking-table-wrap">
+                        <h4 class="mono" style="margin: 10px 0 6px;">Booked Sessions</h4>
+                        <div id="user-bookings-table"></div>
+                    </div>
                 </div>
             </div>
         `;
 
-        // Event Delegation (Attach ONCE to the container)
         container.addEventListener('click', async (e) => {
-            const btn = e.target.closest('.btn-charge, #btn-recharge, #btn-find-slot');
+            const btn = e.target.closest('.btn-charge, #btn-recharge, #btn-find-slot, [data-flow-action]');
             if (!btn) return;
-            
-            console.log('[USER UI] Click detected on:', btn.id || btn.className, 'Action:', btn.dataset.action, 'Slot:', btn.dataset.slotId);
-            console.log('[USER UI] Current appState.allowActions:', appState.allowActions);
-            
-            // Reduced Strictness: Only warn, don't block
-            if (!appState.allowActions && !btn.id?.includes('recharge')) {
-                console.warn('[USER UI] System not fully synchronized, proceeding anyway.');
+            const rawSlotId = btn.dataset.slotId;
+            const slotId = rawSlotId === undefined || rawSlotId === '' ? NaN : Number(rawSlotId);
+            const action = btn.dataset.action;
+            const flowAction = btn.dataset.flowAction;
+
+            if (btn.id === 'btn-recharge') {
+                const res = await executeAction('recharge', { amount: 50, username: appState.session.userId }, 'recharge');
+                if (res?.status === 'success') alert('Recharge successful');
+                return;
             }
 
-            const slotId = parseInt(btn.dataset.slotId);
-            const action = btn.dataset.action;
-            
-            if (btn.id === 'btn-recharge') {
-                console.log('[USER UI] Triggering Recharge...');
+            if (flowAction === 'slot') {
+                chargeFlowState.data.slot_id = Number(btn.dataset.slotId);
+                chargeFlowState.data.charger_type = btn.dataset.chargerType || 'STANDARD';
+                await transitionTo('SELECT_TIME');
+                return;
+            }
+            if (flowAction === 'quote') {
+                chargeFlowState.data.date = document.getElementById('charge-date')?.value || null;
+                chargeFlowState.data.time_window = document.getElementById('charge-time-window')?.value || null;
+                await transitionTo('QUOTE');
+                return;
+            }
+            if (flowAction === 'pay') {
+                await transitionTo('PAYMENT');
+                return;
+            }
+            if (flowAction === 'pay-cancel') {
+                chargeFlowState.step = 'QUOTE';
+                renderChargeFlow();
+                return;
+            }
+            if (flowAction === 'pay-confirm') {
+                const cardNumber = document.getElementById('mock-card-number')?.value?.trim() || '';
+                const cardHolder = document.getElementById('mock-card-holder')?.value?.trim() || '';
+                const cardExpiry = document.getElementById('mock-card-expiry')?.value?.trim() || '';
+                const cardCvv = document.getElementById('mock-card-cvv')?.value?.trim() || '';
+                const digitsOnlyCard = cardNumber.replace(/\D/g, '');
+                const expiryOk = /^(0[1-9]|1[0-2])\/\d{2}$/.test(cardExpiry);
+                const cvvOk = /^\d{3,4}$/.test(cardCvv);
+                if (!cardHolder || digitsOnlyCard.length < 12 || digitsOnlyCard.length > 19 || !expiryOk || !cvvOk) {
+                    setFlowError('Please fill valid card details');
+                    return;
+                }
+                const resultArea = document.getElementById('user-result-area');
+                if (resultArea) resultArea.innerHTML = `<p class="mono">Processing payment...</p>`;
                 try {
-                    const res = await executeAction('recharge', { amount: 50, username: appState.session.userId }, 'recharge');
-                    console.log('[USER UI] Recharge Result:', res);
-                    alert('Recharge Requested! Your balance should update shortly.');
+                    await handlePayment();
+                    await finalizeBooking();
+                    chargeFlowState.step = 'COMPLETE';
+                    renderChargeFlow();
                 } catch (err) {
-                    console.error('[USER UI] Recharge Error:', err);
-                    alert(`Recharge Error: ${err.message}`);
+                    setFlowError(err.message || 'Payment or booking failed');
                 }
                 return;
             }
-            
+            if (flowAction === 'retry') {
+                await transitionTo(chargeFlowState.previousStep || 'SELECT_SLOT');
+                return;
+            }
+            if (flowAction === 'close') {
+                resetFlow();
+                renderChargeFlow();
+                return;
+            }
+
             if (action === 'book') {
-                isLoading = true;
-                update(appState);
-                try {
-                    const res = await executeAction('book', { slot_id: slotId, username: appState.session.userId });
-                    console.log('[USER UI] Book Response:', res);
-                    if (res?.status === 'success') {
-                        alert(`Slot ${slotId} Booked! Code: ${res.auth_code}`);
-                    } else {
-                        alert(`Booking Failed: ${res?.error || 'Unknown Error'}`);
-                    }
-                } catch (err) {
-                    alert(`Network Error: ${err.message}`);
+                if (Number.isNaN(slotId)) {
+                    console.warn('[ChargeFlow] Charge clicked without valid slot id');
+                    return;
                 }
-                isLoading = false;
-                update(appState);
-            } else if (action === 'authorize') {
+                await startChargeFlow(slotId);
+                return;
+            }
+            if (action === 'authorize') {
                 const code = prompt(`Enter Authorization Code for Slot ${slotId}:`);
                 if (code) {
-                    isLoading = true;
-                    update(appState);
-                    try {
-                        const res = await executeAction('authorize', { 
-                            slot_id: slotId, 
-                            code: code,
-                            username: appState.session.userId 
-                        });
-                        console.log('[USER UI] Authorize Response:', res);
-                        if (res?.status === 'success') {
-                            alert('Authorized Successfully!');
-                        } else {
-                            alert(`Authorization Failed: ${res?.error || res?.code || 'Invalid Code'}`);
-                        }
-                    } catch (err) {
-                        alert(`Error: ${err.message}`);
-                    }
-                    isLoading = false;
-                    update(appState);
+                    await executeAction('authorize', { slot_id: slotId, code: code, username: appState.session.userId });
                 }
-            } else if (btn.id === 'btn-find-slot') {
+                return;
+            }
+            if (btn.id === 'btn-find-slot') {
                 isLoading = true;
-                update(appState);
+                update();
                 try {
-                    const payload = {
+                    await executeAction('find_slot', {
                         type: document.getElementById('user-vehicle').value,
                         urgency: document.getElementById('user-urgency').value
-                    };
-                    await executeAction('find_slot', payload, 'find_slot');
-                } catch (err) {
-                    alert(`Error: ${err.message}`);
+                    }, 'find_slot');
+                } finally {
+                    isLoading = false;
+                    update();
                 }
-                isLoading = false;
-                update(appState);
+                return;
             }
         });
     }
 
-    // 2. Dynamic Update (Called every poll)
-    function update(state = {}) {
+    function update() {
         const isUser = appState.uiMode === 'USER' && appState.authStatus !== 'GUEST';
         if (!isUser) {
             container.classList.add('hidden');
             return;
         }
         container.classList.remove('hidden');
-
         if (!appState.snapshot) return;
         const snapshot = appState.snapshot;
         const wallet = snapshot.user_wallet || { balance: 0, currency: 'USD' };
 
-        // Granular updates to avoid flickering
         const balanceEl = document.getElementById('user-balance');
-        if (balanceEl && balanceEl.innerText !== wallet.balance.toFixed(2)) {
-            balanceEl.innerText = wallet.balance.toFixed(2);
-        }
-
+        if (balanceEl) balanceEl.innerText = wallet.balance.toFixed(2);
         const userIdEl = document.getElementById('wallet-user-id');
-        if (userIdEl && userIdEl.innerText !== `ID: ${appState.session.userId}`) {
-            userIdEl.innerText = `ID: ${appState.session.userId}`;
-        }
+        if (userIdEl) userIdEl.innerText = `ID: ${appState.session.userId}`;
 
-        // Update Slot Grid only if content changed
         const slotGridArea = document.getElementById('slot-grid-area');
         if (slotGridArea) {
             const sortedSlots = [...snapshot.slots].sort((a, b) => a.slot_id - b.slot_id);
-            const currentHash = JSON.stringify(sortedSlots.map(s => ({id: s.slot_id, state: s.state})));
-            
+            const currentHash = JSON.stringify(sortedSlots.map(s => ({ id: s.slot_id, state: s.state })));
             if (currentHash !== lastSlotHash) {
                 slotGridArea.innerHTML = sortedSlots.map(slot => `
                     <div class="slot-item ${slot.state.toLowerCase()}">
@@ -186,15 +445,9 @@ export function initUserUI() {
                             <span class="slot-status ${slot.state === 'AUTH_PENDING' ? 'status-pulse' : ''}">${slot.state}</span>
                         </div>
                         ${slot.state === 'FREE' ? `
-                            <button class="btn-charge" data-action="book" data-slot-id="${slot.slot_id}"
-                                ${!appState.allowActions ? 'disabled' : ''}>
-                                Charge
-                            </button>
+                            <button class="btn-charge" data-action="book" data-slot-id="${slot.slot_id}">Charge</button>
                         ` : slot.state === 'AUTH_PENDING' ? `
-                            <button class="btn-charge btn-auth" data-action="authorize" data-slot-id="${slot.slot_id}"
-                                ${!appState.allowActions ? 'disabled' : ''}>
-                                Authorize
-                            </button>
+                            <button class="btn-charge btn-auth" data-action="authorize" data-slot-id="${slot.slot_id}">Authorize</button>
                         ` : `
                             <div class="assigned-user">ID: ${slot.assigned_global_id || '---'}</div>
                         `}
@@ -206,29 +459,51 @@ export function initUserUI() {
 
         const countBadge = document.getElementById('free-slots-count');
         const freeCount = snapshot.slots.filter(s => s.state === 'FREE').length;
-        if (countBadge && countBadge.innerText !== `${freeCount} Free`) {
-            countBadge.innerText = `${freeCount} Free`;
-        }
-        
-        // Update Allocation Button State
+        if (countBadge) countBadge.innerText = `${freeCount} Free`;
+
         const findBtn = document.getElementById('btn-find-slot');
-        if (findBtn) {
-            findBtn.disabled = !appState.allowActions || isLoading;
-            const targetText = isLoading ? 'PROCESSING...' : 'Find Best Slot';
-            if (findBtn.innerText !== targetText) findBtn.innerText = targetText;
+        // Do not tie to allowActions: it flips with camera/sync (~100ms) and makes the button unusable.
+        // find_slot is allowed while waiting for vision (see api_v3 executeAction allowlist).
+        if (findBtn) findBtn.disabled = isLoading;
+
+        const bookingsTable = document.getElementById('user-bookings-table');
+        if (bookingsTable) {
+            const rows = Array.isArray(snapshot.user_bookings) ? snapshot.user_bookings : [];
+            if (rows.length === 0) {
+                bookingsTable.innerHTML = `<p class="mono" style="opacity:.8">No bookings yet</p>`;
+            } else {
+                bookingsTable.innerHTML = `
+                    <table style="width:100%; border-collapse:collapse; font-size:12px;">
+                        <thead>
+                            <tr>
+                                <th style="text-align:left; padding:4px;">Slot</th>
+                                <th style="text-align:left; padding:4px;">Date</th>
+                                <th style="text-align:left; padding:4px;">Time</th>
+                                <th style="text-align:left; padding:4px;">Auth</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            ${rows.map((b) => `
+                                <tr>
+                                    <td style="padding:4px;">${Number(b.slot_id) + 1}</td>
+                                    <td style="padding:4px;">${b.date || '-'}</td>
+                                    <td style="padding:4px;">${b.time_window || '-'}</td>
+                                    <td style="padding:4px;" class="mono">${b.auth_code || 'N/A'}</td>
+                                </tr>
+                            `).join('')}
+                        </tbody>
+                    </table>
+                `;
+            }
         }
     }
 
-    // Initialize
     initialRender();
-    
-    events.on('STATE_UPDATED', (state) => update(state));
+    events.on('STATE_UPDATED', () => update());
     events.on('ACTIONS_CHANGED', () => update());
-    events.on('API_ERROR', () => {
-        isLoading = false;
-        update();
+    events.on('API_ERROR', () => { isLoading = false; update(); });
+    events.on('CHARGE_FLOW_START', (payload) => {
+        void startChargeFlow(payload?.slot_id ?? null, payload?.charger_type ?? null).catch((e) => console.error('[ChargeFlow] CHARGE_FLOW_START failed', e));
     });
-    
-    // Initial call
     update();
 }

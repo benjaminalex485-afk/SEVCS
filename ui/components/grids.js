@@ -1,4 +1,4 @@
-import { bookSlot, addSlot, removeSlot, updateSlotType } from '../app/api_v3.js';
+import { addSlot, removeSlot, updateSlotType } from '../app/api_v3.js';
 import { events } from '../app/events.js';
 
 export function initGrids() {
@@ -11,8 +11,9 @@ export function initGrids() {
         const slotCard = e.target.closest('.slot-card');
         if (slotCard && slotCard.classList.contains('interactive') && !e.target.closest('button')) {
             const slotId = slotCard.dataset.id;
-            console.log(`[SEVCS] Requesting booking for slot ${slotId}`);
-            await bookSlot(slotId);
+            const chargerType = slotCard.dataset.chargerType || 'STANDARD';
+            console.log(`[ChargeFlow] grid entry for slot ${slotId}`);
+            events.emit('CHARGE_FLOW_START', { slot_id: Number(slotId), charger_type: chargerType });
             return;
         }
 
@@ -68,6 +69,7 @@ export function initGrids() {
                             ${snapshot.slots.map(slot => `
                                 <div class="slot-card ${slot.state.toLowerCase()} ${state.allowActions && slot.state === 'FREE' ? 'interactive' : ''}" 
                                      data-id="${slot.slot_id}"
+                                     data-charger-type="${slot.charger_type || 'STANDARD'}"
                                      title="${slot.state === 'FREE' ? 'Click to book' : ''}">
                                     
                                     <div style="display: flex; justify-content: space-between; align-items: flex-start">
@@ -102,7 +104,7 @@ export function initGrids() {
             <div class="card">
                 <h2>Vehicle Queue</h2>
                 ${snapshot && snapshot.queue.length === 0 ? `
-                    <div class="mono" style="color: var(--accent-orange); padding: 1rem; border: 1px dashed; text-align: center;">EMPTY SYSTEM STATE – NO ACTIVE TRACKS</div>
+                    <div class="mono" style="color: var(--accent-orange); padding: 1rem; border: 1px dashed; text-align: center;">No objects detected</div>
                 ` : `
                 <table class="status-table">
                     <thead>
@@ -119,7 +121,7 @@ export function initGrids() {
                                 <td class="mono">V-${v.global_id}</td>
                                 <td class="mono">T-${v.track_id}</td>
                                 <td>${v.state}</td>
-                                <td>${(v.confidence * 100).toFixed(1)}%</td>
+                                <td>${(((v.signal_confidence ?? v.confidence ?? 0) * 100)).toFixed(1)}%</td>
                             </tr>
                         `).join('') : '<tr><td colspan="4" style="text-align: center; color: var(--text-secondary)">Waiting for queue synchronization...</td></tr>'}
                     </tbody>

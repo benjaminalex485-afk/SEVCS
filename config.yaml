@@ -11,14 +11,18 @@ debug_locks: false
 distance_normalization: 1500.0
 model_path: models/yolov8n-seg.pt
 queue_zones:
-- - - 0
-    - 400
-  - - 1280
-    - 400
-  - - 1280
-    - 720
-  - - 0
-    - 720
+- - - 134
+    - 278
+  - - 79
+    - 164
+  - - 7
+    - 171
+  - - 5
+    - 464
+  - - 625
+    - 467
+  - - 623
+    - 228
 rate_limit_attempts: 5
 rate_limit_window: 60.0
 slots:

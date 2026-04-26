@@ -109,6 +109,7 @@ export function startRenderer() {
  * Centralized UI State Priority Engine
  */
 function computeUIState() {
+    const mode = appState.snapshot?.system_mode || appState.snapshot?.mode || '';
     const displayState = (() => {
         if (appState.isResyncing) return 'RESYNC_REQUIRED';
         if (!appState.snapshot) {
@@ -116,6 +117,8 @@ function computeUIState() {
             if (sinceStart > 5000) return 'DISCONNECTED';
             return 'INITIALIZING';
         }
+        if (mode === 'WAITING_FOR_CAMERA') return 'WAITING_FOR_CAMERA';
+        if (mode === 'DEGRADED') return 'DEGRADED_MODE';
         const delta = performance.now() - appState.lastSnapshotMono;
         if (appState.snapshot?.freeze_state) return 'FROZEN';
         if (delta > appState.SNAPSHOT_FRESHNESS_MS + 1000) return 'DISCONNECTED';
@@ -125,7 +128,12 @@ function computeUIState() {
     })();
 
     const isDevMode = appState.snapshot?.dev_mode === true;
-    const allowActions = (displayState === 'SYNCHRONIZED' || displayState === 'DEGRADED' || isDevMode);
+    const allowActions = (
+        displayState === 'SYNCHRONIZED' ||
+        displayState === 'DEGRADED' ||
+        displayState === 'DEGRADED_MODE' ||
+        isDevMode
+    );
     
     if (appState.allowActions !== allowActions) {
         console.log(`[RENDER] allowActions: ${appState.allowActions} -> ${allowActions} (State: ${displayState}, DevMode: ${isDevMode})`);
@@ -140,6 +148,8 @@ function computeUIState() {
 function safeDraw() {
     try {
         const displayState = computeUIState();
+        const slots = Array.isArray(appState.snapshot?.slots) ? appState.snapshot.slots : [];
+        const queue = Array.isArray(appState.snapshot?.queue) ? appState.snapshot.queue : [];
         
         // Final Display Synthesis
         const stateToEmit = {
@@ -147,10 +157,18 @@ function safeDraw() {
             displayState,
             snapshot: appState.snapshot ? {
                 ...appState.snapshot,
-                slots: [...appState.snapshot.slots].sort((a, b) => a.slot_id - b.slot_id),
-                queue: [...appState.snapshot.queue].sort((a, b) => (a.global_id || 0) - (b.global_id || 0))
+                slots: [...slots].sort((a, b) => (a.slot_id || 0) - (b.slot_id || 0)),
+                queue: [...queue].sort((a, b) => (a.global_id || 0) - (b.global_id || 0))
             } : null
         };
+        if (appState.lastRenderState !== displayState) {
+            appState.lastRenderState = displayState;
+            console.log('[SEVCS RENDER] state_source', {
+                displayState,
+                snapshotMode: stateToEmit.snapshot?.system_mode || 'NONE',
+                seq: stateToEmit.snapshot?.snapshot_sequence ?? -1
+            });
+        }
         
         events.emit('STATE_UPDATED', stateToEmit);
     } catch (e) {

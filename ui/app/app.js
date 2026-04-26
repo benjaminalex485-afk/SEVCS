@@ -58,7 +58,8 @@ function bootstrap() {
         
         // Hide/Show main dashboard based on auth
         const isAuth = state.authStatus === 'AUTHENTICATED' || (state.authStatus === 'AUTHENTICATED_PENDING' && state.lastSequence > -1);
-        document.getElementById('main-dashboard').style.visibility = isAuth ? 'visible' : 'hidden';
+        // Keep dashboard visible for observability even before auth.
+        document.getElementById('main-dashboard').style.visibility = 'visible';
         
         if (state.authStatus === 'GUEST') {
             document.getElementById('auth-container').style.display = 'flex';
@@ -90,10 +91,11 @@ function bootstrap() {
 
     // 3. Auth Persistence Check
     const token = localStorage.getItem('sevcs_token');
+    // Always poll status so startup state is visible to guests.
+    startPolling();
     if (token) {
         appState.session.token = token;
         appState.authStatus = 'AUTHENTICATED_PENDING';
-        startPolling();
     }
 
     // 4. Start Render Tick

@@ -64,7 +64,19 @@ export function initSystemUI() {
         let bannerActive = true;
         const displayState = state.displayState;
 
-        if (displayState === 'FROZEN_UNKNOWN') {
+        if (displayState === 'INITIALIZING') {
+            banner.className = 'banner banner-desync';
+            bannerMsg.innerText = 'Initializing...';
+        } else if (displayState === 'WAITING_FOR_CAMERA') {
+            banner.className = 'banner banner-frozen';
+            bannerMsg.innerText = 'Waiting for camera...';
+        } else if (displayState === 'DEGRADED_MODE') {
+            banner.className = 'banner banner-frozen';
+            bannerMsg.innerText = 'Degraded mode';
+        } else if (displayState === 'SYNCHRONIZED') {
+            banner.className = 'banner banner-desync';
+            bannerMsg.innerText = 'Camera Active';
+        } else if (displayState === 'FROZEN_UNKNOWN') {
             banner.className = 'banner banner-frozen';
             bannerMsg.innerText = 'SYSTEM FROZEN - Last action status unknown. Verify state after recovery.';
         } else if (displayState === 'FROZEN') {
@@ -106,6 +118,7 @@ export function initSystemUI() {
                     ${snapshot ? `
                         <div class="mono">
                             <p>Mode: <span style="color: var(--accent-blue)">${snapshot.system_mode}</span></p>
+                            <p>Camera: ${snapshot.system_mode === 'WAITING_FOR_CAMERA' ? 'Waiting for camera...' : 'Camera Active'}</p>
                             ${snapshot.dev_mode ? '<p style="color: #ffaa00; font-weight: bold;">[DEV MODE ACTIVE]</p>' : ''}
                             <p>Health: ${snapshot.system_health}%</p>
                             <p>Sync Score: ${state.healthScore}%</p>

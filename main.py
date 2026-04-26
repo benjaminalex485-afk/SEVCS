@@ -111,6 +111,10 @@ class GlobalState:
         self.wallets = collections.defaultdict(lambda: {"balance": 0.0, "currency": "USD"})
         # Pre-seed some balance for testing
         self.wallets["test3@gmail.com"]["balance"] = 100.0
+        self.pricing_quotes = {}
+        self.payment_receipts = {}
+        # (slot_id|date|time_window) -> booking metadata
+        self.slot_time_reservations = {}
 
 G_STATE = GlobalState()
 
@@ -415,19 +419,129 @@ def get_request_data():
         return data["payload"]
     return data
 
+def _get_slot_charger_type(slot):
+    return getattr(slot, "charger_type", "STANDARD")
+
+def _get_time_multiplier(time_window):
+    if not time_window:
+        return 1.0
+    hour_map = {
+        "00:00-06:00": 0.8,
+        "06:00-12:00": 1.0,
+        "12:00-18:00": 1.2,
+        "18:00-24:00": 1.4
+    }
+    return float(hour_map.get(time_window, 1.0))
+
+def _reservation_key(slot_id, date, time_window):
+    return f"{int(slot_id)}|{str(date)}|{str(time_window)}"
+
+def build_degraded_status_snapshot(username, reason):
+    """Always return a schema-compatible status payload for UI safety."""
+    now = utils.system_now(caller="api_thread")
+    mode = "WAITING_FOR_CAMERA" if not G_STATE.camera_online else "INITIALIZING"
+    return {
+        "snapshot_sequence": int(G_STATE.snapshot_sequence),
+        "snapshot_version": int(G_STATE.last_snapshot_version),
+        "previous_snapshot_version": int(G_STATE.last_snapshot_version),
+        "timestamp": now,
+        "source": "BACKEND",
+        "mode": mode,
+        "system_mode": mode,
+        "mode_reason": str(reason),
+        "system_health": 0.0 if not G_STATE.camera_online else 25.0,
+        "freeze_state": bool(G_STATE.is_forensic_frozen),
+        "freeze_reason": str(G_STATE.freeze_reason) if G_STATE.freeze_reason else "",
+        "state_hash": "",
+        "schema_version": int(G_STATE.schema_version),
+        "slots": [],
+        "queue": [],
+        "user_id": username,
+        "user_wallet": G_STATE.wallets.get(username, {"balance": 0.0, "currency": "USD"}),
+        "user_bookings": [],
+        "dev_mode": DEV_MODE
+    }
+
+def build_pipeline_placeholder_snapshot(frame_id, frame_time, reason):
+    """Emit a valid placeholder snapshot when pipeline is degraded/frozen."""
+    with G_STATE.snapshot_lock:
+        G_STATE.snapshot_sequence += 1
+        seq = G_STATE.snapshot_sequence
+        prev = G_STATE.last_snapshot_version
+        G_STATE.last_snapshot_version = frame_id
+
+    mode = "DEGRADED" if not G_STATE.is_forensic_frozen else "FROZEN"
+    return {
+        "snapshot_sequence": int(seq),
+        "snapshot_version": int(frame_id),
+        "previous_snapshot_version": int(prev if prev else frame_id),
+        "timestamp": utils.system_now(caller="main_loop"),
+        "frame_time": utils.normalize_float(frame_time),
+        "source": "BACKEND",
+        "mode": mode,
+        "system_mode": mode,
+        "mode_reason": str(reason),
+        "system_health": 0.0,
+        "freeze_state": bool(G_STATE.is_forensic_frozen),
+        "freeze_reason": str(G_STATE.freeze_reason) if G_STATE.freeze_reason else "",
+        "state_hash": "",
+        "schema_version": int(G_STATE.schema_version),
+        "slots": [],
+        "queue": [],
+        "dev_mode": DEV_MODE
+    }
+
 # --- API SERVER ---
 @api_app.route('/api/status', methods=['GET'])
 def get_status():
     username = request.args.get('username', 'Anonymous')
+    now = utils.system_now(caller="api_thread")
+    status_mode = "INITIALIZING"
     if G_STATE.snapshot_buffer:
         snapshot = copy.deepcopy(G_STATE.snapshot_buffer[-1])
+        with G_STATE.vision_lock:
+            user_bookings = [
+                {
+                    "slot_id": int(res.get("slot_id", -1)),
+                    "date": res.get("date"),
+                    "time_window": res.get("time_window"),
+                    "auth_code": res.get("auth_code", "N/A"),
+                    "created_at": float(res.get("created_at", 0.0))
+                }
+                for res in G_STATE.slot_time_reservations.values()
+                if res.get("username") == username
+            ]
+        user_bookings.sort(key=lambda x: x.get("created_at", 0.0), reverse=True)
         # Inject the correct wallet and user ID for this specific session
         snapshot["user_id"] = username
         snapshot["user_wallet"] = G_STATE.wallets.get(username, {"balance": 0.0, "currency": "USD"})
-        snapshot["timestamp"] = utils.system_now(caller="api_thread")
+        snapshot["user_bookings"] = user_bookings
+        # Keep producer timestamp untouched for frontend freshness logic.
+        snapshot["api_timestamp"] = now
         snapshot["dev_mode"] = DEV_MODE
+        status_mode = snapshot.get("system_mode", "LIVE")
+        if not hasattr(get_status, "_last_status_log"):
+            get_status._last_status_log = 0.0
+        if now - get_status._last_status_log >= 2.0:
+            get_status._last_status_log = now
+            logger.info(
+                "[API_STATUS] mode=%s seq=%s age=%.2fs slots=%d queue=%d",
+                status_mode,
+                snapshot.get("snapshot_sequence", -1),
+                max(0.0, now - float(snapshot.get("timestamp", now))),
+                len(snapshot.get("slots", [])),
+                len(snapshot.get("queue", [])),
+            )
         return jsonify(snapshot)
-    return jsonify({"error": "No snapshots available", "source": "BACKEND"}), 503
+    reason = "Camera unavailable (degraded mode)" if not G_STATE.camera_online else "State initialized"
+    payload = build_degraded_status_snapshot(username, reason)
+    status_mode = payload.get("system_mode", "INITIALIZING")
+    if not hasattr(get_status, "_last_status_log"):
+        get_status._last_status_log = 0.0
+    if now - get_status._last_status_log >= 2.0:
+        get_status._last_status_log = now
+        logger.info("[API_STATUS] mode=%s seq=%s cold_start=1", status_mode, payload.get("snapshot_sequence", -1))
+    return jsonify(payload), 200
 
 # --- OPERATIONAL SAFETY: RATE LIMITING ---
 class TokenBucket:
@@ -509,6 +623,40 @@ def get_summary_api():
         "latency_p95": round(G_STATE.metrics.get_latency_p95(), 3),
         "active_tracks": active_tracks,
         "queue_size": len(G_STATE.queue_manager.queue) if G_STATE.queue_manager else 0
+    })
+
+@api_app.route('/api/debug/health', methods=['GET'])
+def debug_health_api():
+    now = utils.system_now(caller="api_thread")
+    return jsonify({
+        "source": "BACKEND",
+        "camera_online": bool(G_STATE.camera_online),
+        "vision_heartbeat_age_s": round(max(0.0, now - G_STATE.last_vision_heartbeat), 3),
+        "snapshot_available": bool(len(G_STATE.snapshot_buffer) > 0),
+        "mode": G_STATE.mode.name,
+        "freeze_state": bool(G_STATE.is_forensic_frozen),
+        "freeze_reason": G_STATE.freeze_reason
+    })
+
+@api_app.route('/api/debug/snapshot_meta', methods=['GET'])
+def debug_snapshot_meta_api():
+    if G_STATE.snapshot_buffer:
+        latest = G_STATE.snapshot_buffer[-1]
+        return jsonify({
+            "source": "BACKEND",
+            "snapshot_sequence": latest.get("snapshot_sequence", -1),
+            "snapshot_version": latest.get("snapshot_version", -1),
+            "timestamp": latest.get("timestamp", 0),
+            "slots_count": len(latest.get("slots", [])),
+            "queue_count": len(latest.get("queue", []))
+        })
+    return jsonify({
+        "source": "BACKEND",
+        "snapshot_sequence": -1,
+        "snapshot_version": -1,
+        "timestamp": utils.system_now(caller="api_thread"),
+        "slots_count": 0,
+        "queue_count": 0
     })
 
 @api_app.route('/api/system/mode', methods=['POST'])
@@ -610,6 +758,7 @@ def book_slot_api():
     data = get_request_data()
     username = data.get('username', 'Anonymous')
     identifier = f"{request.remote_addr}:{username}"
+    reservation_key = None
     
     if not DEV_MODE:
         limit = CONFIG.get('rate_limit_attempts', 5)
@@ -618,12 +767,41 @@ def book_slot_api():
             return jsonify({"status": "error", "message": "Rate limit exceeded"}), 429
         G_STATE.auth_engine.record_attempt(identifier)
 
+    quote_id = data.get("quote_id")
+    if quote_id:
+        with G_STATE.vision_lock:
+            quote = G_STATE.pricing_quotes.get(quote_id)
+            if not quote:
+                return jsonify({"status": "error", "message": "Invalid quote_id"}), 400
+            if quote.get("username") != username:
+                return jsonify({"status": "error", "message": "Quote user mismatch"}), 400
+            if utils.system_now(caller="api_thread") > quote.get("expires_at", 0):
+                return jsonify({"status": "error", "message": "Quote expired"}), 400
+            if not quote.get("paid", False):
+                return jsonify({"status": "error", "message": "Payment required before booking"}), 400
+            if quote.get("consumed", False):
+                return jsonify({"status": "error", "message": "Quote already used"}), 409
+            reservation_key = _reservation_key(quote.get("slot_id"), quote.get("date"), quote.get("time_window"))
+            existing_res = G_STATE.slot_time_reservations.get(reservation_key)
+            if existing_res and existing_res.get("quote_id") != quote_id:
+                return jsonify({"status": "error", "message": "Slot already booked for selected date/time"}), 409
+
     with G_STATE.vision_lock:
         assigned_idx = -1
         # Use provided slot_id if available, else find one
         req_slot_id = data.get('slot_id')
         if req_slot_id is not None:
-            assigned_idx = int(req_slot_id) - 1
+            try:
+                raw_slot_id = int(req_slot_id)
+            except (TypeError, ValueError):
+                return jsonify({"status": "error", "message": "Invalid slot_id"}), 400
+            # Accept both 0-based (UI cards: Slot 0..N-1) and 1-based ids.
+            if 0 <= raw_slot_id < len(G_STATE.slots):
+                assigned_idx = raw_slot_id
+            elif 1 <= raw_slot_id <= len(G_STATE.slots):
+                assigned_idx = raw_slot_id - 1
+            else:
+                return jsonify({"status": "error", "message": "Slot not found"}), 404
             logger.info(f"[BOOKING] Manual booking request for Slot {assigned_idx+1}")
         else:
             # AUTO-FIND logic
@@ -641,13 +819,173 @@ def book_slot_api():
     if assigned_idx != -1 and assigned_idx < len(G_STATE.slots):
         timeout = data.get('timeout', 600)
         code = G_STATE.auth_engine.generate_booking(assigned_idx, username, timeout=timeout)
+        if not code:
+            return jsonify({"status": "error", "message": "Booking rejected for this slot"}), 409
+        if quote_id:
+            quote["consumed"] = True
+            G_STATE.slot_time_reservations[reservation_key] = {
+                "quote_id": quote_id,
+                "username": username,
+                "slot_id": assigned_idx,
+                "date": quote.get("date"),
+                "time_window": quote.get("time_window"),
+                "auth_code": code,
+                "created_at": utils.system_now(caller="api_thread")
+            }
         return jsonify({"status": "success", "slot_id": assigned_idx + 1, "auth_code": code})
     
     return jsonify({"status": "error", "message": "No slots available"}), 400
 
+@api_app.route('/api/availability', methods=['GET'])
+def availability_api():
+    username = request.args.get("username", "Anonymous")
+    with G_STATE.vision_lock:
+        slots = [
+            {
+                "slot_id": slot.slot_id,
+                "charger_type": _get_slot_charger_type(slot),
+                "state": slot.state.name
+            }
+            for slot in G_STATE.slots if slot.state == SlotState.FREE
+        ]
+    logger.info(f"[CHARGE_FLOW] availability_requested user={username} free_slots={len(slots)}")
+    return jsonify({
+        "status": "success",
+        "slots": slots,
+        "generated_at": utils.system_now(caller="api_thread")
+    })
+
+@api_app.route('/api/pricing_quote', methods=['POST'])
+def pricing_quote_api():
+    data = get_request_data()
+    username = data.get("username", "Anonymous")
+    slot_id = data.get("slot_id")
+    date = data.get("date")
+    time_window = data.get("time_window")
+    if slot_id is None or not date or not time_window:
+        return jsonify({"status": "error", "message": "slot_id, date, and time_window are required"}), 400
+    try:
+        slot_idx = int(slot_id)
+    except (TypeError, ValueError):
+        return jsonify({"status": "error", "message": "Invalid slot_id"}), 400
+
+    with G_STATE.vision_lock:
+        slot = next((s for s in G_STATE.slots if s.slot_id == slot_idx), None)
+        if not slot:
+            return jsonify({"status": "error", "message": "Slot not found"}), 404
+        if slot.state != SlotState.FREE:
+            return jsonify({"status": "error", "message": "Slot not available"}), 409
+        reservation_key = _reservation_key(slot_idx, date, time_window)
+        if reservation_key in G_STATE.slot_time_reservations:
+            return jsonify({"status": "error", "message": "Slot already booked for selected date/time"}), 409
+        charger_type = _get_slot_charger_type(slot)
+
+    base_price = 10.0 if charger_type == "STANDARD" else 18.0
+    multiplier = _get_time_multiplier(time_window)
+    total_price = round(base_price * multiplier, 2)
+    quote_id = f"q_{int(utils.system_now(caller='api_thread')*1000)}_{slot_idx}"
+    expires_at = utils.system_now(caller="api_thread") + 300.0
+    quote_payload = {
+        "quote_id": quote_id,
+        "username": username,
+        "slot_id": slot_idx,
+        "charger_type": charger_type,
+        "date": date,
+        "time_window": time_window,
+        "unit_price": base_price,
+        "multiplier": multiplier,
+        "total_price": total_price,
+        "currency": "USD",
+        "expires_at": expires_at,
+        "paid": False,
+        "consumed": False
+    }
+    G_STATE.pricing_quotes[quote_id] = quote_payload
+    logger.info(f"[CHARGE_FLOW] quote_generated quote_id={quote_id} slot={slot_idx} total={total_price}")
+    return jsonify({"status": "success", **quote_payload})
+
+@api_app.route('/api/payment/mock', methods=['POST'])
+def payment_mock_api():
+    data = get_request_data()
+    quote_id = data.get("quote_id")
+    username = data.get("username", "Anonymous")
+    method = data.get("method", "MOCK_CARD")
+    if not quote_id:
+        return jsonify({"status": "error", "message": "quote_id is required"}), 400
+    with G_STATE.vision_lock:
+        quote = G_STATE.pricing_quotes.get(quote_id)
+        if not quote:
+            return jsonify({"status": "error", "message": "Quote not found"}), 404
+        if quote.get("username") != username:
+            return jsonify({"status": "error", "message": "Quote user mismatch"}), 400
+        if utils.system_now(caller="api_thread") > quote.get("expires_at", 0):
+            return jsonify({"status": "error", "message": "Quote expired"}), 400
+        if quote.get("consumed", False):
+            return jsonify({"status": "error", "message": "Quote already used"}), 409
+        reservation_key = _reservation_key(quote.get("slot_id"), quote.get("date"), quote.get("time_window"))
+        existing_res = G_STATE.slot_time_reservations.get(reservation_key)
+        if existing_res and existing_res.get("quote_id") != quote_id:
+            return jsonify({"status": "error", "message": "Slot already booked for selected date/time"}), 409
+        payment_id = f"pay_{int(utils.system_now(caller='api_thread')*1000)}"
+        quote["paid"] = True
+    receipt = {
+        "status": "success",
+        "payment_id": payment_id,
+        "quote_id": quote_id,
+        "method": method,
+        "processed_at": utils.system_now(caller="api_thread")
+    }
+    G_STATE.payment_receipts[payment_id] = receipt
+    logger.info(f"[CHARGE_FLOW] payment_mock_result payment_id={payment_id} quote_id={quote_id}")
+    return jsonify(receipt)
+
+@api_app.route('/api/admin_add_slot', methods=['POST'])
+def admin_add_slot_api():
+    data = get_request_data()
+    charger_type = (data.get('charger_type') or "STANDARD").upper()
+    with G_STATE.vision_lock:
+        slot_id = len(G_STATE.slots)
+        # Use the last polygon as a placeholder for debug/admin runtime behavior.
+        polygon = G_STATE.slots[-1].polygon if G_STATE.slots else np.array([[50, 50], [250, 50], [250, 250], [50, 250]], np.int32)
+        G_STATE.slots.append(Slot(slot_id, polygon))
+    logger.info(f"[ADMIN] Added slot {slot_id + 1} (type={charger_type})")
+    return jsonify({"status": "success", "slot_id": slot_id + 1, "charger_type": charger_type})
+
+@api_app.route('/api/admin_remove_slot', methods=['POST'])
+def admin_remove_slot_api():
+    data = get_request_data()
+    try:
+        target_slot = int(data.get('slot_id')) - 1
+    except (TypeError, ValueError):
+        return jsonify({"status": "error", "message": "Invalid slot_id"}), 400
+    with G_STATE.vision_lock:
+        if target_slot < 0 or target_slot >= len(G_STATE.slots):
+            return jsonify({"status": "error", "message": "Slot not found"}), 404
+        G_STATE.slots.pop(target_slot)
+        # Reindex for predictable UI behavior
+        for idx, slot in enumerate(G_STATE.slots):
+            slot.slot_id = idx
+    logger.info(f"[ADMIN] Removed slot {target_slot + 1}")
+    return jsonify({"status": "success"})
+
+@api_app.route('/api/admin_update_slot_type', methods=['POST'])
+def admin_update_slot_type_api():
+    data = get_request_data()
+    try:
+        target_slot = int(data.get('slot_id')) - 1
+    except (TypeError, ValueError):
+        return jsonify({"status": "error", "message": "Invalid slot_id"}), 400
+    charger_type = (data.get('charger_type') or "STANDARD").upper()
+    with G_STATE.vision_lock:
+        if target_slot < 0 or target_slot >= len(G_STATE.slots):
+            return jsonify({"status": "error", "message": "Slot not found"}), 404
+        setattr(G_STATE.slots[target_slot], "charger_type", charger_type)
+    logger.info(f"[ADMIN] Updated slot {target_slot + 1} type to {charger_type}")
+    return jsonify({"status": "success", "slot_id": target_slot + 1, "charger_type": charger_type})
+
 @api_app.route('/api/recharge', methods=['POST'])
 def recharge_api():
-    inner_data = data.get('payload', data)
+    inner_data = get_request_data()
     username = inner_data.get('username', "Anonymous")
     amount = float(inner_data.get('amount', 0))
     
@@ -723,6 +1061,7 @@ def serve_static(path):
     return send_from_directory('ui', path)
 
 def run_api():
+    logger.info("Server running")
     api_app.run(host='0.0.0.0', port=5001, debug=False, threaded=True)
 
 def charging_simulation_loop():
@@ -748,7 +1087,8 @@ def main():
     slots = [Slot(i, poly) for i, poly in enumerate(CONFIG.get('slots', []))]
     G_STATE.auth_engine.clear_all()
     with G_STATE.vision_lock:
-        G_STATE.slots, G_STATE.queue_manager, G_STATE.camera_online = slots, queue_manager, True
+        G_STATE.slots, G_STATE.queue_manager, G_STATE.camera_online = slots, queue_manager, False
+    logger.info("State initialized")
     threading.Thread(target=run_api, daemon=True).start()
     threading.Thread(target=charging_simulation_loop, daemon=True).start()
     
@@ -762,13 +1102,23 @@ def main():
             logger.error(f"[CAMERA] Failed to open camera at index {cam_idx}. Falling back to index 0.")
             cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
             if not cap.isOpened():
-                logger.critical("[CAMERA] No cameras available. Exiting.")
-                return
-        logger.info("[CAMERA] Camera opened successfully.")
-        cv2.namedWindow("Smart EV Charging")
+                logger.warning("Camera unavailable (degraded mode)")
+                cap = None
+            else:
+                logger.info("Camera initialized")
+                with G_STATE.vision_lock:
+                    G_STATE.camera_online = True
+                cv2.namedWindow("Smart EV Charging")
+        else:
+            logger.info("Camera initialized")
+            with G_STATE.vision_lock:
+                G_STATE.camera_online = True
+            cv2.namedWindow("Smart EV Charging")
 
     else:
         cap = None
+        with G_STATE.vision_lock:
+            G_STATE.camera_online = True
     
     REPLAY_MODE = CONFIG.get("replay_mode", False)
     if REPLAY_MODE:
@@ -858,27 +1208,45 @@ def main():
         else:
             # 1. Grab Frame
             t0 = time.time()
-            ret, frame = cap.read()
-            if not ret:
-                logger.error("[CAMERA] Failed to grab frame. Reconnecting...")
-                cap.release()
-                time.sleep(1.0)
-                cap = cv2.VideoCapture(CONFIG.get('camera_index', 1), cv2.CAP_DSHOW)
-                continue
-            t_grab = time.time() - t0
-            
-            # 2. Detect (AI)
-            try:
-                t1 = time.time()
-                detections = tracker.update_with_detections(detector.detect(frame, conf=0.15))
-                t_detect = time.time() - t1
-            except Exception as e:
-                logger.error(f"[VISION] Detection error: {e}")
+            if cap is None:
+                frame = np.zeros((720, 1280, 3), dtype=np.uint8)
                 detections = sv.Detections.empty()
-                t_detect = 0
+                time.sleep(0.05)
+                if frame_id % 60 == 0:
+                    logger.info("[HEARTBEAT] Camera unavailable (degraded mode)")
+            else:
+                ret, frame = cap.read()
+                if not ret:
+                    logger.error("[CAMERA] Failed to grab frame. Reconnecting...")
+                    cap.release()
+                    time.sleep(1.0)
+                    cap = cv2.VideoCapture(CONFIG.get('camera_index', 1), cv2.CAP_DSHOW)
+                    if cap.isOpened():
+                        with G_STATE.vision_lock:
+                            G_STATE.camera_online = True
+                        logger.info("Camera initialized")
+                    else:
+                        cap = None
+                        with G_STATE.vision_lock:
+                            G_STATE.camera_online = False
+                        logger.warning("Camera unavailable (degraded mode)")
+                    continue
+                with G_STATE.vision_lock:
+                    G_STATE.camera_online = True
+                t_grab = time.time() - t0
                 
-            if frame_id % 30 == 0:
-                logger.info(f"[PERF] Frame {frame_id}: Grab {t_grab:.3f}s | Detect {t_detect:.3f}s")
+                # 2. Detect (AI)
+                try:
+                    t1 = time.time()
+                    detections = tracker.update_with_detections(detector.detect(frame, conf=0.15))
+                    t_detect = time.time() - t1
+                except Exception as e:
+                    logger.error(f"[VISION] Detection error: {e}")
+                    detections = sv.Detections.empty()
+                    t_detect = 0
+                    
+                if frame_id % 30 == 0:
+                    logger.info(f"[PERF] Frame {frame_id}: Grab {t_grab:.3f}s | Detect {t_detect:.3f}s")
         
         # --- ATOMIC FRAME PROCESSING ---
         with G_STATE.vision_lock:
@@ -1040,15 +1408,45 @@ def main():
             current_snapshot = get_system_snapshot(frame_id, loop_start, debug=True)
             if current_snapshot:
                 G_STATE.snapshot_buffer.append(current_snapshot)
-                
+            else:
+                degraded_snapshot = build_pipeline_placeholder_snapshot(
+                    frame_id,
+                    loop_start,
+                    G_STATE.freeze_reason or "SNAPSHOT_PIPELINE_FAILURE"
+                )
+                G_STATE.snapshot_buffer.append(degraded_snapshot)
+                logger.warning(
+                    "[SNAPSHOT] Fallback placeholder emitted seq=%s reason=%s",
+                    degraded_snapshot.get("snapshot_sequence"),
+                    degraded_snapshot.get("mode_reason")
+                )
+
                 # 3. Periodic Referential Integrity Audit (Reuse current_snapshot)
-                if frame_id % CONFIG.get("integrity_interval", 30) == 0:
+                if current_snapshot and frame_id % CONFIG.get("integrity_interval", 30) == 0:
                     validate_referential_integrity(current_snapshot)
         else:
             # Auto-unfreeze safety (60s)
             if loop_start - G_STATE.freeze_start_time > 60.0:
                 logger.warning("[FORENSICS] Auto-unfreezing buffer (Timeout)")
                 G_STATE.is_forensic_frozen = False
+            frozen_snapshot = build_pipeline_placeholder_snapshot(
+                frame_id,
+                loop_start,
+                G_STATE.freeze_reason or "FORENSIC_FREEZE_ACTIVE"
+            )
+            G_STATE.snapshot_buffer.append(frozen_snapshot)
+
+        if frame_id % 30 == 0:
+            latest = G_STATE.snapshot_buffer[-1] if G_STATE.snapshot_buffer else {}
+            logger.info(
+                "[HEARTBEAT] frame=%d seq=%s mode=%s camera=%s slots=%d queue=%d",
+                frame_id,
+                latest.get("snapshot_sequence", -1),
+                latest.get("system_mode", "UNKNOWN"),
+                "ACTIVE" if G_STATE.camera_online else "DEGRADED",
+                len(latest.get("slots", [])),
+                len(latest.get("queue", []))
+            )
 
         # --- REAL-TIME ESP32 BROADCAST ---
         if frame_id % 5 == 0: # 6 FPS broadcast
@@ -1077,8 +1475,11 @@ def main():
         frame = visualizer.draw_detections(frame, detections)
         frame = visualizer.draw_sidebar(frame, G_STATE.queue_manager)
 
-        cv2.imshow("Smart EV Charging", frame)
-        key = cv2.waitKey(1) & 0xFF
+        if cap is not None:
+            cv2.imshow("Smart EV Charging", frame)
+            key = cv2.waitKey(1) & 0xFF
+        else:
+            key = 255
         if key != 255:
             logger.info(f"[DEBUG] Key pressed: {key} (q={ord('q')})")
             

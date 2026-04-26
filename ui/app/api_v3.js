@@ -94,6 +94,40 @@ export async function signup(profile) {
     return { success: false, message: result.data?.message || result.error || 'Signup failed' };
 }
 
+export async function getAvailability(username = null) {
+    const url = new URL(`${BASE_URL}/api/availability`);
+    if (username) url.searchParams.append('username', username);
+    const result = await safeFetch(url.toString(), { method: 'GET' });
+    if (!result.ok) {
+        throw new Error(result.data?.message || result.error || `Availability failed (${result.status})`);
+    }
+    return result.data;
+}
+
+export async function getPricingQuote(payload) {
+    const result = await safeFetch(`${BASE_URL}/api/pricing_quote`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ payload })
+    });
+    if (!result.ok) {
+        throw new Error(result.data?.message || result.error || `Quote failed (${result.status})`);
+    }
+    return result.data;
+}
+
+export async function processMockPayment(payload) {
+    const result = await safeFetch(`${BASE_URL}/api/payment/mock`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ payload })
+    });
+    if (!result.ok) {
+        throw new Error(result.data?.message || result.error || `Payment failed (${result.status})`);
+    }
+    return result.data;
+}
+
 /**
  * Polling loop with exponential backoff and latency tracking.
  */
@@ -101,7 +135,7 @@ export async function signup(profile) {
  * Polling loop with single-instance guard and auth gate.
  */
 const fetchStatus = async () => {
-    if (appState.authStatus === 'GUEST' || appState.isSimulating) return;
+    if (appState.isSimulating) return;
 
     const currentTimeout = Math.min(MAX_TIMEOUT, Math.max(MIN_TIMEOUT, avgLatency * 3));
     const controller = new AbortController();
@@ -115,11 +149,13 @@ const fetchStatus = async () => {
         }
         const result = await safeFetch(url.toString(), { signal: controller.signal });
         clearTimeout(timeoutId);
+        console.log('[SEVCS POLL] status_response', { ok: result.ok, status: result.status, retryDelay: currentRetryDelay });
         
         if (!result.ok || !result.data) {
             if (result.status === 401) {
                 events.emit('AUTH_EXPIRED');
             }
+            console.warn('[SEVCS POLL] rejected_response', { status: result.status });
             return;
         }
 
@@ -130,6 +166,11 @@ const fetchStatus = async () => {
         }
 
         setLatestSnapshot(result.data, latency);
+        console.log('[SEVCS POLL] snapshot_ingest', {
+            seq: result.data?.snapshot_sequence,
+            mode: result.data?.system_mode || result.data?.mode,
+            latency
+        });
         
         currentRetryDelay = POLL_INTERVAL;
         consecutiveFailures = 0;
@@ -152,6 +193,7 @@ const fetchStatus = async () => {
         
         const jitter = (appState.lastSequence % 5) * 40; 
         currentRetryDelay = Math.min(currentRetryDelay * 2, MAX_BACKOFF) + jitter;
+        console.error('[SEVCS POLL] fetch_failed', { message: error.message, retryDelay: currentRetryDelay, consecutiveFailures });
 
         events.emit('API_ERROR', errorObj);
     }
@@ -165,8 +207,11 @@ export async function startPolling() {
 
     async function pollLoop() {
         if (!isPolling) return;
-        await fetchStatus();
-        pollingInterval = setTimeout(pollLoop, currentRetryDelay);
+        try {
+            await fetchStatus();
+        } finally {
+            pollingInterval = setTimeout(pollLoop, currentRetryDelay);
+        }
     }
     pollLoop();
 }
@@ -205,27 +250,30 @@ const ACTION_TIMEOUT_MS = appState.INTENT_TIMEOUT_MS;
 export async function executeAction(endpoint, payload, intentKey = null) {
     // 0. Policy Guard: Allow financial actions even during desync
     console.log(`[API] executeAction called: ${endpoint}`, payload);
-    const isCriticalVisionAction = !['recharge', 'login', 'signup'].includes(endpoint);
+    const isQuoteBackedBooking = endpoint === 'book' && !!payload?.quote_id;
+    const isCriticalVisionAction = !['recharge', 'login', 'signup', 'find_slot'].includes(endpoint) && !isQuoteBackedBooking;
     
     if (isCriticalVisionAction && !appState.allowActions) {
+        const blockMessage = 'System not synchronized. Please wait for health indicator to turn Green.';
         console.error(`[API] Action ${endpoint} BLOCKED: System not synchronized. Current State:`, appState.displayState);
         events.emit('API_ERROR', { 
             code: 'NOT_SYNCHRONIZED', 
             retryable: false, 
-            message: 'System not synchronized. Please wait for health indicator to turn Green.' 
+            message: blockMessage
         });
-        return;
+        return { status: 'error', message: blockMessage };
     }
 
     // Intent Lock Guard
     if (intentKey && appState.pendingIntents.has(intentKey)) {
         const intent = appState.pendingIntents.get(intentKey);
-        if (intent.status === 'PENDING') return; 
+        if (intent.status === 'PENDING') return { status: 'pending', message: 'Action already in progress' };
     }
 
     if (appState.pendingActions.size >= MAX_PENDING) {
-        events.emit('API_ERROR', { code: 'THROTTLE', retryable: true, message: 'Too many pending requests' });
-        return;
+        const throttleMessage = 'Too many pending requests';
+        events.emit('API_ERROR', { code: 'THROTTLE', retryable: true, message: throttleMessage });
+        return { status: 'error', message: throttleMessage };
     }
 
     // Click-Time Version Binding
@@ -315,7 +363,7 @@ export async function executeAction(endpoint, payload, intentKey = null) {
 }
 
 export async function bookSlot(slotId) {
-    return executeAction('book_slot', { slot_id: slotId }, `book_slot_${slotId}`);
+    return executeAction('book', { slot_id: slotId }, `book_slot_${slotId}`);
 }
 
 /**

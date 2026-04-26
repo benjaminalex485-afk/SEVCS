@@ -21,6 +21,7 @@ export const appState = {
     lastSnapshotMono: performance.now(),
     appStartMono: performance.now(),
     lastClockSyncTime: 0,
+    timeOffset: 0,
     lastHardSyncTime: 0,
     minAcceptedSequence: -1,
     isResyncing: false,
@@ -112,10 +113,23 @@ function normalizeSnapshot(s) {
         freeze_state: Boolean(s.freeze_state),
         slots: Array.isArray(s.slots) ? s.slots : [],
         queue: Array.isArray(s.queue) ? s.queue : [],
+        user_bookings: Array.isArray(s.user_bookings) ? s.user_bookings : [],
+        user_wallet: s.user_wallet || { balance: 0, currency: 'USD' },
+        user_id: s.user_id || null,
         state_hash: String(s.state_hash || ""),
         source: String(s.source || ""),
         latency: Number(s.latency || 0)
     };
+}
+
+function isValidSnapshotPayload(s) {
+    if (!s || typeof s !== 'object') return false;
+    const requiredNumbers = ['snapshot_sequence', 'snapshot_version', 'timestamp'];
+    for (const key of requiredNumbers) {
+        if (!Number.isFinite(Number(s[key]))) return false;
+    }
+    if (!Array.isArray(s.slots) || !Array.isArray(s.queue)) return false;
+    return true;
 }
 
 /**
@@ -160,6 +174,10 @@ export function setLatestSnapshot(data, latency) {
     }
 
     // 3. Normalized Contract
+    if (!isValidSnapshotPayload(data)) {
+        console.warn('[SEVCS] SNAPSHOT REJECTED: Invalid contract payload', data);
+        return;
+    }
     const normalized = normalizeSnapshot(data);
     normalized.latency = latency;
 
@@ -252,6 +270,12 @@ export function setLatestSnapshot(data, latency) {
     // 10. Frame Isolation
     latestIncomingSnapshot = safeClone({ ...normalized, timestamp, arrivalTimestamp: Date.now() });
     appState.lastSnapshotMono = performance.now(); // 🔥 HEARTBEAT: Update timer on ANY valid arrival
+    console.log('[SEVCS] SNAPSHOT ACCEPTED', {
+        seq: normalized.snapshot_sequence,
+        version: normalized.snapshot_version,
+        source: normalized.source,
+        mode: normalized.system_mode
+    });
 
     // Desync Early Detection (Monotonicity Guard)
     if (appState.snapshot && normalized.snapshot_sequence > appState.lastSequence + 1) {
@@ -396,6 +420,7 @@ export function processSnapshot(data) {
 
     appState.snapshot = deepFreeze(data); // Immutable commit
     appState.lastSequence = newSequence;
+    appState.snapshotVersion = data.snapshot_version;
     appState.lastSnapshotTime = Date.now();
     appState.lastSnapshotMono = nowMono;
     
