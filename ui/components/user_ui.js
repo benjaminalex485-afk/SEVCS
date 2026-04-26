@@ -11,6 +11,8 @@ export function initUserUI() {
         loading: false,
         error: null,
         success: null,
+        pendingAmount: 0,
+        baselineBalance: 0,
         form: {
             amount: '50',
             cardNumber: '',
@@ -18,6 +20,12 @@ export function initUserUI() {
             cardExpiry: '',
             cardCvv: ''
         }
+    };
+    let walletToastTimer = null;
+    const bookingCancelState = {
+        openKey: null,
+        busy: false,
+        message: null
     };
 
     const initialFlowData = () => ({
@@ -73,6 +81,60 @@ export function initUserUI() {
             return 'Please fill valid card details';
         }
         return null;
+    }
+
+    function showWalletToast(message, tone = 'success') {
+        const toast = document.getElementById('wallet-toast');
+        if (!toast) return;
+        toast.textContent = message;
+        toast.classList.remove('hidden', 'wallet-toast-success', 'wallet-toast-error');
+        toast.classList.add(tone === 'error' ? 'wallet-toast-error' : 'wallet-toast-success');
+        if (walletToastTimer) clearTimeout(walletToastTimer);
+        walletToastTimer = setTimeout(() => {
+            toast.classList.add('hidden');
+        }, 2500);
+    }
+
+    function finalizeRechargeSuccess(amount, balanceFromResponse = null) {
+        rechargeFlowState.loading = false;
+        rechargeFlowState.open = false;
+        rechargeFlowState.error = null;
+        rechargeFlowState.success = null;
+        rechargeFlowState.pendingAmount = 0;
+        rechargeFlowState.baselineBalance = 0;
+        rechargeFlowState.form = { amount: '50', cardNumber: '', cardHolder: '', cardExpiry: '', cardCvv: '' };
+
+        if (appState.snapshot) {
+            appState.snapshot.user_wallet = appState.snapshot.user_wallet || { balance: 0, currency: 'USD' };
+            const nextBalance = Number(balanceFromResponse);
+            if (Number.isFinite(nextBalance)) {
+                appState.snapshot.user_wallet.balance = nextBalance;
+            } else {
+                const curr = Number(appState.snapshot.user_wallet?.balance || 0);
+                appState.snapshot.user_wallet.balance = curr;
+            }
+        }
+        showWalletToast(`Wallet recharged by $${amount.toFixed(2)}.`, 'success');
+        renderWalletRechargePanel();
+        update();
+    }
+
+    function parseBookingStart(dateStr, timeWindow) {
+        if (!dateStr || !timeWindow || !String(timeWindow).includes('-')) return null;
+        const startPart = String(timeWindow).split('-')[0].trim();
+        const iso = `${dateStr}T${startPart}:00`;
+        const dt = new Date(iso);
+        return Number.isNaN(dt.getTime()) ? null : dt;
+    }
+
+    function getRefundRatio(hoursBeforeStart) {
+        if (hoursBeforeStart == null) return 0.0;
+        if (hoursBeforeStart >= 24) return 1.0;
+        if (hoursBeforeStart >= 18) return 0.9;
+        if (hoursBeforeStart >= 12) return 0.8;
+        if (hoursBeforeStart >= 6) return 0.6;
+        if (hoursBeforeStart >= 3) return 0.4;
+        return 0.0;
     }
 
     function renderWalletRechargePanel() {
@@ -368,69 +430,75 @@ export function initUserUI() {
     function initialRender() {
         container.innerHTML = `
             <div class="user-dashboard-grid">
-                <div class="card wallet-card glass" id="wallet-area">
-                    <div class="wallet-header">
-                        <h3>Your Wallet</h3>
-                        <span class="wallet-id" id="wallet-user-id">ID: ---</span>
+                <div class="user-col1-stack">
+                    <div class="card wallet-card glass" id="wallet-area">
+                        <div class="wallet-header">
+                            <h3>Your Wallet</h3>
+                            <span class="wallet-id" id="wallet-user-id">ID: ---</span>
+                        </div>
+                        <div class="balance-area">
+                            <span class="currency">$</span>
+                            <span class="balance" id="user-balance">0.00</span>
+                        </div>
+                        <button class="primary-btn btn-small" id="btn-recharge">Quick Recharge $50</button>
+                        <div id="wallet-toast" class="wallet-toast hidden"></div>
+                        <div id="wallet-recharge-area" class="hidden"></div>
                     </div>
-                    <div class="balance-area">
-                        <span class="currency">$</span>
-                        <span class="balance" id="user-balance">0.00</span>
+                    <div class="card camera-card glass" id="camera-status-card">
+                        <div class="wallet-header">
+                            <h3>Camera Status</h3>
+                            <span class="wallet-id" id="camera-status-mode">--</span>
+                        </div>
+                        <div class="camera-status-line">
+                            <span class="status-dot status-dot-amber" id="camera-status-dot" aria-hidden="true"></span>
+                            <div class="mono camera-status-text-amber" id="camera-status-text">Waiting for status...</div>
+                        </div>
                     </div>
-                    <button class="primary-btn btn-small" id="btn-recharge">Quick Recharge $50</button>
-                    <div id="wallet-recharge-area" class="hidden"></div>
                 </div>
-                <div class="card camera-card glass" id="camera-status-card">
-                    <div class="wallet-header">
-                        <h3>Camera Status</h3>
-                        <span class="wallet-id" id="camera-status-mode">--</span>
+                <div class="user-col2-stack">
+                    <div class="card slots-card glass">
+                        <div class="card-header">
+                            <h3>Available Slots</h3>
+                            <span class="count-badge" id="free-slots-count">0 Free</span>
+                        </div>
+                        <div class="slot-grid" id="slot-grid-area"></div>
                     </div>
-                    <div class="camera-status-line">
-                        <span class="status-dot status-dot-amber" id="camera-status-dot" aria-hidden="true"></span>
-                        <div class="mono camera-status-text-amber" id="camera-status-text">Waiting for status...</div>
-                    </div>
-                </div>
-                <div class="card slots-card glass">
-                    <div class="card-header">
-                        <h3>Available Slots</h3>
-                        <span class="count-badge" id="free-slots-count">0 Free</span>
-                    </div>
-                    <div class="slot-grid" id="slot-grid-area"></div>
-                </div>
-                <div class="card actions-card glass">
-                    <h3>Smart Allocation</h3>
-                    <div class="form-group">
-                        <label>Vehicle Type</label>
-                        <select id="user-vehicle">
-                            <option value="SUV">SUV</option>
-                            <option value="Sedan">Sedan</option>
-                            <option value="Truck">Truck</option>
-                        </select>
-                    </div>
-                    <div class="form-group">
-                        <label>Urgency</label>
-                        <select id="user-urgency">
-                            <option value="LOW">Low</option>
-                            <option value="HIGH">High</option>
-                        </select>
-                    </div>
-                    <button class="primary-btn" id="btn-find-slot">Find Best Slot</button>
-                    <div id="user-result-area"></div>
-                    <div class="booking-table-wrap">
-                        <h4 class="mono" style="margin: 10px 0 6px;">Booked Sessions</h4>
-                        <div id="user-bookings-table"></div>
+                    <div class="card actions-card glass">
+                        <h3>Smart Allocation</h3>
+                        <div class="form-group">
+                            <label>Vehicle Type</label>
+                            <select id="user-vehicle">
+                                <option value="SUV">SUV</option>
+                                <option value="Sedan">Sedan</option>
+                                <option value="Truck">Truck</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label>Urgency</label>
+                            <select id="user-urgency">
+                                <option value="LOW">Low</option>
+                                <option value="HIGH">High</option>
+                            </select>
+                        </div>
+                        <button class="primary-btn" id="btn-find-slot">Find Best Slot</button>
+                        <div id="user-result-area"></div>
+                        <div class="booking-table-wrap">
+                            <h4 class="mono" style="margin: 10px 0 6px;">Booked Sessions</h4>
+                            <div id="user-bookings-table"></div>
+                        </div>
                     </div>
                 </div>
             </div>
         `;
 
         container.addEventListener('click', async (e) => {
-            const btn = e.target.closest('.btn-charge, #btn-recharge, #btn-find-slot, [data-flow-action], [data-wallet-action]');
+            const btn = e.target.closest('.btn-charge, #btn-recharge, #btn-find-slot, [data-flow-action], [data-wallet-action], [data-booking-action]');
             if (!btn) return;
             const rawSlotId = btn.dataset.slotId;
             const slotId = rawSlotId === undefined || rawSlotId === '' ? NaN : Number(rawSlotId);
             const action = btn.dataset.action;
             const flowAction = btn.dataset.flowAction;
+            const bookingAction = btn.dataset.bookingAction;
 
             if (btn.id === 'btn-recharge') {
                 rechargeFlowState.open = true;
@@ -473,22 +541,39 @@ export function initUserUI() {
                 rechargeFlowState.loading = true;
                 rechargeFlowState.error = null;
                 rechargeFlowState.success = null;
+                rechargeFlowState.pendingAmount = amount;
+                rechargeFlowState.baselineBalance = Number(appState.snapshot?.user_wallet?.balance || 0);
                 renderWalletRechargePanel();
-                const res = await executeAction(
-                    'recharge',
-                    { amount, username: appState.session.userId },
-                    `recharge_${appState.session.userId}`
-                );
+                const rechargeTimeoutMs = 12000;
+                const intentKey = `recharge_${appState.session.userId}_${Date.now()}`;
+                const timeoutPromise = new Promise((resolve) => {
+                    setTimeout(() => resolve({ status: 'error', message: 'Recharge request timed out. Please try again.' }), rechargeTimeoutMs);
+                });
+                let res = null;
+                try {
+                    res = await Promise.race([
+                        executeAction(
+                            'recharge',
+                            { amount, username: appState.session.userId },
+                            intentKey
+                        ),
+                        timeoutPromise
+                    ]);
+                } catch (e) {
+                    res = { status: 'error', message: e?.message || 'Recharge failed' };
+                }
                 rechargeFlowState.loading = false;
                 if (res?.status === 'success') {
-                    rechargeFlowState.success = `Payment successful. Wallet recharged by $${amount.toFixed(2)}.`;
-                    rechargeFlowState.error = null;
-                    rechargeFlowState.form = { amount: '50', cardNumber: '', cardHolder: '', cardExpiry: '', cardCvv: '' };
+                    finalizeRechargeSuccess(amount, res?.balance);
                 } else {
                     rechargeFlowState.error = res?.message || res?.error || 'Recharge failed';
                     rechargeFlowState.success = null;
+                    rechargeFlowState.pendingAmount = 0;
+                    rechargeFlowState.baselineBalance = 0;
+                    showWalletToast(rechargeFlowState.error, 'error');
                 }
                 renderWalletRechargePanel();
+                update();
                 return;
             }
 
@@ -592,6 +677,41 @@ export function initUserUI() {
                 }
                 return;
             }
+            if (bookingAction === 'open-cancel') {
+                bookingCancelState.openKey = btn.dataset.bookingKey || null;
+                bookingCancelState.message = null;
+                update();
+                return;
+            }
+            if (bookingAction === 'close-cancel') {
+                bookingCancelState.openKey = null;
+                bookingCancelState.busy = false;
+                bookingCancelState.message = null;
+                update();
+                return;
+            }
+            if (bookingAction === 'confirm-cancel') {
+                const bookingKey = btn.dataset.bookingKey || '';
+                if (!bookingKey) return;
+                bookingCancelState.busy = true;
+                bookingCancelState.message = null;
+                update();
+                const res = await executeAction('cancel_booking', {
+                    booking_key: bookingKey,
+                    username: appState.session.userId
+                }, `cancel_booking_${bookingKey}`);
+                bookingCancelState.busy = false;
+                if (res?.status === 'success') {
+                    bookingCancelState.openKey = null;
+                    bookingCancelState.message = res?.message || 'Booking cancelled';
+                    const resultArea = document.getElementById('user-result-area');
+                    if (resultArea) resultArea.innerHTML = `<p class="mono">${bookingCancelState.message}</p>`;
+                } else {
+                    bookingCancelState.message = res?.message || res?.error || 'Unable to cancel booking';
+                }
+                update();
+                return;
+            }
             if (btn.id === 'btn-find-slot') {
                 isLoading = true;
                 update();
@@ -662,6 +782,17 @@ export function initUserUI() {
         if (balanceEl) balanceEl.innerText = wallet.balance.toFixed(2);
         const userIdEl = document.getElementById('wallet-user-id');
         if (userIdEl) userIdEl.innerText = `ID: ${appState.session.userId}`;
+
+        // Recovery path: if backend already credited wallet but action response is delayed,
+        // auto-finish recharge UX instead of leaving it stuck at "Processing...".
+        if (rechargeFlowState.loading && rechargeFlowState.pendingAmount > 0) {
+            const currBal = Number(wallet.balance || 0);
+            const expected = Number(rechargeFlowState.baselineBalance || 0) + Number(rechargeFlowState.pendingAmount || 0);
+            if (currBal >= expected - 0.001) {
+                finalizeRechargeSuccess(rechargeFlowState.pendingAmount, currBal);
+                return;
+            }
+        }
 
         const slotGridArea = document.getElementById('slot-grid-area');
         if (slotGridArea) {
@@ -746,17 +877,47 @@ export function initUserUI() {
                                 <th style="text-align:left; padding:4px;">Date</th>
                                 <th style="text-align:left; padding:4px;">Time</th>
                                 <th style="text-align:left; padding:4px;">Auth</th>
+                                <th style="text-align:left; padding:4px;">Action</th>
                             </tr>
                         </thead>
                         <tbody>
-                            ${rows.map((b) => `
+                            ${rows.map((b) => {
+                                const bookingKey = b.booking_key || '';
+                                const isOpen = bookingCancelState.openKey === bookingKey;
+                                const start = parseBookingStart(b.date, b.time_window);
+                                const hoursBefore = start ? ((start.getTime() - Date.now()) / 3600000) : null;
+                                const refundRatio = getRefundRatio(hoursBefore);
+                                const paid = Number(b.total_price || 0);
+                                const estimatedRefund = Math.max(0, paid * refundRatio);
+                                return `
                                 <tr>
                                     <td style="padding:4px;">${displaySlot(b.slot_id)}</td>
                                     <td style="padding:4px;">${b.date || '-'}</td>
                                     <td style="padding:4px;">${b.time_window || '-'}</td>
                                     <td style="padding:4px;" class="mono">${b.auth_code || 'N/A'}</td>
+                                    <td style="padding:4px;">
+                                        <button class="btn-booking-cancel" data-booking-action="open-cancel" data-booking-key="${bookingKey}">Cancel Booking</button>
+                                    </td>
                                 </tr>
-                            `).join('')}
+                                ${isOpen ? `
+                                    <tr>
+                                        <td colspan="5" style="padding:6px;">
+                                            <div class="booking-cancel-confirm">
+                                                <div class="mono" style="margin-bottom:6px;">Confirm cancellation?</div>
+                                                <div class="mono" style="opacity:.9; margin-bottom:6px;">
+                                                    Warning: only part of your money may be refunded. Estimated refund: $${estimatedRefund.toFixed(2)} (${Math.round(refundRatio * 100)}%).
+                                                </div>
+                                                <div style="display:flex; gap:8px;">
+                                                    <button class="primary-btn btn-small" data-booking-action="confirm-cancel" data-booking-key="${bookingKey}" ${bookingCancelState.busy ? 'disabled' : ''}>${bookingCancelState.busy ? 'Cancelling...' : 'Confirm Cancel'}</button>
+                                                    <button class="primary-btn btn-small wallet-cancel-btn" data-booking-action="close-cancel" ${bookingCancelState.busy ? 'disabled' : ''}>Keep Booking</button>
+                                                </div>
+                                                ${bookingCancelState.message ? `<p class="status-msg warning" style="margin-top:8px;">${bookingCancelState.message}</p>` : ''}
+                                            </div>
+                                        </td>
+                                    </tr>
+                                ` : ''}
+                            `;
+                            }).join('')}
                         </tbody>
                     </table>
                 `;

@@ -251,7 +251,7 @@ export async function executeAction(endpoint, payload, intentKey = null) {
     // 0. Policy Guard: Allow financial actions even during desync
     console.log(`[API] executeAction called: ${endpoint}`, payload);
     const isQuoteBackedBooking = endpoint === 'book' && !!payload?.quote_id;
-    const isCriticalVisionAction = !['recharge', 'login', 'signup', 'find_slot', 'authorize', 'start_charging'].includes(endpoint) && !isQuoteBackedBooking;
+    const isCriticalVisionAction = !['recharge', 'cancel_booking', 'login', 'signup', 'find_slot', 'authorize', 'start_charging'].includes(endpoint) && !isQuoteBackedBooking;
     
     if (isCriticalVisionAction && !appState.allowActions) {
         const blockMessage = 'System not synchronized. Please wait for health indicator to turn Green.';

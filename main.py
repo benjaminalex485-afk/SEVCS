@@ -449,6 +449,31 @@ def _current_time_window():
         return "12:00-18:00"
     return "18:00-24:00"
 
+def _booking_window_start_ts(date_str, time_window):
+    try:
+        date_part = str(date_str).strip()
+        tw = str(time_window).strip()
+        start_hhmm = tw.split("-")[0]
+        dt = time.strptime(f"{date_part} {start_hhmm}", "%Y-%m-%d %H:%M")
+        return time.mktime(dt)
+    except Exception:
+        return None
+
+def _refund_ratio_for_hours(hours_before_start):
+    if hours_before_start is None:
+        return 0.0
+    if hours_before_start >= 24.0:
+        return 1.0
+    if hours_before_start >= 18.0:
+        return 0.9
+    if hours_before_start >= 12.0:
+        return 0.8
+    if hours_before_start >= 6.0:
+        return 0.6
+    if hours_before_start >= 3.0:
+        return 0.4
+    return 0.0
+
 def _estimate_slot_eta_minutes(slot_idx):
     # Estimate remaining charging time from active session if present.
     session = G_STATE.sessions.get(slot_idx)
@@ -601,14 +626,16 @@ def get_status():
         with G_STATE.vision_lock:
             user_bookings = [
                 {
+                    "booking_key": key,
                     "slot_id": int(res.get("slot_id", -1)),
                     "date": res.get("date"),
                     "time_window": res.get("time_window"),
                     "auth_code": res.get("auth_code", "N/A"),
-                    "created_at": float(res.get("created_at", 0.0))
+                    "created_at": float(res.get("created_at", 0.0)),
+                    "total_price": float((G_STATE.pricing_quotes.get(res.get("quote_id"), {}) or {}).get("total_price", 0.0))
                 }
-                for res in G_STATE.slot_time_reservations.values()
-                if res.get("username") == username
+                for key, res in G_STATE.slot_time_reservations.items()
+                if isinstance(res, dict) and res.get("username") == username
             ]
         user_bookings.sort(key=lambda x: x.get("created_at", 0.0), reverse=True)
         # Inject the correct wallet and user ID for this specific session
@@ -936,6 +963,70 @@ def book_slot_api():
         return jsonify({"status": "success", "slot_id": assigned_idx + 1, "auth_code": code})
     
     return jsonify({"status": "error", "message": "No slots available"}), 400
+
+@api_app.route('/api/cancel_booking', methods=['POST'])
+def cancel_booking_api():
+    data = get_request_data()
+    username = data.get("username", "Anonymous")
+    booking_key = data.get("booking_key")
+    if not booking_key:
+        return jsonify({"status": "error", "message": "booking_key is required"}), 400
+
+    with G_STATE.vision_lock:
+        booking = G_STATE.slot_time_reservations.get(booking_key)
+        if not booking:
+            return jsonify({"status": "error", "message": "Booking not found"}), 404
+        if booking.get("username") != username:
+            return jsonify({"status": "error", "message": "Booking user mismatch"}), 403
+
+        slot_idx = int(booking.get("slot_id", -1))
+        if slot_idx < 0 or slot_idx >= len(G_STATE.slots):
+            return jsonify({"status": "error", "message": "Invalid booking slot"}), 400
+
+        slot = G_STATE.slots[slot_idx]
+        if slot.state == SlotState.CHARGING:
+            return jsonify({"status": "error", "message": "Cannot cancel an active charging session"}), 409
+
+        quote_id = booking.get("quote_id")
+        quote = G_STATE.pricing_quotes.get(quote_id, {}) if quote_id else {}
+        paid_amount = float(quote.get("total_price", 0.0))
+
+        start_ts = _booking_window_start_ts(booking.get("date"), booking.get("time_window"))
+        now_ts = utils.system_now(caller="api_thread")
+        hours_before = ((start_ts - now_ts) / 3600.0) if start_ts is not None else None
+        refund_ratio = _refund_ratio_for_hours(hours_before)
+        refund_amount = round(paid_amount * refund_ratio, 2)
+
+        wallet = G_STATE.wallets[username]
+        wallet["balance"] = round(float(wallet.get("balance", 0.0)) + refund_amount, 2)
+
+        # Mark quote as canceled and non-reusable.
+        if quote_id and quote:
+            quote["canceled"] = True
+            quote["consumed"] = True
+
+        # Remove reservation and invalidate auth booking.
+        del G_STATE.slot_time_reservations[booking_key]
+        G_STATE.auth_engine.revoke_authorization(slot_idx)
+        with G_STATE.auth_engine.lock:
+            G_STATE.auth_engine.bookings.pop(slot_idx, None)
+            G_STATE.auth_engine.authorizations.pop(slot_idx, None)
+
+        if slot.state in [SlotState.AUTH_PENDING, SlotState.AUTH_ACTIVE, SlotState.ALIGNMENT_PENDING]:
+            slot.set_state(SlotState.FREE)
+
+    G_STATE.last_snapshot_version += 1
+    logger.info(
+        "[BOOKING] canceled user=%s slot=%s booking_key=%s paid=%.2f refund=%.2f ratio=%.2f",
+        username, slot_idx + 1, booking_key, paid_amount, refund_amount, refund_ratio
+    )
+    return jsonify({
+        "status": "success",
+        "message": f"Booking cancelled. Refund ${refund_amount:.2f} credited to wallet.",
+        "refund_amount": refund_amount,
+        "refund_ratio": refund_ratio,
+        "wallet_balance": G_STATE.wallets[username]["balance"]
+    })
 
 @api_app.route('/api/availability', methods=['GET'])
 def availability_api():

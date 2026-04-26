@@ -130,8 +130,20 @@ export function initGrids() {
         const isAdmin = state.uiMode === 'ADMIN';
         const mainDashboard = document.getElementById('main-dashboard');
         const dataPanel = document.querySelector('.data-panel');
+        const col2Stack = document.querySelector('.user-col2-stack');
+        const adminCol2Stack = document.getElementById('admin-col2-stack');
         if (mainDashboard) mainDashboard.classList.toggle('admin-layout', isAdmin);
         if (dataPanel) dataPanel.classList.toggle('admin-layout', isAdmin);
+
+        // Keep Vehicle Queue in admin layout root for admin mode,
+        // but attach it under user column-2 stack in user mode
+        // so wallet expansion in column-1 only pushes camera card.
+        if (adminCol2Stack && dataPanel && isAdmin && adminCol2Stack.parentElement !== dataPanel) {
+            dataPanel.appendChild(adminCol2Stack);
+        }
+        if (adminCol2Stack && col2Stack && !isAdmin && adminCol2Stack.parentElement !== col2Stack) {
+            col2Stack.appendChild(adminCol2Stack);
+        }
 
         // Performance Guard: Only re-render if data has actually changed
         const currentHash = snapshot ? `${snapshot.state_hash}_${snapshot.snapshot_sequence}_${isAdmin}` : 'empty';
