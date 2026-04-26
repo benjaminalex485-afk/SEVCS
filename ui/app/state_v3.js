@@ -543,9 +543,10 @@ export function resolveAction(requestId, responseData) {
         
         // Finalize intent
         if (responseData) {
+            const finalStatus = (responseData.status === 'OK' || responseData.status === 'success') ? 'SUCCESS' : 'FAILED';
             appState.pendingIntents.set(action.intentKey, { 
                 ...intent, 
-                status: responseData.status === 'OK' ? 'SUCCESS' : 'FAILED' 
+                status: finalStatus
             });
         }
     }
@@ -555,7 +556,9 @@ export function resolveAction(requestId, responseData) {
             sequence: responseData.snapshot_sequence || appState.lastSequence,
             request_id: requestId,
             endpoint: action.endpoint,
-            status: responseData.status === 'OK' ? (responseData.replayed ? 'REPLAYED' : 'NEW') : (responseData.status || 'REJECTED'),
+            status: (responseData.status === 'OK' || responseData.status === 'success') 
+                ? (responseData.replayed ? 'REPLAYED' : 'NEW') 
+                : (responseData.status || 'REJECTED'),
             snapshot_version: responseData.snapshot_version || action.versionSent,
             snapshot_sequence: responseData.snapshot_sequence || action.snapshot_sequence,
             decision_id: responseData.decision_id || '---',

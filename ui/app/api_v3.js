@@ -30,62 +30,68 @@ async function safeFetch(url, options = {}) {
         headers['Authorization'] = `Bearer ${appState.session.token}`;
     }
 
-    const response = await fetch(url, { ...options, headers });
+    try {
+        const response = await fetch(url, { ...options, headers });
+        
+        if (response.status === 401) {
+            console.error('[SEVCS API] Unauthorized (401).');
+            if (appState.session.token) {
+                console.warn('[SEVCS API] Active session invalidated. Triggering Logout.');
+                events.emit('FORCE_LOGOUT');
+            }
+            return { ok: false, status: 401, error: 'Unauthorized' };
+        }
 
-    if (response.status === 401) {
-        console.error('[SEVCS API] Unauthorized (401). Triggering Logout.');
-        events.emit('FORCE_LOGOUT');
-        return null;
+        const data = await response.json().catch(() => ({}));
+        
+        return {
+            ok: response.ok,
+            status: response.status,
+            data: data
+        };
+    } catch (error) {
+        console.error('[API ERROR]', error);
+        return {
+            ok: false,
+            status: 0,
+            error: error.message
+        };
     }
-
-    if (!response.ok) {
-        const error = await response.json().catch(() => ({ message: response.statusText }));
-        throw new Error(error.message || `HTTP Error: ${response.status}`);
-    }
-
-    return response.json();
 }
 
 /**
  * Authentication Layer (Independent of Snapshot Pipeline)
  */
 export async function login(credentials) {
-    try {
-        const data = await safeFetch(`${BASE_URL}/api/login`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(credentials)
-        });
+    const result = await safeFetch(`${BASE_URL}/api/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(credentials)
+    });
 
-        if (data && data.token) {
-            appState.session = { token: data.token, userId: data.user_id, role: data.role || 'USER' };
-            appState.uiMode = data.role || 'USER'; 
-            appState.authStatus = 'AUTHENTICATED_PENDING';
-            localStorage.setItem('sevcs_token', data.token);
-            startPolling();
-            return { success: true };
-        }
-        return { success: false, message: data ? data.message : 'Login failed' };
-    } catch (error) {
-        return { success: false, message: error.message };
+    if (result.ok && result.data?.token) {
+        const data = result.data;
+        appState.session = { token: data.token, userId: data.user_id, role: data.role || 'USER' };
+        appState.uiMode = data.role || 'USER'; 
+        appState.authStatus = 'AUTHENTICATED_PENDING';
+        localStorage.setItem('sevcs_token', data.token);
+        startPolling();
+        return { success: true };
     }
+    return { success: false, message: result.data?.message || result.error || 'Login failed' };
 }
 
 export async function signup(profile) {
-    try {
-        const data = await safeFetch(`${BASE_URL}/api/signup`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(profile)
-        });
+    const result = await safeFetch(`${BASE_URL}/api/signup`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(profile)
+    });
 
-        if (data && data.success) {
-            return { success: true };
-        }
-        return { success: false, message: data ? data.message : 'Signup failed' };
-    } catch (error) {
-        return { success: false, message: error.message };
+    if (result.ok && result.data?.success) {
+        return { success: true };
     }
+    return { success: false, message: result.data?.message || result.error || 'Signup failed' };
 }
 
 /**
@@ -107,9 +113,15 @@ const fetchStatus = async () => {
         if (appState.session.userId) {
             url.searchParams.append('username', appState.session.userId);
         }
-        const data = await safeFetch(url.toString(), { signal: controller.signal });
+        const result = await safeFetch(url.toString(), { signal: controller.signal });
         clearTimeout(timeoutId);
-        if (!data) return;
+        
+        if (!result.ok || !result.data) {
+            if (result.status === 401) {
+                events.emit('AUTH_EXPIRED');
+            }
+            return;
+        }
 
         let latency = Date.now() - start;
         if (latency >= 10) {
@@ -117,7 +129,7 @@ const fetchStatus = async () => {
             avgLatency = (EMA_ALPHA * latency) + ((1 - EMA_ALPHA) * avgLatency);
         }
 
-        setLatestSnapshot(data, latency);
+        setLatestSnapshot(result.data, latency);
         
         currentRetryDelay = POLL_INTERVAL;
         consecutiveFailures = 0;
@@ -192,10 +204,11 @@ const ACTION_TIMEOUT_MS = appState.INTENT_TIMEOUT_MS;
 
 export async function executeAction(endpoint, payload, intentKey = null) {
     // 0. Policy Guard: Allow financial actions even during desync
+    console.log(`[API] executeAction called: ${endpoint}`, payload);
     const isCriticalVisionAction = !['recharge', 'login', 'signup'].includes(endpoint);
     
     if (isCriticalVisionAction && !appState.allowActions) {
-        console.warn(`[SEVCS API] Action ${endpoint} blocked: System not synchronized.`);
+        console.error(`[API] Action ${endpoint} BLOCKED: System not synchronized. Current State:`, appState.displayState);
         events.emit('API_ERROR', { 
             code: 'NOT_SYNCHRONIZED', 
             retryable: false, 
@@ -255,7 +268,7 @@ export async function executeAction(endpoint, payload, intentKey = null) {
     }
 
     try {
-        const data = await safeFetch(`${BASE_URL}/api/${endpoint}`, {
+        const result = await safeFetch(`${BASE_URL}/api/${endpoint}`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -266,30 +279,38 @@ export async function executeAction(endpoint, payload, intentKey = null) {
             })
         });
 
-        if (!data) return;
+        if (!result.ok) {
+            const errorMsg = result.data?.message || result.error || `HTTP Error: ${result.status}`;
+            throw new Error(errorMsg);
+        }
+
+        const data = result.data;
 
         // Freeze Race Guard: Check before resolving
-        if (appState.snapshot.freeze_state) {
+        if (appState.snapshot?.freeze_state) {
             console.warn('[SEVCS API] Response received during FREEZE. Marking as UNKNOWN.');
             resolveAction(requestId, { ...data, status: 'UNKNOWN', error: 'System frozen during completion' });
-            return;
+            return { ...data, status: 'UNKNOWN' };
         }
 
         events.emit('ACTION_RESPONSE', { 
             requestId, 
             endpoint,
-            status: data.status === 'OK' ? (data.replayed ? 'REPLAYED' : 'NEW') : 'REJECTED',
+            status: data.status === 'OK' || data.status === 'success' ? (data.replayed ? 'REPLAYED' : 'NEW') : 'REJECTED',
             snapshot_version: data.snapshot_version,
             snapshot_sequence: data.snapshot_sequence,
             payload: data 
         });
 
         resolveAction(requestId, data);
+        return data;
 
     } catch (error) {
         console.error(`[SEVCS API] Action ${endpoint} Failed:`, error);
         events.emit('API_ERROR', { code: 'ACTION_FAILED', retryable: false, message: error.message });
-        resolveAction(requestId, { status: 'ERROR', error: error.message });
+        const errorRes = { status: 'ERROR', error: error.message };
+        resolveAction(requestId, errorRes);
+        return errorRes;
     }
 }
 

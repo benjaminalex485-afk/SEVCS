@@ -124,7 +124,13 @@ function computeUIState() {
         return 'SYNCHRONIZED';
     })();
 
-    appState.allowActions = (displayState === 'SYNCHRONIZED' || displayState === 'DEGRADED');
+    const isDevMode = appState.snapshot?.dev_mode === true;
+    const allowActions = (displayState === 'SYNCHRONIZED' || displayState === 'DEGRADED' || isDevMode);
+    
+    if (appState.allowActions !== allowActions) {
+        console.log(`[RENDER] allowActions: ${appState.allowActions} -> ${allowActions} (State: ${displayState}, DevMode: ${isDevMode})`);
+        appState.allowActions = allowActions;
+    }
     return displayState;
 }
 

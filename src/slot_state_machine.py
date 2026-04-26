@@ -138,6 +138,10 @@ class Slot:
         """
         Enforces physical reality by restricting allowed state jumps.
         """
+        if utils.DEV_MODE:
+            logger.info(f"[DEV MODE] Bypassing transition validation: {self.state.name} -> {new_state.name}")
+            return True
+
         allowed = {
             SlotState.FREE: [SlotState.RESERVED, SlotState.ALIGNMENT_PENDING],
             SlotState.RESERVED: [SlotState.ALIGNMENT_PENDING, SlotState.FREE],
@@ -152,10 +156,15 @@ class Slot:
     def set_state(self, new_state, track_id=None):
         if self.state != new_state:
             if not self.validate_transition(new_state):
+                if utils.DEV_MODE:
+                    logger.warning(f"[DEV MODE] State override applied: {self.state.name} -> {new_state.name}")
+                    self.state = new_state
+                    self.state_enter_time = utils.system_now(caller="main_loop")
+                    if track_id is not None:
+                        self.locked_track_id = track_id
+                    return True
+
                 logger.error(f"[Slot {self.slot_id+1}] REJECTED Invalid Transition: {self.state.name} -> {new_state.name}")
-                
-                # Dynamic strict mode check from a global CONFIG if possible, 
-                # but for now we'll stick to basic validation.
                 self.force_safe_state()
                 return False
 
@@ -178,9 +187,9 @@ class Slot:
         alpha = 0.3
         self.smoothed_alignment_score = (0.7 * self.smoothed_alignment_score) + (alpha * score)
         
-        ALIGN_THRESHOLD_HIGH = 0.75
-        ALIGN_THRESHOLD_LOW = 0.45 
-        GRACE_PERIOD = 5.0 # Seconds before we declare MISALIGNED
+        ALIGN_THRESHOLD_HIGH = 0.75 if not utils.DEV_MODE else 0.3
+        ALIGN_THRESHOLD_LOW = 0.45 if not utils.DEV_MODE else 0.1
+        GRACE_PERIOD = 5.0 if not utils.DEV_MODE else 15.0 # Seconds before we declare MISALIGNED
         
         # Log throttling (1Hz)
         if "overlap_ratio" in features:

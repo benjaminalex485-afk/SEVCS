@@ -55,7 +55,7 @@ export function initSimulationUI() {
                             <tr>
                                 <td class="mono">#${entry.sequence}</td>
                                 <td>${entry.endpoint}</td>
-                                <td><span class="status-tag ${entry.status.toLowerCase()}">${entry.status}</span></td>
+                                <td><span class="status-tag ${(entry.status || 'UNKNOWN').toLowerCase()}">${entry.status || 'UNKNOWN'}</span></td>
                                 <td class="mono">v${entry.snapshot_version}</td>
                             </tr>
                         `).join('') : '<tr><td colspan="4" style="text-align: center; color: var(--text-secondary)">No requests logged.</td></tr>'}

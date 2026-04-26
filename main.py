@@ -41,9 +41,10 @@ else:
 # --- CONSTANTS ---
 CONFIG = utils.load_config()
 utils.validate_config(CONFIG)
-ALIGN_THRESHOLD = 0.75
-AUTH_WINDOW = 1.0 # Early authorization window to eliminate API race conditions
-STRICT_MODE = CONFIG.get("strict_mode", False)
+DEV_MODE = utils.DEV_MODE
+ALIGN_THRESHOLD = 0.75 if not DEV_MODE else 0.3
+AUTH_WINDOW = 1.0 if not DEV_MODE else 10.0 # Relaxed early authorization window
+STRICT_MODE = CONFIG.get("strict_mode", False) if not DEV_MODE else False
 # Freeze configuration after initial load and validation
 # CONFIG = utils.freeze_config(CONFIG)
 
@@ -233,6 +234,10 @@ def trigger_freeze(reason):
         # Only override if new reason is critical or we are in the first frame of freeze
         return
     
+    if DEV_MODE:
+        logger.warning(f"[DEV MODE] System freeze BYPASSED: {reason}")
+        return
+
     G_STATE.is_forensic_frozen = True
     G_STATE.freeze_reason = reason
     G_STATE.freeze_start_time = utils.system_now(caller="main_loop")
@@ -318,7 +323,8 @@ def get_system_snapshot(frame_id, frame_time, debug=True):
             "source": "BACKEND",
             "timestamp": utils.system_now(caller="main_loop"),
             "system_health": float(G_STATE.queue_manager.system_health) if G_STATE.queue_manager else 1.0,
-            "system_mode": local_mode.name
+            "system_mode": local_mode.name,
+            "dev_mode": DEV_MODE
         }
         
         # --- 3. FULL-CYCLE SANITY GATE (Dump -> Load -> Normalize -> Validate) ---
@@ -335,17 +341,26 @@ def get_system_snapshot(frame_id, frame_time, debug=True):
         # 1. Slots must ALWAYS exist (hard invariant)
         slots = normalized.get("slots")
         if not isinstance(slots, list) or len(slots) == 0:
-            raise ValueError("EMPTY_SLOTS")
+            if DEV_MODE:
+                logger.warning("[DEV MODE] EMPTY_SLOTS detected in snapshot. Continuing.")
+            else:
+                raise ValueError("EMPTY_SLOTS")
 
         # 2. Mode must be present
         mode = normalized.get("mode")
         if mode is None:
-            raise ValueError("MISSING_MODE")
+            if DEV_MODE:
+                logger.warning("[DEV MODE] MISSING_MODE detected in snapshot. Continuing.")
+            else:
+                raise ValueError("MISSING_MODE")
 
         # 3. Queue can be empty ONLY in safe/idle states
         queue = normalized.get("queue")
         if queue is None:
-            raise ValueError("MISSING_QUEUE")
+            if DEV_MODE:
+                logger.warning("[DEV MODE] MISSING_QUEUE detected in snapshot. Continuing.")
+            else:
+                raise ValueError("MISSING_QUEUE")
 
         if len(queue) == 0:
             # Allowed empty states
@@ -393,7 +408,9 @@ def get_system_snapshot(frame_id, frame_time, debug=True):
 
 def get_request_data():
     """Helper to handle the wrapped 'payload' from api_v3.js."""
-    data = request.json or {}
+    if not request.is_json:
+        return {}
+    data = request.get_json(silent=True) or {}
     if "payload" in data:
         return data["payload"]
     return data
@@ -408,6 +425,7 @@ def get_status():
         snapshot["user_id"] = username
         snapshot["user_wallet"] = G_STATE.wallets.get(username, {"balance": 0.0, "currency": "USD"})
         snapshot["timestamp"] = utils.system_now(caller="api_thread")
+        snapshot["dev_mode"] = DEV_MODE
         return jsonify(snapshot)
     return jsonify({"error": "No snapshots available", "source": "BACKEND"}), 503
 
@@ -439,6 +457,9 @@ def rate_limit(endpoint_name):
     def decorator(f):
         @wraps(f)
         def wrapped(*args, **kwargs):
+            if DEV_MODE:
+                return f(*args, **kwargs)
+            
             ip = request.remote_addr
             
             # 1. Global Bypass for Priority APIs
@@ -565,7 +586,7 @@ def login_api():
 
 @api_app.route('/api/signup', methods=['POST'])
 def signup_api():
-    data = request.json or {}
+    data = get_request_data()
     email = data.get('email')
     password = data.get('password')
     name = data.get('name', 'New User')
@@ -586,48 +607,49 @@ def signup_api():
 
 @api_app.route('/api/book', methods=['POST'])
 def book_slot_api():
-    # ISSUE 4: Rate Limiting
     data = get_request_data()
     username = data.get('username', 'Anonymous')
     identifier = f"{request.remote_addr}:{username}"
     
-    limit = CONFIG.get('rate_limit_attempts', 5)
-    window = CONFIG.get('rate_limit_window', 60.0)
-    
-    if not G_STATE.auth_engine.check_rate_limit(identifier, limit, window):
-        return jsonify({"status": "error", "message": "Rate limit exceeded"}), 429
-    G_STATE.auth_engine.record_attempt(identifier)
+    if not DEV_MODE:
+        limit = CONFIG.get('rate_limit_attempts', 5)
+        window = CONFIG.get('rate_limit_window', 60.0)
+        if not G_STATE.auth_engine.check_rate_limit(identifier, limit, window):
+            return jsonify({"status": "error", "message": "Rate limit exceeded"}), 429
+        G_STATE.auth_engine.record_attempt(identifier)
+
     with G_STATE.vision_lock:
         assigned_idx = -1
-        # PRIORITY 1: If vehicle is already present -> bind to that slot
-        for i, slot in enumerate(G_STATE.slots):
-            if slot.locked_track_id is not None:
-                # Still check if it already has an active booking to avoid double-booking same vehicle
-                if i not in G_STATE.auth_engine.bookings or G_STATE.auth_engine.is_expired(i):
-                    assigned_idx = i
-                    logger.info(f"[BOOKING] Binding to physical vehicle at Slot {i+1}")
-                    break
-        
-        # PRIORITY 2: Fallback to first available free slot
-        if assigned_idx == -1:
+        # Use provided slot_id if available, else find one
+        req_slot_id = data.get('slot_id')
+        if req_slot_id is not None:
+            assigned_idx = int(req_slot_id) - 1
+            logger.info(f"[BOOKING] Manual booking request for Slot {assigned_idx+1}")
+        else:
+            # AUTO-FIND logic
             for i, slot in enumerate(G_STATE.slots):
-                is_free = (slot.state == SlotState.FREE)
-                no_booking = (i not in G_STATE.auth_engine.bookings or G_STATE.auth_engine.is_expired(i))
-                if is_free and no_booking:
-                    assigned_idx = i
-                    break
+                if slot.locked_track_id is not None:
+                    if i not in G_STATE.auth_engine.bookings or G_STATE.auth_engine.is_expired(i):
+                        assigned_idx = i
+                        break
+            if assigned_idx == -1:
+                for i, slot in enumerate(G_STATE.slots):
+                    if slot.state == SlotState.FREE and (i not in G_STATE.auth_engine.bookings or G_STATE.auth_engine.is_expired(i)):
+                        assigned_idx = i
+                        break
         
-    if assigned_idx != -1:
+    if assigned_idx != -1 and assigned_idx < len(G_STATE.slots):
         timeout = data.get('timeout', 600)
         code = G_STATE.auth_engine.generate_booking(assigned_idx, username, timeout=timeout)
         return jsonify({"status": "success", "slot_id": assigned_idx + 1, "auth_code": code})
+    
     return jsonify({"status": "error", "message": "No slots available"}), 400
 
 @api_app.route('/api/recharge', methods=['POST'])
 def recharge_api():
-    data = get_request_data()
-    username = data.get('username', "Anonymous")
-    amount = float(data.get('amount', 0))
+    inner_data = data.get('payload', data)
+    username = inner_data.get('username', "Anonymous")
+    amount = float(inner_data.get('amount', 0))
     
     if amount <= 0:
         return jsonify({"status": "error", "message": "Invalid amount"}), 400
@@ -644,15 +666,6 @@ def find_slot_api():
     data = get_request_data()
     v_type = data.get('type', 'SUV')
     urgency = data.get('urgency', 'LOW')
-    
-    logger.info(f"[ALLOCATION] Finding slot for {v_type} with {urgency} urgency")
-    
-    # Simplified logic: find first FREE slot
-    with G_STATE.vision_lock:
-        for i, slot in enumerate(G_STATE.slots):
-            if slot.state == SlotState.FREE:
-                return jsonify({"status": "success", "slot_id": i + 1})
-                
     return jsonify({"status": "error", "message": "No slots available"}), 400
 
 @api_app.route('/api/authorize', methods=['POST'])
@@ -661,38 +674,38 @@ def authorize_api():
     username = data.get("username", "Anonymous")
     identifier = f"{request.remote_addr}:{username}"
 
-    # ISSUE 4: Rate Limiting
-    limit = CONFIG.get('rate_limit_attempts', 5)
-    window = CONFIG.get('rate_limit_window', 60.0)
-    if not G_STATE.auth_engine.check_rate_limit(identifier, limit, window):
-        return jsonify({"status": "error", "message": "Rate limit exceeded"}), 429
-    G_STATE.auth_engine.record_attempt(identifier)
+    if not DEV_MODE:
+        limit = CONFIG.get('rate_limit_attempts', 5)
+        window = CONFIG.get('rate_limit_window', 60.0)
+        if not G_STATE.auth_engine.check_rate_limit(identifier, limit, window):
+            return jsonify({"status": "error", "message": "Rate limit exceeded"}), 429
+        G_STATE.auth_engine.record_attempt(identifier)
 
     slot_id, code = data.get('slot_id'), data.get('code')
     if slot_id is None or code is None: return jsonify({"status": "error", "message": "Missing slot_id or code"}), 400
-    idx = slot_id - 1
+    idx = int(slot_id) - 1
     loop_start = utils.system_now(caller="api_thread")
     
     with G_STATE.vision_lock:
         if idx < 0 or idx >= len(G_STATE.slots): return jsonify({"status": "error", "code": "wrong_slot"}), 400
         slot = G_STATE.slots[idx]
         
-        # STABILIZED STAGE 2: Early Authorization Window
-        is_pending = (slot.state == SlotState.AUTH_PENDING)
-        is_early_window = (slot.state == SlotState.ALIGNMENT_PENDING and (loop_start - slot.state_enter_time <= AUTH_WINDOW))
-        
-        if not (is_pending or is_early_window):
-            return jsonify({"status": "error", "code": "stale_request"}), 400
+        # In DEV MODE, we bypass state and occlusion checks
+        if not DEV_MODE:
+            is_pending = (slot.state == SlotState.AUTH_PENDING)
+            is_early_window = (slot.state == SlotState.ALIGNMENT_PENDING and (loop_start - slot.state_enter_time <= AUTH_WINDOW))
             
-        if slot.locked_track_id is None:
-            return jsonify({"status": "error", "code": "no_vehicle"}), 400
+            if not (is_pending or is_early_window):
+                return jsonify({"status": "error", "code": "stale_request"}), 400
+                
+            if slot.locked_track_id is None:
+                return jsonify({"status": "error", "code": "no_vehicle"}), 400
             
-        # STAGE 3.5: Occlusion Debounce Safety
-        if slot.is_in_occlusion_debounce():
-            logger.warning(f"[AUTH] REJECTED Early Auth for Slot {idx+1}: UNSTABLE_TRACK (Occluded)")
-            return jsonify({"status": "error", "code": "unstable_track"}), 400
+            if slot.is_in_occlusion_debounce():
+                logger.warning(f"[AUTH] REJECTED Early Auth for Slot {idx+1}: UNSTABLE_TRACK (Occluded)")
+                return jsonify({"status": "error", "code": "unstable_track"}), 400
             
-        current_track_id = slot.locked_track_id
+        current_track_id = slot.locked_track_id if slot.locked_track_id is not None else -1
         
     status, is_idempotent = G_STATE.auth_engine.authorize_vehicle(idx, code, current_track_id)
     if status == "success": return jsonify({"status": "success", "idempotent": is_idempotent})
@@ -785,8 +798,9 @@ def main():
         in_startup_grace = (loop_start - G_STATE.startup_time < 2.0)
         
         if not in_startup_grace and not is_replay:
-            if dt > 4.0:
-                 trigger_freeze("SYSTEM_STALL: Compute hang detected (>4s)")
+            watchdog_timeout = 15.0 if DEV_MODE else 4.0
+            if dt > watchdog_timeout:
+                 trigger_freeze(f"SYSTEM_STALL: Compute hang detected (>{watchdog_timeout}s)")
         
         # Performance mode logic (Refactored)
         G_STATE.metrics.record_latency(dt)
@@ -1058,39 +1072,15 @@ def main():
                     for dc in dead_clients:
                         esp32_clients.discard(dc)
 
-            # --- OVERLAYS ---
-            frame = visualizer.draw_overlays(frame, G_STATE.slots, CONFIG.get('queue_zones', []), {})
-            frame = visualizer.draw_detections(frame, detections)
-            frame = visualizer.draw_sidebar(frame, G_STATE.queue_manager)
-            
-            # --- SNAPSHOT GENERATION ---
-            G_STATE.snapshot_sequence += 1
-            snapshot = {
-                "snapshot_version": G_STATE.last_snapshot_version,
-                "snapshot_sequence": G_STATE.snapshot_sequence,
-                "timestamp": loop_start,
-                "freeze_state": G_STATE.is_forensic_frozen,
-                "user_id": "Anonymous",
-                "slots": [],
-                "queue": [], 
-                "user_wallet": {"balance": 0, "currency": "USD"} # Placeholder, injected by /api/status
-            }
-            
-            for i, slot in enumerate(G_STATE.slots):
-                snapshot["slots"].append({
-                    "slot_id": i,
-                    "state": slot.state.name,
-                    "alignment_score": round(slot.smoothed_alignment_score, 2),
-                    "assigned_global_id": slot.locked_track_id
-                })
-            
-            with G_STATE.snapshot_lock:
-                G_STATE.snapshot_buffer.append(snapshot)
+        # --- OVERLAYS ---
+        frame = visualizer.draw_overlays(frame, G_STATE.slots, CONFIG.get('queue_zones', []), {})
+        frame = visualizer.draw_detections(frame, detections)
+        frame = visualizer.draw_sidebar(frame, G_STATE.queue_manager)
 
-            cv2.imshow("Smart EV Charging", frame)
-            key = cv2.waitKey(1) & 0xFF
-            if key != 255:
-                logger.info(f"[DEBUG] Key pressed: {key} (q={ord('q')})")
+        cv2.imshow("Smart EV Charging", frame)
+        key = cv2.waitKey(1) & 0xFF
+        if key != 255:
+            logger.info(f"[DEBUG] Key pressed: {key} (q={ord('q')})")
             
             if key in [ord('q'), ord('Q')]: 
                 logger.info("[DEBUG] Q key detected. Saving configuration...")

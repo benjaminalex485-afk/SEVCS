@@ -43,10 +43,18 @@ export function initSystemUI() {
         else if (healthScore > 40) healthLabel = 'DEGRADED';
         
         healthIndicator.className = `health-indicator ${healthLabel.toLowerCase()}`;
-        healthIndicator.innerText = `HEALTH: ${healthLabel} (${healthScore}%)`;
+        if (state.snapshot?.dev_mode) {
+            healthIndicator.innerText = `[DEV MODE] HEALTH: ${healthLabel}`;
+            healthIndicator.style.border = '2px solid #ffaa00';
+            healthIndicator.style.color = '#ffaa00';
+        } else {
+            healthIndicator.innerText = `HEALTH: ${healthLabel} (${healthScore}%)`;
+            healthIndicator.style.border = '';
+            healthIndicator.style.color = '';
+        }
 
         // 3. Mode Toggle Protection & Styling
-        const canSwitch = state.displayState === 'SYNCHRONIZED';
+        const canSwitch = state.displayState === 'SYNCHRONIZED' || state.snapshot?.dev_mode === true;
         btnAdmin.disabled = !canSwitch;
         btnUser.disabled = !canSwitch;
         btnAdmin.className = `btn-toggle ${state.uiMode === 'ADMIN' ? 'active' : ''}`;
@@ -98,6 +106,7 @@ export function initSystemUI() {
                     ${snapshot ? `
                         <div class="mono">
                             <p>Mode: <span style="color: var(--accent-blue)">${snapshot.system_mode}</span></p>
+                            ${snapshot.dev_mode ? '<p style="color: #ffaa00; font-weight: bold;">[DEV MODE ACTIVE]</p>' : ''}
                             <p>Health: ${snapshot.system_health}%</p>
                             <p>Sync Score: ${state.healthScore}%</p>
                             <p>Stable: ${state.stableFrames}/10</p>

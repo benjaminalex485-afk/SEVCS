@@ -67,8 +67,8 @@ export function initUserUI() {
             const btn = e.target.closest('.btn-charge, #btn-recharge, #btn-find-slot');
             if (!btn) return;
             
-            console.log('[USER UI] Click detected on:', btn.id || btn.className);
-            // alert(`CLICKED: ${btn.id || btn.className}`);
+            console.log('[USER UI] Click detected on:', btn.id || btn.className, 'Action:', btn.dataset.action, 'Slot:', btn.dataset.slotId);
+            console.log('[USER UI] Current appState.allowActions:', appState.allowActions);
             
             // Reduced Strictness: Only warn, don't block
             if (!appState.allowActions && !btn.id?.includes('recharge')) {
@@ -96,10 +96,11 @@ export function initUserUI() {
                 update(appState);
                 try {
                     const res = await executeAction('book', { slot_id: slotId, username: appState.session.userId });
-                    if (res.status === 'success') {
-                        alert(`Slot ${slotId} Booked! Auth Code: ${res.auth_code}\nKeep this code to authorize your session.`);
+                    console.log('[USER UI] Book Response:', res);
+                    if (res?.status === 'success') {
+                        alert(`Slot ${slotId} Booked! Code: ${res.auth_code}`);
                     } else {
-                        alert(`Booking Failed: ${res.message}`);
+                        alert(`Booking Failed: ${res?.error || 'Unknown Error'}`);
                     }
                 } catch (err) {
                     alert(`Network Error: ${err.message}`);
@@ -117,10 +118,11 @@ export function initUserUI() {
                             code: code,
                             username: appState.session.userId 
                         });
-                        if (res.status === 'success') {
-                            alert(`Authorization Successful! Charging will begin.`);
+                        console.log('[USER UI] Authorize Response:', res);
+                        if (res?.status === 'success') {
+                            alert('Authorized Successfully!');
                         } else {
-                            alert(`Auth Failed: ${res.message}`);
+                            alert(`Authorization Failed: ${res?.error || res?.code || 'Invalid Code'}`);
                         }
                     } catch (err) {
                         alert(`Error: ${err.message}`);

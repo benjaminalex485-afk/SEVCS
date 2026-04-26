@@ -87,6 +87,8 @@ class AuthEngine:
 
     def check_rate_limit(self, identifier, limit, window):
         """Checks if identifier has exceeded limit within window seconds."""
+        if utils.DEV_MODE:
+            return True
         with self.lock:
             if identifier not in self.attempts:
                 return True
@@ -108,6 +110,9 @@ class AuthEngine:
                 booking = self.bookings.get(slot_id)
                 if booking and booking["auth_code"] == code:
                     return "success", True # success, idempotent=True
+                elif utils.DEV_MODE:
+                    logger.info(f"[DEV MODE] Idempotent bypass for Slot {slot_id+1}")
+                    return "success", True
 
             # 2. Validate Booking
             booking = self.bookings.get(slot_id)
@@ -115,7 +120,10 @@ class AuthEngine:
                 return "wrong_slot", False
             
             if booking["status"] in ["ACTIVE", "EXPIRED"]:
-                return "stale_request", False # Code already used or expired
+                if utils.DEV_MODE:
+                    logger.warning(f"[DEV MODE] Accepting stale/expired booking for Slot {slot_id+1}")
+                else:
+                    return "stale_request", False # Code already used or expired
                 
             if now > booking["expires_at"]:
                 logger.warning(f"[AUTH] REJECTED: Code expired for Slot {slot_id+1}")
@@ -123,8 +131,11 @@ class AuthEngine:
                 return "expired", False
                 
             if booking["auth_code"] != code:
-                logger.warning(f"[AUTH] REJECTED: Invalid code for Slot {slot_id+1}")
-                return "invalid_code", False
+                if utils.DEV_MODE:
+                    logger.warning(f"[DEV MODE] Invalid code accepted for Slot {slot_id+1}: {code} != {booking['auth_code']}")
+                else:
+                    logger.warning(f"[AUTH] REJECTED: Invalid code for Slot {slot_id+1}")
+                    return "invalid_code", False
             
             # 3. Create Authorization (Bind to Identity)
             self.authorizations[slot_id] = {

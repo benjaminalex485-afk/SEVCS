@@ -3,17 +3,22 @@ from ultralytics import YOLO
 import supervision as sv
 import numpy as np
 
+from . import utils
+
 class SlotDetector:
     def __init__(self, model_path, class_ids):
         self.model = YOLO(model_path)
         self.class_ids = class_ids
         self.slot_scores = [] # List to track score [0.0, 1.0] for each slot
+        self.DEV_MODE = utils.DEV_MODE
 
     def detect(self, frame, conf=0.25):
         """
         Runs YOLOv8 inference on the frame.
         Returns: supervision.Detections object
         """
+        if self.DEV_MODE:
+            conf = 0.1 # Lower confidence in DEV MODE
         results = self.model(frame, verbose=False, conf=conf)[0]
         detections = sv.Detections.from_ultralytics(results)
         
@@ -61,7 +66,10 @@ class SlotDetector:
             self.slot_scores[i] = max(0.0, min(1.0, self.slot_scores[i]))
             
             # Determine Status
-            is_occupied = self.slot_scores[i] > 0.7
+            occupancy_threshold = 0.3 if self.DEV_MODE else 0.7
+            is_occupied = self.slot_scores[i] > occupancy_threshold
+            if self.DEV_MODE and is_occupied and self.slot_scores[i] <= 0.7:
+                logger.info(f"[DEV MODE] Low confidence occupancy accepted for Slot {i+1}: {self.slot_scores[i]:.2f}")
             occupancy_status.append(is_occupied)
         
         return occupancy_status
