@@ -248,6 +248,7 @@ export function setLatestSnapshot(data, latency) {
 
     // 10. Frame Isolation
     latestIncomingSnapshot = safeClone({ ...normalized, timestamp, arrivalTimestamp: Date.now() });
+    appState.lastSnapshotMono = performance.now(); // 🔥 HEARTBEAT: Update timer on ANY valid arrival
 
     // Desync Early Detection (Monotonicity Guard)
     if (appState.snapshot && normalized.snapshot_sequence > appState.lastSequence + 1) {

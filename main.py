@@ -11,6 +11,7 @@ from flask_cors import CORS
 from scipy.optimize import linear_sum_assignment
 import json
 from flask_sock import Sock
+import yaml
 
 # Professional Package-style Imports
 from src.queue_manager import QueueManager
@@ -21,7 +22,7 @@ from src.visualizer import Visualizer
 from src import utils
 
 # --- SIMULATION CONFIG ---
-USE_FAKE_INPUT = True
+USE_FAKE_INPUT = False
 ACTIVE_SCENARIO = os.getenv("SEVCS_SCENARIO", "stage2_happy_path")
 
 if USE_FAKE_INPUT:
@@ -44,7 +45,7 @@ ALIGN_THRESHOLD = 0.75
 AUTH_WINDOW = 1.0 # Early authorization window to eliminate API race conditions
 STRICT_MODE = CONFIG.get("strict_mode", False)
 # Freeze configuration after initial load and validation
-CONFIG = utils.freeze_config(CONFIG)
+# CONFIG = utils.freeze_config(CONFIG)
 
 # --- LOGGING CONFIG ---
 logging.basicConfig(
@@ -69,9 +70,9 @@ class GlobalState:
         self.last_vision_heartbeat = 0
         
         # Concurrency
-        self.vision_lock = threading.Lock()
-        self.session_lock = threading.Lock()
-        self.queue_lock = threading.Lock()
+        self.vision_lock = threading.RLock()
+        self.session_lock = threading.RLock()
+        self.queue_lock = threading.RLock()
         
         # Stage 4.1/4.2 Industrial Layer
         self.mode = SystemMode.FULL
@@ -94,7 +95,7 @@ class GlobalState:
         self.overflow_start_time = 0.0
         
         # Locks
-        self.snapshot_lock = threading.Lock()
+        self.snapshot_lock = threading.RLock()
         
         # Authentication
         self.auth_engine = AuthEngine()
@@ -106,6 +107,10 @@ class GlobalState:
         ]
 
 G_STATE = GlobalState()
+
+# --- API SERVER ---
+api_app = Flask(__name__)
+CORS(api_app)
 
 # --- WEBSOCKET LAYER ---
 sock = Sock(api_app)
@@ -137,6 +142,51 @@ def release_lock(name, lock):
     if CONFIG.get("debug_locks", False):
         logger.debug(f"[LOCK] Releasing {name}")
     lock.release()
+
+# --- INTERACTIVE CALIBRATION ---
+INTERACTIVE_POINTS = []
+INTERACTIVE_MODE = None # 'SLOT', 'QUEUE', None
+
+def on_mouse(event, x, y, flags, param):
+    global INTERACTIVE_POINTS
+    if event == cv2.EVENT_LBUTTONDOWN:
+        INTERACTIVE_POINTS.append([x, y])
+        logger.info(f"[CALIB] Point added: ({x}, {y})")
+
+def calibrate_zones(frame, mode='SLOT'):
+    """Dedicated window for calibration as per user request."""
+    global INTERACTIVE_POINTS
+    INTERACTIVE_POINTS = []
+    window_name = f"CALIBRATION - {mode}"
+    cv2.namedWindow(window_name)
+    cv2.setMouseCallback(window_name, on_mouse)
+    
+    logger.info(f"[CALIB] Starting {mode} calibration. Click points, then press 'ENTER' to save or 'ESC' to cancel.")
+    
+    while True:
+        display = frame.copy()
+        # Draw instructions
+        cv2.putText(display, f"MODE: {mode} | Points: {len(INTERACTIVE_POINTS)}", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        cv2.putText(display, "Click points, then ENTER to Save, ESC to Cancel", (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        
+        for pt in INTERACTIVE_POINTS:
+            cv2.circle(display, tuple(pt), 5, (0, 0, 255), -1)
+        if len(INTERACTIVE_POINTS) >= 2:
+            cv2.polylines(display, [np.array(INTERACTIVE_POINTS, np.int32)], mode == 'SLOT' and len(INTERACTIVE_POINTS) >= 4, (0, 255, 255), 2)
+            
+        cv2.imshow(window_name, display)
+        key = cv2.waitKey(30) & 0xFF
+        if key == 13: # ENTER
+            if len(INTERACTIVE_POINTS) >= 3:
+                break
+            else:
+                logger.warning("[CALIB] Need at least 3 points to save.")
+        elif key == 27: # ESC
+            INTERACTIVE_POINTS = []
+            break
+            
+    cv2.destroyWindow(window_name)
+    return INTERACTIVE_POINTS
 
 def trigger_freeze(reason):
     """Idempotent freeze trigger with priority and diagnostic logging."""
@@ -225,7 +275,11 @@ def get_system_snapshot(frame_id, frame_time, debug=True):
             "slots": [s.to_dict() for s in local_slots],
             "internal_state": local_internal,
             "schema_version": G_STATE.schema_version,
-            "scope": {"node_id": "node_1", "camera_id": "cam_1"}
+            "scope": {"node_id": "node_1", "camera_id": "cam_1"},
+            "source": "BACKEND",
+            "timestamp": utils.system_now(caller="main_loop"),
+            "system_health": float(G_STATE.queue_manager.system_health) if G_STATE.queue_manager else 1.0,
+            "system_mode": local_mode.name
         }
         
         # --- 3. FULL-CYCLE SANITY GATE (Dump -> Load -> Normalize -> Validate) ---
@@ -260,7 +314,8 @@ def get_system_snapshot(frame_id, frame_time, debug=True):
                 "SAFE",
                 "IDLE",
                 "INIT",
-                "SOFT_SAFE"
+                "SOFT_SAFE",
+                "FULL"
             }
 
             if mode not in ALLOWED_EMPTY_QUEUE_MODES:
@@ -295,15 +350,24 @@ def get_system_snapshot(frame_id, frame_time, debug=True):
         trigger_freeze(f"SNAPSHOT_PIPELINE_ERROR: {type(e).__name__}")
         return None
 
-# --- API SERVER ---
-api_app = Flask(__name__)
-CORS(api_app)
+        return None
 
+def get_request_data():
+    """Helper to handle the wrapped 'payload' from api_v3.js."""
+    data = request.json or {}
+    if "payload" in data:
+        return data["payload"]
+    return data
+
+# --- API SERVER ---
 @api_app.route('/api/status', methods=['GET'])
 def get_status():
     if G_STATE.snapshot_buffer:
-        return jsonify(copy.deepcopy(G_STATE.snapshot_buffer[-1]))
-    return jsonify({"error": "No snapshots available"}), 503
+        snapshot = copy.deepcopy(G_STATE.snapshot_buffer[-1])
+        # Ensure latest timestamp for UI freshness check
+        snapshot["timestamp"] = utils.system_now(caller="api_thread")
+        return jsonify(snapshot)
+    return jsonify({"error": "No snapshots available", "source": "BACKEND"}), 503
 
 # --- OPERATIONAL SAFETY: RATE LIMITING ---
 class TokenBucket:
@@ -438,10 +502,50 @@ def get_slots_api():
             })
         return jsonify({"slots": data})
 
+@api_app.route('/api/login', methods=['POST'])
+def login_api():
+    data = get_request_data()
+    username = data.get('email') or data.get('username')
+    password = data.get('password')
+    logger.info(f"[API] Login attempt for: {username}")
+    for user in G_STATE.users_db:
+        if user['username'] == username and user['password'] == password:
+            logger.info(f"[API] Login SUCCESS for: {username} ({user['role']})")
+            return jsonify({
+                "status": "success", 
+                "token": "dummy-token-123", 
+                "user_id": username,
+                "role": user['role'].upper(),
+                "success": True
+            })
+    logger.warning(f"[API] Login FAILED for: {username}")
+    return jsonify({"status": "error", "message": "Invalid credentials", "success": False}), 401
+
+@api_app.route('/api/signup', methods=['POST'])
+def signup_api():
+    data = request.json or {}
+    email = data.get('email')
+    password = data.get('password')
+    name = data.get('name', 'New User')
+    
+    if not email or not password:
+        return jsonify({"status": "error", "message": "Missing email or password"}), 400
+    
+    # Check if user already exists
+    for user in G_STATE.users_db:
+        if user['username'] == email:
+            return jsonify({"status": "error", "message": "User already exists"}), 400
+            
+    # Add to in-memory DB
+    new_user = {"username": email, "password": password, "role": "user", "name": name}
+    G_STATE.users_db.append(new_user)
+    logger.info(f"[API] New user registered: {email}")
+    return jsonify({"status": "success", "message": "Account created successfully", "success": True})
+
 @api_app.route('/api/book', methods=['POST'])
 def book_slot_api():
     # ISSUE 4: Rate Limiting
-    data = request.json or {}
+    data = get_request_data()
     username = data.get('username', 'Anonymous')
     identifier = f"{request.remote_addr}:{username}"
     
@@ -479,7 +583,7 @@ def book_slot_api():
 
 @api_app.route('/api/authorize', methods=['POST'])
 def authorize_api():
-    data = request.json or {}
+    data = get_request_data()
     username = data.get("username", "Anonymous")
     identifier = f"{request.remote_addr}:{username}"
 
@@ -520,6 +624,17 @@ def authorize_api():
     if status == "success": return jsonify({"status": "success", "idempotent": is_idempotent})
     return jsonify({"status": "error", "code": status}), 400
 
+# --- WEB UI SERVER ---
+@api_app.route('/')
+def serve_index():
+    return send_from_directory('ui', 'index.html')
+
+@api_app.route('/<path:path>')
+def serve_static(path):
+    if path.startswith('api/'):
+        return jsonify({"error": "API route not found"}), 404
+    return send_from_directory('ui', path)
+
 def run_api():
     api_app.run(host='0.0.0.0', port=5001, debug=False, threaded=True)
 
@@ -550,12 +665,23 @@ def main():
     threading.Thread(target=run_api, daemon=True).start()
     threading.Thread(target=charging_simulation_loop, daemon=True).start()
     
-    cap = None if USE_FAKE_INPUT else cv2.VideoCapture(CONFIG.get('camera_index', 0))
-    resolution_wh = (1280, 720)
-    max_diag = np.linalg.norm(resolution_wh)
-    track_ages = {}
-    
     logger.info(f"System Ready. Mode: {'FAKE' if USE_FAKE_INPUT else 'REAL'} | Scenario: {ACTIVE_SCENARIO if USE_FAKE_INPUT else 'N/A'}")
+    
+    if not USE_FAKE_INPUT:
+        cam_idx = CONFIG.get('camera_index', 0)
+        logger.info(f"[CAMERA] Attempting to open camera at index: {cam_idx} (DSHOW)")
+        cap = cv2.VideoCapture(cam_idx, cv2.CAP_DSHOW)
+        if not cap.isOpened():
+            logger.error(f"[CAMERA] Failed to open camera at index {cam_idx}. Falling back to index 0.")
+            cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+            if not cap.isOpened():
+                logger.critical("[CAMERA] No cameras available. Exiting.")
+                return
+        logger.info("[CAMERA] Camera opened successfully.")
+        cv2.namedWindow("Smart EV Charging")
+        cv2.setMouseCallback("Smart EV Charging", on_mouse)
+    else:
+        cap = None
     
     REPLAY_MODE = CONFIG.get("replay_mode", False)
     if REPLAY_MODE:
@@ -572,6 +698,8 @@ def main():
     # --- CONSECUTIVE COUNTERS ---
     consecutive_overflow = 0
     overflow_start_frame_time = 0.0
+    track_ages = {}
+    STRICT_MODE = CONFIG.get('strict_mode', False)
     while True:
         frame_id += 1
         loop_start = utils.system_now(caller="main_loop")
@@ -640,14 +768,36 @@ def main():
             detections = engine.get_detections()
             if engine.is_complete(): engine.reset()
         else:
+            # 1. Grab Frame
+            t0 = time.time()
             ret, frame = cap.read()
-            if not ret: break
-            detections = tracker.update_with_detections(detector.detect(frame, conf=0.15))
+            if not ret:
+                logger.error("[CAMERA] Failed to grab frame. Reconnecting...")
+                cap.release()
+                time.sleep(1.0)
+                cap = cv2.VideoCapture(CONFIG.get('camera_index', 1), cv2.CAP_DSHOW)
+                continue
+            t_grab = time.time() - t0
+            
+            # 2. Detect (AI)
+            try:
+                t1 = time.time()
+                detections = tracker.update_with_detections(detector.detect(frame, conf=0.15))
+                t_detect = time.time() - t1
+            except Exception as e:
+                logger.error(f"[VISION] Detection error: {e}")
+                detections = sv.Detections.empty()
+                t_detect = 0
+                
+            if frame_id % 30 == 0:
+                logger.info(f"[PERF] Frame {frame_id}: Grab {t_grab:.3f}s | Detect {t_detect:.3f}s")
         
         # --- ATOMIC FRAME PROCESSING ---
         with G_STATE.vision_lock:
             G_STATE.last_vision_heartbeat = loop_start
             G_STATE.last_detections = detections
+            resolution_wh = (frame.shape[1], frame.shape[0])
+            max_diag = np.sqrt(resolution_wh[0]**2 + resolution_wh[1]**2)
             current_track_ids = set(detections.tracker_id) if detections.tracker_id is not None else set()
             
             # --- TRACKING PERSISTENCE ---
@@ -796,15 +946,16 @@ def main():
                         trigger_freeze("INTEGRITY_DUPLICATE: Multiple slots assigned same ID")
                     active_ids.add(s.locked_track_id)
             
-            # 2. Periodic Referential Integrity Audit
-            if frame_id % CONFIG.get("integrity_interval", 30) == 0:
-                 validate_referential_integrity(get_system_snapshot(frame_id, loop_start, debug=False))
-            
-        # 2. Snapshot Replay Buffer (End of Loop)
+        # 2. Snapshot Generation (Single Point of Truth)
+        current_snapshot = None
         if not G_STATE.is_forensic_frozen:
-            snapshot = get_system_snapshot(frame_id, loop_start, debug=True)
-            if snapshot:
-                G_STATE.snapshot_buffer.append(snapshot)
+            current_snapshot = get_system_snapshot(frame_id, loop_start, debug=True)
+            if current_snapshot:
+                G_STATE.snapshot_buffer.append(current_snapshot)
+                
+                # 3. Periodic Referential Integrity Audit (Reuse current_snapshot)
+                if frame_id % CONFIG.get("integrity_interval", 30) == 0:
+                    validate_referential_integrity(current_snapshot)
         else:
             # Auto-unfreeze safety (60s)
             if loop_start - G_STATE.freeze_start_time > 60.0:
@@ -834,11 +985,56 @@ def main():
                         esp32_clients.discard(dc)
 
         if not USE_FAKE_INPUT:
+            # --- OVERLAYS ---
             frame = visualizer.draw_overlays(frame, G_STATE.slots, CONFIG.get('queue_zones', []), {})
             frame = visualizer.draw_detections(frame, detections)
             frame = visualizer.draw_sidebar(frame, G_STATE.queue_manager)
+            
+            # Draw Calibration Preview
+            global INTERACTIVE_POINTS, INTERACTIVE_MODE
+            for pt in INTERACTIVE_POINTS:
+                cv2.circle(frame, tuple(pt), 4, (0, 0, 255), -1)
+            if len(INTERACTIVE_POINTS) >= 2:
+                cv2.polylines(frame, [np.array(INTERACTIVE_POINTS)], False, (0, 255, 255), 2)
+
             cv2.imshow("Smart EV Charging", frame)
-            if cv2.waitKey(1) & 0xFF == ord('q'): break
+            key = cv2.waitKey(1) & 0xFF
+            if key != 255:
+                logger.info(f"[DEBUG] Key pressed: {key} (q={ord('q')})")
+            
+            if key in [ord('q'), ord('Q')]: 
+                logger.info("[DEBUG] Q key detected. Saving configuration...")
+                try:
+                    CONFIG_TO_SAVE = copy.deepcopy(CONFIG)
+                    CONFIG_TO_SAVE['slots'] = [s.polygon.tolist() for s in G_STATE.slots]
+                    with open("config.yaml", 'w') as f:
+                        yaml.dump(CONFIG_TO_SAVE, f)
+                    logger.info("[CONFIG] Successfully saved calibration to config.yaml")
+                except Exception as e:
+                    logger.error(f"[CONFIG] Save failed: {e}")
+                
+                logger.info("[SYSTEM] Quitting...")
+                break
+            elif key == ord('s'):
+                pts = calibrate_zones(frame, mode='SLOT')
+                if len(pts) >= 3:
+                    new_slot = Slot(len(G_STATE.slots), np.array(pts, np.int32))
+                    with G_STATE.vision_lock:
+                        G_STATE.slots.append(new_slot)
+                    logger.info(f"[CALIB] Slot {len(G_STATE.slots)} added and synced.")
+            elif key == ord('z'):
+                pts = calibrate_zones(frame, mode='QUEUE')
+                if len(pts) >= 3:
+                    q_zones = CONFIG.get('queue_zones', [])
+                    q_zones.append(pts)
+                    CONFIG['queue_zones'] = q_zones
+                    logger.info(f"[CALIB] Queue zone added.")
+            elif key == ord('c'):
+                with G_STATE.vision_lock:
+                    G_STATE.slots = []
+                    CONFIG['slots'] = []
+                    CONFIG['queue_zones'] = []
+                logger.info("[CALIB] All zones cleared.")
         else:
             # Already slept at the top of the loop in FAKE mode
             pass

@@ -181,6 +181,7 @@ public:
     static String getSlots();
     static String book(String payload);
     static void taskCallback(void *pvParameters);
+    static void setDataMutex(SemaphoreHandle_t mutex) { dataMutex = mutex; }
 private:
     static String cameraIp;
     static SemaphoreHandle_t dataMutex;
@@ -199,7 +200,6 @@ String CameraClient::lastSlots = "[]";
 
 void CameraClient::init(String ipAddress) { 
     cameraIp = ipAddress; 
-    dataMutex = xSemaphoreCreateMutex();
     // Start background task with 8KB stack and low priority (1)
     xTaskCreate(taskCallback, "cameraTask", 8192, NULL, 1, NULL);
 }
@@ -245,7 +245,7 @@ void CameraClient::taskCallback(void *pvParameters) {
             http.end();
 
             // Update shared data state under mutex
-            if (xSemaphoreTake(dataMutex, portMAX_DELAY)) {
+            if (dataMutex != NULL && xSemaphoreTake(dataMutex, portMAX_DELAY)) {
                 online = newOnline;
                 state = newState;
                 lastSummary = newSummary;
@@ -258,13 +258,13 @@ void CameraClient::taskCallback(void *pvParameters) {
 }
 
 String CameraClient::getSummary() { 
-    String res;
-    if (xSemaphoreTake(dataMutex, portMAX_DELAY)) { res = lastSummary; xSemaphoreGive(dataMutex); }
+    String res = "{}";
+    if (dataMutex != NULL && xSemaphoreTake(dataMutex, portMAX_DELAY)) { res = lastSummary; xSemaphoreGive(dataMutex); }
     return res;
 }
 String CameraClient::getSlots() { 
-    String res;
-    if (xSemaphoreTake(dataMutex, portMAX_DELAY)) { res = lastSlots; xSemaphoreGive(dataMutex); }
+    String res = "[]";
+    if (dataMutex != NULL && xSemaphoreTake(dataMutex, portMAX_DELAY)) { res = lastSlots; xSemaphoreGive(dataMutex); }
     return res;
 }
 String CameraClient::book(String payload) {
@@ -288,13 +288,13 @@ bool CameraClient::stopDetection() {
     int code = http.POST(""); http.end(); return code == 200;
 }
 bool CameraClient::isOnline() { 
-    bool res;
-    if (xSemaphoreTake(dataMutex, portMAX_DELAY)) { res = online; xSemaphoreGive(dataMutex); }
+    bool res = false;
+    if (dataMutex != NULL && xSemaphoreTake(dataMutex, portMAX_DELAY)) { res = online; xSemaphoreGive(dataMutex); }
     return res;
 }
 String CameraClient::getState() { 
-    String res;
-    if (xSemaphoreTake(dataMutex, portMAX_DELAY)) { res = state; xSemaphoreGive(dataMutex); }
+    String res = "offline";
+    if (dataMutex != NULL && xSemaphoreTake(dataMutex, portMAX_DELAY)) { res = state; xSemaphoreGive(dataMutex); }
     return res;
 }
 
@@ -651,19 +651,28 @@ void WebServerManager::handleNotFound() {
 // MAIN SETUP AND LOOP
 // ==========================================
 void setup() {
+    CameraClient::setDataMutex(xSemaphoreCreateMutex());
     Serial.begin(115200);
     delay(1000);
     Serial.println("\n--- EV Charging Station Simulator Booting ---");
 
+    Serial.println("Initializing LittleFS...");
     if(!LittleFS.begin(true)){ Serial.println("LittleFS Error"); return; }
 
+    Serial.println("Initializing Logger...");
     LocalLogger::init();
+    Serial.println("Initializing Auth...");
     AuthManager::init(); 
     
+    Serial.println("Initializing Controller...");
     ChargingController::init(16.0); // Default 16A limit
+    Serial.println("Initializing WiFi...");
+    WiFiManager::initAP();
+
+    Serial.println("Initializing Camera Client...");
     CameraClient::init("192.168.4.2");
 
-    WiFiManager::initAP();
+    Serial.println("Initializing Web Server...");
     WebServerManager::init();
 
     Serial.println("System Initialized. AP IP: 192.168.4.1");

@@ -77,7 +77,7 @@ class QueueManager:
             "thrash_rate": float(self.thrash_rate)
         }
 
-    def _update_system_health(self, has_anomaly, dt):
+    def _update_system_health(self, has_anomaly, dt, now):
         """Asymmetric health: fast drop, slow recovery with accelerated jump."""
         if has_anomaly:
             self.system_health = max(0.0, self.system_health - 0.2)
@@ -251,7 +251,7 @@ class QueueManager:
             return
         
         # 1. Update System Health & Mode Awareness
-        self._update_system_health(self.has_recent_anomaly, dt)
+        self._update_system_health(self.has_recent_anomaly, dt, now)
         
         # Filter Suggestable Slots
         suggestable_slots = [

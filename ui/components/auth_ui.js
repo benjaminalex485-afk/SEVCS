@@ -98,7 +98,7 @@ export function renderAuthUI() {
                 ` : ''}
                 <div class="input-group">
                     <label>Email Address</label>
-                    <input type="email" id="email" placeholder="user@example.com" required>
+                    <input type="text" id="email" placeholder="user@example.com" required>
                 </div>
                 <div class="input-group">
                     <label>Password</label>

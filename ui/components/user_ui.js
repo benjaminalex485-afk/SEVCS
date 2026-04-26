@@ -86,12 +86,17 @@ export function initUserUI() {
                             <div class="slot-item ${slot.state.toLowerCase()}">
                                 <div class="slot-info">
                                     <span class="slot-label">Slot ${slot.slot_id}</span>
-                                    <span class="slot-status">${slot.state}</span>
+                                    <span class="slot-status ${slot.state === 'AUTH_PENDING' ? 'status-pulse' : ''}">${slot.state}</span>
                                 </div>
                                 ${slot.state === 'FREE' ? `
-                                    <button class="btn-charge" data-slot-id="${slot.slot_id}"
+                                    <button class="btn-charge" data-action="book" data-slot-id="${slot.slot_id}"
                                         ${!appState.allowActions || appState.pendingIntents.has(`book_slot_${slot.slot_id}`) ? 'disabled' : ''}>
                                         ${appState.pendingIntents.get(`book_slot_${slot.slot_id}`)?.status === 'PENDING' ? '...' : 'Charge'}
+                                    </button>
+                                ` : slot.state === 'AUTH_PENDING' ? `
+                                    <button class="btn-charge btn-auth" data-action="authorize" data-slot-id="${slot.slot_id}"
+                                        ${!appState.allowActions || appState.pendingIntents.has(`auth_slot_${slot.slot_id}`) ? 'disabled' : ''}>
+                                        Authorize
                                     </button>
                                 ` : `
                                     <div class="assigned-user">ID: ${slot.assigned_global_id || '---'}</div>
@@ -136,27 +141,72 @@ export function initUserUI() {
             </div>
         `;
 
-        // Event Listeners
-        document.getElementById('btn-recharge')?.addEventListener('click', () => {
-            executeAction('recharge', { amount: 50 }, 'recharge');
-        });
+        // Event Delegation (Attach once)
+        if (!container.dataset.listenerAttached) {
+            container.addEventListener('click', async (e) => {
+                const btn = e.target.closest('.btn-charge, #btn-recharge, #btn-find-slot');
+                if (!btn) return;
+                
+                if (btn.id === 'btn-recharge') {
+                    executeAction('recharge', { amount: 50 }, 'recharge');
+                    return;
+                }
+                
+                if (btn.id === 'btn-find-slot') {
+                    isLoading = true;
+                    render();
+                    const payload = {
+                        type: document.getElementById('user-vehicle').value,
+                        urgency: document.getElementById('user-urgency').value
+                    };
+                    executeAction('find_slot', payload, 'find_slot');
+                    return;
+                }
 
-        document.querySelectorAll('.btn-charge').forEach(btn => {
-            btn.onclick = () => {
-                const slotId = btn.dataset.slotId;
-                executeAction('book_slot', { slot_id: slotId }, `book_slot_${slotId}`);
-            };
-        });
-
-        document.getElementById('btn-find-slot')?.addEventListener('click', () => {
-            isLoading = true;
-            render();
-            const payload = {
-                type: document.getElementById('user-vehicle').value,
-                urgency: document.getElementById('user-urgency').value
-            };
-            executeAction('find_slot', payload, 'find_slot');
-        });
+                const slotId = parseInt(btn.dataset.slotId);
+                const action = btn.dataset.action;
+                
+                if (action === 'book') {
+                    isLoading = true;
+                    render(appState);
+                    try {
+                        const res = await executeAction('book', { slot_id: slotId, username: appState.session.userId });
+                        if (res.status === 'success') {
+                            alert(`Slot ${slotId} Booked! Auth Code: ${res.auth_code}\nKeep this code to authorize your session.`);
+                        } else {
+                            alert(`Booking Failed: ${res.message}`);
+                        }
+                    } catch (err) {
+                        alert(`Network Error: ${err.message}`);
+                    }
+                    isLoading = false;
+                    render(appState);
+                } else if (action === 'authorize') {
+                    const code = prompt(`Enter Authorization Code for Slot ${slotId}:`);
+                    if (code) {
+                        isLoading = true;
+                        render(appState);
+                        try {
+                            const res = await executeAction('authorize', { 
+                                slot_id: slotId, 
+                                code: code,
+                                username: appState.session.userId 
+                            });
+                            if (res.status === 'success') {
+                                alert(`Authorization Successful! Charging will begin.`);
+                            } else {
+                                alert(`Auth Failed: ${res.message}`);
+                            }
+                        } catch (err) {
+                            alert(`Error: ${err.message}`);
+                        }
+                        isLoading = false;
+                        render(appState);
+                    }
+                }
+            });
+            container.dataset.listenerAttached = "true";
+        }
     }
 
     events.on('ACTION_RESPONSE', (data) => {

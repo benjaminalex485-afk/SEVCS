@@ -153,7 +153,7 @@ class Visualizer:
         cand_y = queue_y + 70
         offset = 0
         for v_id, count in queue_manager.entry_stability.items():
-            if not any(v['id'] == v_id for v in queue_manager.queue):
+            if not any(v.track_id == v_id for v in queue_manager.queue.values()):
                 iy = cand_y + 15 + (offset * 15)
                 cv2.putText(frame, f"Entry ID {v_id}: {count}/5", (sb_x, iy), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (100, 200, 255), 1)
                 offset += 1

@@ -550,4 +550,18 @@ body {
 
 @keyframes spin { to { transform: rotate(360deg); } }
 
+.btn-charge.btn-auth {
+    background: var(--accent-blue);
+}
+
+.status-pulse {
+    animation: status-pulse-anim 2s infinite;
+}
+
+@keyframes status-pulse-anim {
+    0% { opacity: 1; }
+    50% { opacity: 0.5; }
+    100% { opacity: 1; }
+}
+
 .hidden { display: none !important; }
