@@ -115,6 +115,22 @@ function normalizeSnapshot(s) {
         queue: Array.isArray(s.queue) ? s.queue : [],
         user_bookings: Array.isArray(s.user_bookings) ? s.user_bookings : [],
         user_active_sessions: Array.isArray(s.user_active_sessions) ? s.user_active_sessions : [],
+        admin_kpis: s.admin_kpis || {
+            last24h: {
+                total_revenue: 0,
+                total_energy_kwh: 0,
+                session_count: 0,
+                avg_session_value: 0,
+                avg_kwh_per_session: 0
+            },
+            lifetime: {
+                total_revenue: 0,
+                total_energy_kwh: 0,
+                session_count: 0,
+                avg_session_value: 0,
+                avg_kwh_per_session: 0
+            }
+        },
         user_wallet: s.user_wallet || { balance: 0, currency: 'USD' },
         user_id: s.user_id || null,
         state_hash: String(s.state_hash || ""),
