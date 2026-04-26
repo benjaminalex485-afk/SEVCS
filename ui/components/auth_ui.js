@@ -81,7 +81,7 @@ export function renderAuthUI() {
     
     container.innerHTML = `
         <div class="auth-card glass">
-            <h1>SEVCS Smart Charging</h1>
+            <h1>VoltPark Smart Charging</h1>
             <p class="subtitle">Secure Deterministic Control Layer</p>
             
             <div class="auth-tabs">
@@ -138,7 +138,7 @@ export function renderAuthUI() {
 
     form.addEventListener('submit', async (e) => {
         e.preventDefault();
-        console.log('[SEVCS AUTH] Submit triggered. Current Status:', appState.authStatus);
+        console.log('[VoltPark AUTH] Submit triggered. Current Status:', appState.authStatus);
         
         const emailEl = document.getElementById('email');
         const passwordEl = document.getElementById('password');
@@ -158,7 +158,7 @@ export function renderAuthUI() {
         }
 
         if (appState.authStatus === 'AUTHENTICATING') {
-            console.warn('[SEVCS AUTH] Already authenticating. Ignoring.');
+            console.warn('[VoltPark AUTH] Already authenticating. Ignoring.');
             return;
         }
         
@@ -168,7 +168,7 @@ export function renderAuthUI() {
         try {
             let result;
             if (isSignup) {
-                console.log('[SEVCS AUTH] Attempting Signup:', email);
+                console.log('[VoltPark AUTH] Attempting Signup:', email);
                 result = await signup({ name, email, password, vehicleType });
                 
                 if (result.success) {
@@ -184,12 +184,12 @@ export function renderAuthUI() {
                     return;
                 }
             } else {
-                console.log('[SEVCS AUTH] Attempting Login:', email);
+                console.log('[VoltPark AUTH] Attempting Login:', email);
                 result = await login({ email, password });
             }
 
             if (result && !result.success) {
-                console.error('[SEVCS AUTH] Auth Failed:', result.message);
+                console.error('[VoltPark AUTH] Auth Failed:', result.message);
                 appState.authStatus = 'GUEST';
                 renderAuthUI();
                 const errorEl = document.getElementById('auth-error');
@@ -199,7 +199,7 @@ export function renderAuthUI() {
                 }
             }
         } catch (error) {
-            console.error('[SEVCS AUTH] Critical Auth Error:', error);
+            console.error('[VoltPark AUTH] Critical Auth Error:', error);
             appState.authStatus = 'GUEST';
             renderAuthUI();
             const errorEl = document.getElementById('auth-error');

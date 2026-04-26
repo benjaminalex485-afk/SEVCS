@@ -1,4 +1,4 @@
-console.log('[SEVCS] APP.JS LOADED');
+console.log('[VoltPark] APP.JS LOADED');
 import { executeAction, startPolling } from './api_v3.js';
 import { startRenderer } from './renderer.js';
 import { initSystemUI } from '../components/system_ui.js';
@@ -10,17 +10,17 @@ import { events } from './events.js';
 import { appState, performHardReset } from './state_v3.js';
 
 /**
- * SEVCS UI Bootstrap
+ * VoltPark UI Bootstrap
  */
 function bootstrap() {
-    console.log('[SEVCS] Initializing Deterministic UI...');
+    console.log('[VoltPark] Initializing Deterministic UI...');
 
     // 0. Emergency Catch-All
     const resetBtn = document.getElementById('btn-hard-reset');
     if (resetBtn) {
-        console.log('[SEVCS] Emergency Reset Button Found');
+        console.log('[VoltPark] Emergency Reset Button Found');
         resetBtn.addEventListener('click', () => {
-            console.warn('[SEVCS] Emergency Reset Triggered');
+            console.warn('[VoltPark] Emergency Reset Triggered');
             if (confirm('Clear all local session data and reload?')) {
                 localStorage.clear();
                 location.reload();
@@ -32,19 +32,19 @@ function bootstrap() {
 
     // 1. Initialize Components
     try {
-        console.log('[SEVCS] Initializing System UI...');
+        console.log('[VoltPark] Initializing System UI...');
         initSystemUI();
-        console.log('[SEVCS] Initializing Grids...');
+        console.log('[VoltPark] Initializing Grids...');
         initGrids();
-        console.log('[SEVCS] Initializing Simulation UI...');
+        console.log('[VoltPark] Initializing Simulation UI...');
         initSimulationUI();
-        console.log('[SEVCS] Initializing User UI...');
+        console.log('[VoltPark] Initializing User UI...');
         initUserUI();
-        console.log('[SEVCS] Initializing Auth UI...');
+        console.log('[VoltPark] Initializing Auth UI...');
         renderAuthUI();
-        console.log('[SEVCS] Component Initialization Complete.');
+        console.log('[VoltPark] Component Initialization Complete.');
     } catch (e) {
-        console.error('[SEVCS] Component Initialization Failed:', e);
+        console.error('[VoltPark] Component Initialization Failed:', e);
     }
 
     // 2. Mode Toggling
@@ -102,7 +102,7 @@ function bootstrap() {
     startRenderer();
 
     events.on('API_ERROR', (error) => {
-        console.error(`[SEVCS UI ERROR] ${error.code}: ${error.message}`);
+        console.error(`[VoltPark UI ERROR] ${error.code}: ${error.message}`);
     });
 }
 

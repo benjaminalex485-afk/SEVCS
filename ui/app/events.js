@@ -1,5 +1,5 @@
 /**
- * SEVCS Lightweight Event Bus
+ * VoltPark Lightweight Event Bus
  * Decouples state changes from rendering and API responses.
  */
 class EventEmitter {

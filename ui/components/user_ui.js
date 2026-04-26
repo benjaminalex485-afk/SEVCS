@@ -12,10 +12,15 @@ export function initUserUI() {
         charger_type: null,
         date: null,
         time_window: null,
+        requested_kwh: 20,
+        charge_rate_kw: 7,
+        allow_waitlist: false,
         quote: null,
         payment: null,
         auth_code: null,
-        available_slots: []
+        available_slots: [],
+        wait_eta_minutes: null,
+        wait_message: null
     });
 
     const chargeFlowState = {
@@ -24,6 +29,12 @@ export function initUserUI() {
         data: initialFlowData(),
         error: null
     };
+
+    function displaySlot(slotId) {
+        const n = Number(slotId);
+        if (Number.isNaN(n)) return String(slotId ?? '-');
+        return String(n + 1);
+    }
 
     function resetFlow() {
         chargeFlowState.step = "IDLE";
@@ -56,7 +67,7 @@ export function initUserUI() {
                     <div class="mono">Select Slot</div>
                     ${chargeFlowState.data.available_slots.map(s => `
                         <button class="primary-btn btn-small" data-flow-action="slot" data-slot-id="${s.slot_id}" data-charger-type="${s.charger_type}">
-                            Slot ${s.slot_id} (${s.charger_type})
+                            Slot ${displaySlot(s.slot_id)} (${s.charger_type})
                         </button>
                     `).join('')}
                 `;
@@ -64,8 +75,10 @@ export function initUserUI() {
             case "SELECT_TIME": {
                 const savedDate = chargeFlowState.data.date || "";
                 const savedWindow = chargeFlowState.data.time_window || "00:00-06:00";
+                const savedKwh = Number(chargeFlowState.data.requested_kwh || 20);
+                const savedRate = Number(chargeFlowState.data.charge_rate_kw || 7);
                 resultArea.innerHTML = `
-                    <div class="mono">Selected Slot ${chargeFlowState.data.slot_id} (${chargeFlowState.data.charger_type})</div>
+                    <div class="mono">Selected Slot ${displaySlot(chargeFlowState.data.slot_id)} (${chargeFlowState.data.charger_type})</div>
                     <div class="form-group">
                         <label>Date</label>
                         <input type="date" id="charge-date" />
@@ -79,6 +92,14 @@ export function initUserUI() {
                             <option value="18:00-24:00">18:00-24:00</option>
                         </select>
                     </div>
+                    <div class="form-group">
+                        <label>Required Charge (kWh)</label>
+                        <input type="number" id="charge-kwh" min="5" max="120" step="1" value="${savedKwh}" />
+                    </div>
+                    <div class="form-group">
+                        <label>Charge Rate (kW)</label>
+                        <input type="number" id="charge-rate-kw" min="3" max="150" step="1" value="${savedRate}" />
+                    </div>
                     <button class="primary-btn btn-small" data-flow-action="quote">Get Quote</button>
                 `;
                 const dateEl = document.getElementById("charge-date");
@@ -87,11 +108,20 @@ export function initUserUI() {
                 if (tw) tw.value = savedWindow;
                 break;
             }
+            case "WAIT_DECISION":
+                resultArea.innerHTML = `
+                    <p class="mono">${chargeFlowState.data.wait_message || 'No slot is currently free.'}</p>
+                    <p class="mono">Earliest availability: ${chargeFlowState.data.wait_eta_minutes ?? '-'} min</p>
+                    <button class="primary-btn btn-small" data-flow-action="find-reserve">Reserve & Pay Now</button>
+                    <button class="primary-btn btn-small" data-flow-action="find-wait" style="margin-top:8px;">Wait For Availability</button>
+                `;
+                break;
             case "QUOTE":
                 resultArea.innerHTML = `
                     <p class="mono">Quote generated</p>
                     <p class="mono">Price: $${chargeFlowState.data.quote.total_price.toFixed(2)}</p>
                     <p class="mono">Multiplier: ${chargeFlowState.data.quote.multiplier}</p>
+                    <p class="mono">Requested: ${chargeFlowState.data.quote.requested_kwh} kWh @ ${chargeFlowState.data.quote.charge_rate_kw} kW</p>
                     <p class="mono">Expiry: ${new Date(chargeFlowState.data.quote.expires_at * 1000).toLocaleTimeString()}</p>
                     <button class="primary-btn btn-small" data-flow-action="pay">Proceed to Payment</button>
                 `;
@@ -131,6 +161,13 @@ export function initUserUI() {
                 resultArea.innerHTML = `
                     <p class="mono" style="color: var(--accent-red)">Error: ${chargeFlowState.error}</p>
                     <button class="primary-btn btn-small" data-flow-action="retry">Retry</button>
+                `;
+                break;
+            case "START_CHARGING_CONFIRM":
+                resultArea.innerHTML = `
+                    <p class="mono">Authorization verified for Slot ${displaySlot(chargeFlowState.data.slot_id)}.</p>
+                    <p class="mono">Press confirm once vehicle is parked correctly.</p>
+                    <button class="primary-btn btn-small" data-flow-action="start-charge-confirm">Start Charging</button>
                 `;
                 break;
             default:
@@ -175,6 +212,9 @@ export function initUserUI() {
             slot_id: chargeFlowState.data.slot_id,
             date: chargeFlowState.data.date,
             time_window: chargeFlowState.data.time_window,
+            requested_kwh: chargeFlowState.data.requested_kwh,
+            charge_rate_kw: chargeFlowState.data.charge_rate_kw,
+            allow_waitlist: chargeFlowState.data.allow_waitlist,
             username: appState.session.userId
         });
         chargeFlowState.data.quote = quote;
@@ -216,6 +256,7 @@ export function initUserUI() {
             IDLE: ['SELECT_SLOT'],
             INIT: ['SELECT_SLOT'],
             SELECT_SLOT: ['SELECT_TIME', 'ERROR'],
+            WAIT_DECISION: ['SELECT_TIME', 'ERROR'],
             SELECT_TIME: ['QUOTE', 'ERROR'],
             QUOTE: ['PAYMENT', 'ERROR'],
             PAYMENT: ['COMPLETE', 'ERROR'],
@@ -339,7 +380,23 @@ export function initUserUI() {
             if (flowAction === 'quote') {
                 chargeFlowState.data.date = document.getElementById('charge-date')?.value || null;
                 chargeFlowState.data.time_window = document.getElementById('charge-time-window')?.value || null;
+                chargeFlowState.data.requested_kwh = Number(document.getElementById('charge-kwh')?.value || 20);
+                chargeFlowState.data.charge_rate_kw = Number(document.getElementById('charge-rate-kw')?.value || 7);
                 await transitionTo('QUOTE');
+                return;
+            }
+            if (flowAction === 'find-reserve') {
+                chargeFlowState.data.allow_waitlist = true;
+                await transitionTo('SELECT_TIME');
+                return;
+            }
+            if (flowAction === 'find-wait') {
+                chargeFlowState.step = 'IDLE';
+                renderChargeFlow();
+                const resultArea = document.getElementById('user-result-area');
+                if (resultArea) {
+                    resultArea.innerHTML = `<p class="mono">You can wait ~${chargeFlowState.data.wait_eta_minutes ?? '-'} min for earliest slot.</p>`;
+                }
                 return;
             }
             if (flowAction === 'pay') {
@@ -396,7 +453,32 @@ export function initUserUI() {
             if (action === 'authorize') {
                 const code = prompt(`Enter Authorization Code for Slot ${slotId}:`);
                 if (code) {
-                    await executeAction('authorize', { slot_id: slotId, code: code, username: appState.session.userId });
+                    const authRes = await executeAction('authorize', { slot_id: slotId, code: code, username: appState.session.userId });
+                    if (authRes?.status === 'success') {
+                        chargeFlowState.data.slot_id = Number(slotId);
+                        chargeFlowState.data.auth_code = code;
+                        chargeFlowState.step = 'START_CHARGING_CONFIRM';
+                        renderChargeFlow();
+                    } else {
+                        setFlowError(authRes?.message || authRes?.error || authRes?.code || 'Authorization failed');
+                    }
+                }
+                return;
+            }
+            if (flowAction === 'start-charge-confirm') {
+                const startRes = await executeAction('start_charging', {
+                    slot_id: chargeFlowState.data.slot_id,
+                    code: chargeFlowState.data.auth_code,
+                    username: appState.session.userId
+                }, `start_charging_${chargeFlowState.data.slot_id}`);
+                if (startRes?.status === 'success') {
+                    chargeFlowState.step = 'IDLE';
+                    renderChargeFlow();
+                    const resultArea = document.getElementById('user-result-area');
+                    // start_charging API returns slot_id as 1-based for user readability.
+                    if (resultArea) resultArea.innerHTML = `<p class="mono">Charging started at Slot ${startRes.slot_id}.</p>`;
+                } else {
+                    setFlowError(startRes?.message || startRes?.error || 'Unable to start charging');
                 }
                 return;
             }
@@ -404,10 +486,38 @@ export function initUserUI() {
                 isLoading = true;
                 update();
                 try {
-                    await executeAction('find_slot', {
+                    const lookupDate = document.getElementById('charge-date')?.value || new Date().toISOString().slice(0, 10);
+                    const lookupWindow = document.getElementById('charge-time-window')?.value || '06:00-12:00';
+                    const result = await executeAction('find_slot', {
                         type: document.getElementById('user-vehicle').value,
-                        urgency: document.getElementById('user-urgency').value
+                        urgency: document.getElementById('user-urgency').value,
+                        date: lookupDate,
+                        time_window: lookupWindow,
+                        username: appState.session.userId
                     }, 'find_slot');
+                    if (result?.status !== 'success') {
+                        setFlowError(result?.message || result?.error || 'Unable to find slot');
+                        return;
+                    }
+                    const rec = result.recommended_slot;
+                    if (!rec) {
+                        setFlowError('No recommended slot found');
+                        return;
+                    }
+                    chargeFlowState.data.slot_id = Number(rec.slot_id);
+                    chargeFlowState.data.charger_type = rec.charger_type || 'STANDARD';
+                    chargeFlowState.data.date = result.date || lookupDate;
+                    chargeFlowState.data.time_window = result.time_window || lookupWindow;
+                    chargeFlowState.data.allow_waitlist = false;
+                    if (result.mode === 'WAIT') {
+                        chargeFlowState.data.wait_eta_minutes = Number(result.eta_minutes || 0);
+                        chargeFlowState.data.wait_message = result.message || 'No slot is currently free.';
+                        chargeFlowState.step = 'WAIT_DECISION';
+                        renderChargeFlow();
+                    } else {
+                        chargeFlowState.step = 'SELECT_SLOT';
+                        await transitionTo('SELECT_TIME');
+                    }
                 } finally {
                     isLoading = false;
                     update();
@@ -441,7 +551,7 @@ export function initUserUI() {
                 slotGridArea.innerHTML = sortedSlots.map(slot => `
                     <div class="slot-item ${slot.state.toLowerCase()}">
                         <div class="slot-info">
-                            <span class="slot-label">Slot ${slot.slot_id}</span>
+                            <span class="slot-label">Slot ${displaySlot(slot.slot_id)}</span>
                             <span class="slot-status ${slot.state === 'AUTH_PENDING' ? 'status-pulse' : ''}">${slot.state}</span>
                         </div>
                         ${slot.state === 'FREE' ? `
@@ -485,10 +595,51 @@ export function initUserUI() {
                         <tbody>
                             ${rows.map((b) => `
                                 <tr>
-                                    <td style="padding:4px;">${Number(b.slot_id) + 1}</td>
+                                    <td style="padding:4px;">${displaySlot(b.slot_id)}</td>
                                     <td style="padding:4px;">${b.date || '-'}</td>
                                     <td style="padding:4px;">${b.time_window || '-'}</td>
                                     <td style="padding:4px;" class="mono">${b.auth_code || 'N/A'}</td>
+                                </tr>
+                            `).join('')}
+                        </tbody>
+                    </table>
+                `;
+            }
+        }
+
+        const activeSessionsWrapId = 'user-active-sessions-table';
+        let activeWrap = document.getElementById(activeSessionsWrapId);
+        if (!activeWrap) {
+            const bookingsWrap = document.querySelector('.booking-table-wrap');
+            if (bookingsWrap) {
+                const host = document.createElement('div');
+                host.innerHTML = `<h4 class="mono" style="margin: 10px 0 6px;">Active Charging</h4><div id="${activeSessionsWrapId}"></div>`;
+                bookingsWrap.parentNode.insertBefore(host, bookingsWrap);
+                activeWrap = document.getElementById(activeSessionsWrapId);
+            }
+        }
+        if (activeWrap) {
+            const sessions = Array.isArray(snapshot.user_active_sessions) ? snapshot.user_active_sessions : [];
+            if (sessions.length === 0) {
+                activeWrap.innerHTML = `<p class="mono" style="opacity:.8">No active charging session</p>`;
+            } else {
+                activeWrap.innerHTML = `
+                    <table style="width:100%; border-collapse:collapse; font-size:12px;">
+                        <thead>
+                            <tr>
+                                <th style="text-align:left; padding:4px;">Slot</th>
+                                <th style="text-align:left; padding:4px;">Battery</th>
+                                <th style="text-align:left; padding:4px;">Power</th>
+                                <th style="text-align:left; padding:4px;">Energy</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            ${sessions.map((s) => `
+                                <tr>
+                                    <td style="padding:4px;">${displaySlot(s.slot_id)}</td>
+                                    <td style="padding:4px;">${Number(s.battery_pct).toFixed(1)}%</td>
+                                    <td style="padding:4px;">${Number(s.power_kw).toFixed(1)} kW</td>
+                                    <td style="padding:4px;">${Number(s.energy_kwh).toFixed(2)} kWh</td>
                                 </tr>
                             `).join('')}
                         </tbody>

@@ -69,10 +69,10 @@ export function startRenderer() {
                     lastIdentity = identityKey;
                 } catch (e) {
                     retryCount++;
-                    console.error(`[SEVCS] SNAPSHOT PROCESS FAILED: Attempt ${retryCount}`, e);
+                    console.error(`[VoltPark] SNAPSHOT PROCESS FAILED: Attempt ${retryCount}`, e);
                     
                     if (retryCount >= MAX_RETRY) {
-                        console.error('[SEVCS] TOXIC SNAPSHOT IDENTIFIED: Blacklisting for 30s', identityKey);
+                        console.error('[VoltPark] TOXIC SNAPSHOT IDENTIFIED: Blacklisting for 30s', identityKey);
                         toxicFrames.set(identityKey, Date.now());
                         if (toxicFrames.size > 100) toxicFrames.clear();
                         commitSnapshot();
@@ -84,7 +84,7 @@ export function startRenderer() {
             // 3. RENDER
             safeDraw();
         } catch (e) {
-            console.error('[SEVCS] RENDER TICK CRASH:', e);
+            console.error('[VoltPark] RENDER TICK CRASH:', e);
         } finally {
             isRendering = false;
         }
@@ -96,7 +96,7 @@ export function startRenderer() {
     // Watchdog
     setInterval(() => {
         if (Date.now() - lastRenderTime > MAX_RENDER_DELAY) {
-            console.warn('[SEVCS] RENDER STARVATION DETECTED: Forcing recovery frame');
+            console.warn('[VoltPark] RENDER STARVATION DETECTED: Forcing recovery frame');
             renderTick(); 
         }
     }, 200);
@@ -163,7 +163,7 @@ function safeDraw() {
         };
         if (appState.lastRenderState !== displayState) {
             appState.lastRenderState = displayState;
-            console.log('[SEVCS RENDER] state_source', {
+            console.log('[VoltPark RENDER] state_source', {
                 displayState,
                 snapshotMode: stateToEmit.snapshot?.system_mode || 'NONE',
                 seq: stateToEmit.snapshot?.snapshot_sequence ?? -1
@@ -172,7 +172,7 @@ function safeDraw() {
         
         events.emit('STATE_UPDATED', stateToEmit);
     } catch (e) {
-        console.error('[SEVCS] KERNEL CRASH', e);
+        console.error('[VoltPark] KERNEL CRASH', e);
         events.emit('RENDER_FALLBACK', e);
     }
 }

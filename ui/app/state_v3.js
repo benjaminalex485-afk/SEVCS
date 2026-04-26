@@ -1,7 +1,7 @@
 import { events } from './events.js';
 import { resetPendingActions } from './api_v3.js';
 
-console.log('[SEVCS] STATE_V3 LOADED - VERIFYING LATENCY FIX AT L402');
+console.log('[VoltPark] STATE_V3 LOADED - VERIFYING LATENCY FIX AT L402');
 export const appState = {
     // System Status
     snapshot: null,
@@ -114,6 +114,7 @@ function normalizeSnapshot(s) {
         slots: Array.isArray(s.slots) ? s.slots : [],
         queue: Array.isArray(s.queue) ? s.queue : [],
         user_bookings: Array.isArray(s.user_bookings) ? s.user_bookings : [],
+        user_active_sessions: Array.isArray(s.user_active_sessions) ? s.user_active_sessions : [],
         user_wallet: s.user_wallet || { balance: 0, currency: 'USD' },
         user_id: s.user_id || null,
         state_hash: String(s.state_hash || ""),
@@ -175,7 +176,7 @@ export function setLatestSnapshot(data, latency) {
 
     // 3. Normalized Contract
     if (!isValidSnapshotPayload(data)) {
-        console.warn('[SEVCS] SNAPSHOT REJECTED: Invalid contract payload', data);
+        console.warn('[VoltPark] SNAPSHOT REJECTED: Invalid contract payload', data);
         return;
     }
     const normalized = normalizeSnapshot(data);
@@ -194,7 +195,7 @@ export function setLatestSnapshot(data, latency) {
     if (appState.forceGapSimulation) {
         normalized.snapshot_sequence += 50;
         appState.forceGapSimulation = false;
-        console.warn('[SEVCS SIM] Sequence GAP injected into pipeline');
+        console.warn('[VoltPark SIM] Sequence GAP injected into pipeline');
     }
 
     // Use Adjusted Now for drift compensation
@@ -203,14 +204,14 @@ export function setLatestSnapshot(data, latency) {
 
     // Stale: Reject hard
     if (age > appState.MAX_SNAPSHOT_AGE) {
-        console.warn('[SEVCS] SNAPSHOT REJECTED: Stale Data', { age, timestamp, adjustedNow, offset: appState.timeOffset });
+        console.warn('[VoltPark] SNAPSHOT REJECTED: Stale Data', { age, timestamp, adjustedNow, offset: appState.timeOffset });
         appState.stableBackendFrames = 0; 
         return;
     }
 
     // Future: Reject drift
     if (timestamp - adjustedNow > 3000) {
-        console.error('[SEVCS] SNAPSHOT REJECTED: Future Timestamp', { drift: timestamp - adjustedNow, timestamp, adjustedNow });
+        console.error('[VoltPark] SNAPSHOT REJECTED: Future Timestamp', { drift: timestamp - adjustedNow, timestamp, adjustedNow });
         appState.stableBackendFrames = 0; 
         return;
     }
@@ -270,7 +271,7 @@ export function setLatestSnapshot(data, latency) {
     // 10. Frame Isolation
     latestIncomingSnapshot = safeClone({ ...normalized, timestamp, arrivalTimestamp: Date.now() });
     appState.lastSnapshotMono = performance.now(); // 🔥 HEARTBEAT: Update timer on ANY valid arrival
-    console.log('[SEVCS] SNAPSHOT ACCEPTED', {
+    console.log('[VoltPark] SNAPSHOT ACCEPTED', {
         seq: normalized.snapshot_sequence,
         version: normalized.snapshot_version,
         source: normalized.source,
@@ -330,7 +331,7 @@ export function takeLatestSnapshot() {
             // Cooldown check
             if (Date.now() - appState.lastHardSyncTime < 3000) return null;
             
-            console.error('[SEVCS] PERSISTENT DESYNC (>2s): Triggering recovery sync');
+            console.error('[VoltPark] PERSISTENT DESYNC (>2s): Triggering recovery sync');
             performHardSync(null); 
             appState.lastDesyncFrameTime = 0;
             return null;
@@ -363,7 +364,7 @@ export function processSnapshot(data) {
 
     // 4. User Scope Guard
     if (data.user_id && appState.session.userId && data.user_id !== appState.session.userId) {
-        console.error('[SEVCS] USER SCOPE VIOLATION');
+        console.error('[VoltPark] USER SCOPE VIOLATION');
         events.emit('FORCE_LOGOUT');
         return;
     }
@@ -472,7 +473,7 @@ function performHardSync(meta) {
     appState.isDesync = true;
     appState.stableFrames = 0;
 
-    console.warn('[SEVCS] HARD SYNC: Transitioning to RESYNC_REQUIRED', meta);
+    console.warn('[VoltPark] HARD SYNC: Transitioning to RESYNC_REQUIRED', meta);
     
     // Stop Polling BEFORE establishing boundary
     import('./api_v3.js').then(m => m.stopPolling());
@@ -493,7 +494,7 @@ function performHardSync(meta) {
 export function resync() {
     if (!appState.isResyncing) return;
 
-    console.warn('[SEVCS] USER RESYNC: Re-initializing pipeline');
+    console.warn('[VoltPark] USER RESYNC: Re-initializing pipeline');
     
     // Reset AUTHORITATIVE Boundary FIRST
     appState.snapshot = null;
@@ -515,7 +516,7 @@ export function resync() {
  * Hard Reset: Full teardown (Logout).
  */
 export function performHardReset() {
-    console.warn('[SEVCS] HARD RESET: Tearing down all state');
+    console.warn('[VoltPark] HARD RESET: Tearing down all state');
     
     // 1. Clear Polling & Timers
     events.emit('STOP_POLLING');
@@ -561,7 +562,7 @@ export function resolveAction(requestId, responseData) {
         const intent = appState.pendingIntents.get(action.intentKey);
         // Intent Finalization Guard: If already finalized (timeout/replayed), ignore late response
         if (intent && intent.status !== 'PENDING') {
-            console.warn('[SEVCS] IGNORED LATE RESPONSE: Intent already finalized as', intent.status);
+            console.warn('[VoltPark] IGNORED LATE RESPONSE: Intent already finalized as', intent.status);
             appState.pendingActions.delete(requestId);
             return;
         }
@@ -607,7 +608,7 @@ export function cleanupIntents() {
     const now = Date.now();
     for (const [key, intent] of appState.pendingIntents.entries()) {
         if (intent.status === 'PENDING' && now - intent.startedAt > appState.INTENT_TIMEOUT_MS) {
-            console.error('[SEVCS] INTENT TIMEOUT:', key);
+            console.error('[VoltPark] INTENT TIMEOUT:', key);
             appState.pendingIntents.set(key, { ...intent, status: 'UNKNOWN' });
             
             // Log as unknown in history if we can find the action
@@ -621,7 +622,7 @@ export function cleanupIntents() {
 setInterval(cleanupIntents, 1000);
 
 // Debug API
-window.__SEVCS_DEBUG__ = {
+window.__VOLTPARK_DEBUG__ = {
     getState: () => appState,
     forceMockMode: () => { appState.isSimulating = true; startSimulation(); },
     simulateLatency: (ms) => { appState.debugLatency = ms; },
@@ -683,7 +684,7 @@ events.on('FORCE_GAP_SIMULATION', () => {
 // Multi-Tab Sync
 window.addEventListener('storage', (event) => {
     if (event.key === 'sevcs_token' && !event.newValue) {
-        console.warn('[SEVCS] LOGOUT DETECTED IN OTHER TAB');
+        console.warn('[VoltPark] LOGOUT DETECTED IN OTHER TAB');
         performHardReset();
     }
 });

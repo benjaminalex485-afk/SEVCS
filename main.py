@@ -436,6 +436,46 @@ def _get_time_multiplier(time_window):
 def _reservation_key(slot_id, date, time_window):
     return f"{int(slot_id)}|{str(date)}|{str(time_window)}"
 
+def _current_date_str():
+    return time.strftime("%Y-%m-%d", time.localtime())
+
+def _current_time_window():
+    hour = time.localtime().tm_hour
+    if 0 <= hour < 6:
+        return "00:00-06:00"
+    if 6 <= hour < 12:
+        return "06:00-12:00"
+    if 12 <= hour < 18:
+        return "12:00-18:00"
+    return "18:00-24:00"
+
+def _estimate_slot_eta_minutes(slot_idx):
+    # Estimate remaining charging time from active session if present.
+    session = G_STATE.sessions.get(slot_idx)
+    if not session:
+        return 30
+    battery_pct = float(session.get("battery_pct", 0))
+    remaining = max(0.0, 100.0 - battery_pct)
+    # ~0.1% per second in simulation loop => 60% in 10 minutes.
+    return max(1, int(round((remaining / 0.1) / 60.0)))
+
+def _build_user_active_sessions(username):
+    sessions = []
+    with G_STATE.session_lock, G_STATE.auth_engine.lock:
+        for slot_idx, session in G_STATE.sessions.items():
+            booking = G_STATE.auth_engine.bookings.get(slot_idx, {})
+            if booking.get("user") != username:
+                continue
+            sessions.append({
+                "slot_id": int(slot_idx),
+                "battery_pct": round(float(session.get("battery_pct", 0.0)), 2),
+                "power_kw": round(float(session.get("power", 0.0)), 2),
+                "energy_kwh": round(float(session.get("energy", 0.0)), 2),
+                "started_at": float(session.get("start_time", 0.0))
+            })
+    sessions.sort(key=lambda x: x.get("started_at", 0.0), reverse=True)
+    return sessions
+
 def build_degraded_status_snapshot(username, reason):
     """Always return a schema-compatible status payload for UI safety."""
     now = utils.system_now(caller="api_thread")
@@ -459,6 +499,7 @@ def build_degraded_status_snapshot(username, reason):
         "user_id": username,
         "user_wallet": G_STATE.wallets.get(username, {"balance": 0.0, "currency": "USD"}),
         "user_bookings": [],
+        "user_active_sessions": [],
         "dev_mode": DEV_MODE
     }
 
@@ -516,6 +557,7 @@ def get_status():
         snapshot["user_id"] = username
         snapshot["user_wallet"] = G_STATE.wallets.get(username, {"balance": 0.0, "currency": "USD"})
         snapshot["user_bookings"] = user_bookings
+        snapshot["user_active_sessions"] = _build_user_active_sessions(username)
         # Keep producer timestamp untouched for frontend freshness logic.
         snapshot["api_timestamp"] = now
         snapshot["dev_mode"] = DEV_MODE
@@ -862,18 +904,25 @@ def pricing_quote_api():
     slot_id = data.get("slot_id")
     date = data.get("date")
     time_window = data.get("time_window")
+    requested_kwh = data.get("requested_kwh", 20)
+    charge_rate_kw = data.get("charge_rate_kw", 7)
+    allow_waitlist = bool(data.get("allow_waitlist", False))
     if slot_id is None or not date or not time_window:
         return jsonify({"status": "error", "message": "slot_id, date, and time_window are required"}), 400
     try:
         slot_idx = int(slot_id)
+        requested_kwh = float(requested_kwh)
+        charge_rate_kw = float(charge_rate_kw)
     except (TypeError, ValueError):
-        return jsonify({"status": "error", "message": "Invalid slot_id"}), 400
+        return jsonify({"status": "error", "message": "Invalid slot_id/requested_kwh/charge_rate_kw"}), 400
+    requested_kwh = max(5.0, min(120.0, requested_kwh))
+    charge_rate_kw = max(3.0, min(150.0, charge_rate_kw))
 
     with G_STATE.vision_lock:
         slot = next((s for s in G_STATE.slots if s.slot_id == slot_idx), None)
         if not slot:
             return jsonify({"status": "error", "message": "Slot not found"}), 404
-        if slot.state != SlotState.FREE:
+        if slot.state != SlotState.FREE and not allow_waitlist:
             return jsonify({"status": "error", "message": "Slot not available"}), 409
         reservation_key = _reservation_key(slot_idx, date, time_window)
         if reservation_key in G_STATE.slot_time_reservations:
@@ -882,7 +931,9 @@ def pricing_quote_api():
 
     base_price = 10.0 if charger_type == "STANDARD" else 18.0
     multiplier = _get_time_multiplier(time_window)
-    total_price = round(base_price * multiplier, 2)
+    energy_factor = requested_kwh / 20.0
+    rate_factor = 1.0 + ((charge_rate_kw - 7.0) / 100.0)
+    total_price = round(base_price * multiplier * energy_factor * rate_factor, 2)
     quote_id = f"q_{int(utils.system_now(caller='api_thread')*1000)}_{slot_idx}"
     expires_at = utils.system_now(caller="api_thread") + 300.0
     quote_payload = {
@@ -894,11 +945,14 @@ def pricing_quote_api():
         "time_window": time_window,
         "unit_price": base_price,
         "multiplier": multiplier,
+        "requested_kwh": requested_kwh,
+        "charge_rate_kw": charge_rate_kw,
         "total_price": total_price,
         "currency": "USD",
         "expires_at": expires_at,
         "paid": False,
-        "consumed": False
+        "consumed": False,
+        "allow_waitlist": allow_waitlist
     }
     G_STATE.pricing_quotes[quote_id] = quote_payload
     logger.info(f"[CHARGE_FLOW] quote_generated quote_id={quote_id} slot={slot_idx} total={total_price}")
@@ -1004,6 +1058,58 @@ def find_slot_api():
     data = get_request_data()
     v_type = data.get('type', 'SUV')
     urgency = data.get('urgency', 'LOW')
+    date = data.get("date") or _current_date_str()
+    time_window = data.get("time_window") or _current_time_window()
+    username = data.get("username", "Anonymous")
+
+    with G_STATE.vision_lock:
+        free_candidates = []
+        busy_candidates = []
+        for slot in G_STATE.slots:
+            reservation_key = _reservation_key(slot.slot_id, date, time_window)
+            if reservation_key in G_STATE.slot_time_reservations:
+                continue
+            if slot.state == SlotState.FREE:
+                free_candidates.append(slot)
+            else:
+                busy_candidates.append(slot)
+
+        if free_candidates:
+            selected = sorted(free_candidates, key=lambda s: s.slot_id)[0]
+            logger.info(f"[FIND_SLOT] immediate_available user={username} slot={selected.slot_id} date={date} tw={time_window} type={v_type} urgency={urgency}")
+            return jsonify({
+                "status": "success",
+                "mode": "AVAILABLE",
+                "message": f"Slot {selected.slot_id + 1} is available now.",
+                "date": date,
+                "time_window": time_window,
+                "recommended_slot": {
+                    "slot_id": selected.slot_id,
+                    "charger_type": _get_slot_charger_type(selected),
+                    "state": selected.state.name
+                }
+            })
+
+        if busy_candidates:
+            selected_busy = sorted(busy_candidates, key=lambda s: s.slot_id)[0]
+            eta = _estimate_slot_eta_minutes(selected_busy.slot_id)
+            logger.info(f"[FIND_SLOT] wait_required user={username} slot={selected_busy.slot_id} eta={eta}m date={date} tw={time_window} type={v_type} urgency={urgency}")
+            return jsonify({
+                "status": "success",
+                "mode": "WAIT",
+                "message": f"No slot is free right now. Earliest Slot {selected_busy.slot_id + 1} in about {eta} min.",
+                "eta_minutes": eta,
+                "date": date,
+                "time_window": time_window,
+                "recommended_slot": {
+                    "slot_id": selected_busy.slot_id,
+                    "charger_type": _get_slot_charger_type(selected_busy),
+                    "state": selected_busy.state.name
+                },
+                "can_reserve_with_payment": True
+            })
+
+    logger.info(f"[FIND_SLOT] no_slot_found user={username} date={date} tw={time_window} type={v_type} urgency={urgency}")
     return jsonify({"status": "error", "message": "No slots available"}), 400
 
 @api_app.route('/api/authorize', methods=['POST'])
@@ -1020,34 +1126,103 @@ def authorize_api():
         G_STATE.auth_engine.record_attempt(identifier)
 
     slot_id, code = data.get('slot_id'), data.get('code')
-    if slot_id is None or code is None: return jsonify({"status": "error", "message": "Missing slot_id or code"}), 400
-    idx = int(slot_id) - 1
+    if slot_id is None or code is None:
+        return jsonify({"status": "error", "message": "Missing slot_id or code"}), 400
+    try:
+        raw_slot_id = int(slot_id)
+    except (TypeError, ValueError):
+        return jsonify({"status": "error", "message": "Invalid slot_id"}), 400
     loop_start = utils.system_now(caller="api_thread")
     
     with G_STATE.vision_lock:
+        if 0 <= raw_slot_id < len(G_STATE.slots):
+            idx = raw_slot_id
+        elif 1 <= raw_slot_id <= len(G_STATE.slots):
+            idx = raw_slot_id - 1
+        else:
+            return jsonify({"status": "error", "code": "wrong_slot", "message": "Slot not found"}), 400
         if idx < 0 or idx >= len(G_STATE.slots): return jsonify({"status": "error", "code": "wrong_slot"}), 400
         slot = G_STATE.slots[idx]
-        
-        # In DEV MODE, we bypass state and occlusion checks
-        if not DEV_MODE:
-            is_pending = (slot.state == SlotState.AUTH_PENDING)
-            is_early_window = (slot.state == SlotState.ALIGNMENT_PENDING and (loop_start - slot.state_enter_time <= AUTH_WINDOW))
-            
-            if not (is_pending or is_early_window):
-                return jsonify({"status": "error", "code": "stale_request"}), 400
-                
-            if slot.locked_track_id is None:
-                return jsonify({"status": "error", "code": "no_vehicle"}), 400
-            
-            if slot.is_in_occlusion_debounce():
-                logger.warning(f"[AUTH] REJECTED Early Auth for Slot {idx+1}: UNSTABLE_TRACK (Occluded)")
-                return jsonify({"status": "error", "code": "unstable_track"}), 400
+        is_pending = (slot.state == SlotState.AUTH_PENDING)
+        is_early_window = (slot.state == SlotState.ALIGNMENT_PENDING and (loop_start - slot.state_enter_time <= AUTH_WINDOW))
+        if not (is_pending or is_early_window):
+            return jsonify({"status": "error", "code": "stale_request", "message": "This slot is not ready for authorization yet"}), 400
+        if slot.locked_track_id is None:
+            return jsonify({"status": "error", "code": "no_vehicle", "message": "No vehicle detected in selected slot"}), 400
+        if slot.is_in_occlusion_debounce():
+            logger.warning(f"[AUTH] REJECTED Early Auth for Slot {idx+1}: UNSTABLE_TRACK (Occluded)")
+            return jsonify({"status": "error", "code": "unstable_track", "message": "Vehicle tracking is unstable"}), 400
             
         current_track_id = slot.locked_track_id if slot.locked_track_id is not None else -1
         
+    status_message_map = {
+        "wrong_slot": "No booking found for this slot. Enter code on the booked slot.",
+        "stale_request": "Authorization window is not active for this slot.",
+        "no_vehicle": "No vehicle detected in this slot. Park correctly and retry.",
+        "unstable_track": "Vehicle tracking unstable. Hold position and retry.",
+        "expired": "Authorization code expired. Please book again.",
+        "invalid_code": "Invalid authorization code.",
+        "ID_MISMATCH": "This code belongs to a different vehicle/slot.",
+    }
     status, is_idempotent = G_STATE.auth_engine.authorize_vehicle(idx, code, current_track_id)
-    if status == "success": return jsonify({"status": "success", "idempotent": is_idempotent})
-    return jsonify({"status": "error", "code": status}), 400
+    if status == "success":
+        return jsonify({
+            "status": "success",
+            "idempotent": is_idempotent,
+            "next_action": "START_CHARGING_CONFIRM",
+            "slot_id": idx + 1
+        })
+    return jsonify({"status": "error", "code": status, "message": status_message_map.get(status, f"Authorization failed: {status}")}), 400
+
+@api_app.route('/api/start_charging', methods=['POST'])
+def start_charging_api():
+    data = get_request_data()
+    username = data.get("username", "Anonymous")
+    slot_id = data.get("slot_id")
+    code = data.get("code")
+    if slot_id is None or code is None:
+        return jsonify({"status": "error", "message": "Missing slot_id or code"}), 400
+    try:
+        raw_slot_id = int(slot_id)
+    except (TypeError, ValueError):
+        return jsonify({"status": "error", "message": "Invalid slot_id"}), 400
+    with G_STATE.vision_lock:
+        if 0 <= raw_slot_id < len(G_STATE.slots):
+            idx = raw_slot_id
+        elif 1 <= raw_slot_id <= len(G_STATE.slots):
+            idx = raw_slot_id - 1
+        else:
+            return jsonify({"status": "error", "message": "Slot not found"}), 404
+        slot = G_STATE.slots[idx]
+        track_id = slot.locked_track_id if slot.locked_track_id is not None else -1
+        booking = G_STATE.auth_engine.bookings.get(idx)
+        if not booking:
+            return jsonify({"status": "error", "message": "No booking found for slot"}), 409
+        if booking.get("user") != username:
+            return jsonify({"status": "error", "message": "Booking user mismatch"}), 403
+        if booking.get("auth_code") != code and not DEV_MODE:
+            return jsonify({"status": "error", "message": "Invalid auth code"}), 400
+        auth_status, _ = G_STATE.auth_engine.authorize_vehicle(idx, code, track_id)
+        if auth_status != "success":
+            return jsonify({"status": "error", "message": f"Authorization failed: {auth_status}"}), 409
+        is_aligned = (slot.alignment_state == AlignmentState.ALIGNED and slot.smoothed_alignment_score >= ALIGN_THRESHOLD)
+        if track_id is None or track_id < 0:
+            return jsonify({"status": "error", "message": "Vehicle not detected in selected slot"}), 409
+        if not is_aligned:
+            return jsonify({"status": "error", "message": "Park correctly in the assigned slot before starting charge"}), 409
+        slot.set_state(SlotState.AUTH_ACTIVE, track_id=track_id)
+        if not slot.set_state(SlotState.CHARGING, track_id=track_id):
+            return jsonify({"status": "error", "message": "Unable to start charging for this slot"}), 409
+        G_STATE.auth_engine.consume_booking(idx)
+        with G_STATE.session_lock:
+            G_STATE.sessions[idx] = {
+                "battery_pct": 20.0,
+                "power": 7.2,
+                "energy": 0.0,
+                "start_time": utils.system_now(caller="api_thread")
+            }
+    logger.info(f"[CHARGING] Manual start success user={username} slot={idx+1}")
+    return jsonify({"status": "success", "slot_id": idx + 1, "message": "Charging started"})
 
 # --- WEB UI SERVER ---
 @api_app.route('/')
@@ -1364,6 +1539,14 @@ def main():
                             else:
                                 if slot.set_state(SlotState.CHARGING, track_id=tid):
                                     G_STATE.auth_engine.consume_booking(s_idx)
+                                    with G_STATE.session_lock:
+                                        if s_idx not in G_STATE.sessions:
+                                            G_STATE.sessions[s_idx] = {
+                                                "battery_pct": 20.0,
+                                                "power": 7.2,
+                                                "energy": 0.0,
+                                                "start_time": utils.system_now(caller="main_loop")
+                                            }
                                     logger.info(f"[AUTH] AUTH_ACTIVE -> CHARGING for Slot {s_idx+1}")
                                     logger.info(f"VALIDATED Session Start for Slot {s_idx+1}")
 
@@ -1373,6 +1556,8 @@ def main():
                             if not is_auth or not is_aligned:
                                 logger.warning(f"[AUTH] SESSION TERMINATED for Slot {s_idx+1}")
                                 slot.set_state(SlotState.FREE)
+                                with G_STATE.session_lock:
+                                    G_STATE.sessions.pop(s_idx, None)
                         slot.handle_occlusion(False, current_time=loop_start)
 
             # --- DEPARTURE & GHOST RECOVERY ---
@@ -1382,6 +1567,8 @@ def main():
                     logger.critical(f"[INVARIANT] Ghost Charging on Slot {i+1} -> FORCED RESET")
                     slot.force_safe_state()
                     G_STATE.auth_engine.revoke_authorization(i)
+                    with G_STATE.session_lock:
+                        G_STATE.sessions.pop(i, None)
 
                 if i not in matched_slots:
                     if slot.state == SlotState.AUTH_PENDING:

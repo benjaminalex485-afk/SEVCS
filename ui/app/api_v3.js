@@ -34,9 +34,9 @@ async function safeFetch(url, options = {}) {
         const response = await fetch(url, { ...options, headers });
         
         if (response.status === 401) {
-            console.error('[SEVCS API] Unauthorized (401).');
+            console.error('[VoltPark API] Unauthorized (401).');
             if (appState.session.token) {
-                console.warn('[SEVCS API] Active session invalidated. Triggering Logout.');
+                console.warn('[VoltPark API] Active session invalidated. Triggering Logout.');
                 events.emit('FORCE_LOGOUT');
             }
             return { ok: false, status: 401, error: 'Unauthorized' };
@@ -149,13 +149,13 @@ const fetchStatus = async () => {
         }
         const result = await safeFetch(url.toString(), { signal: controller.signal });
         clearTimeout(timeoutId);
-        console.log('[SEVCS POLL] status_response', { ok: result.ok, status: result.status, retryDelay: currentRetryDelay });
+        console.log('[VoltPark POLL] status_response', { ok: result.ok, status: result.status, retryDelay: currentRetryDelay });
         
         if (!result.ok || !result.data) {
             if (result.status === 401) {
                 events.emit('AUTH_EXPIRED');
             }
-            console.warn('[SEVCS POLL] rejected_response', { status: result.status });
+            console.warn('[VoltPark POLL] rejected_response', { status: result.status });
             return;
         }
 
@@ -166,7 +166,7 @@ const fetchStatus = async () => {
         }
 
         setLatestSnapshot(result.data, latency);
-        console.log('[SEVCS POLL] snapshot_ingest', {
+        console.log('[VoltPark POLL] snapshot_ingest', {
             seq: result.data?.snapshot_sequence,
             mode: result.data?.system_mode || result.data?.mode,
             latency
@@ -193,7 +193,7 @@ const fetchStatus = async () => {
         
         const jitter = (appState.lastSequence % 5) * 40; 
         currentRetryDelay = Math.min(currentRetryDelay * 2, MAX_BACKOFF) + jitter;
-        console.error('[SEVCS POLL] fetch_failed', { message: error.message, retryDelay: currentRetryDelay, consecutiveFailures });
+        console.error('[VoltPark POLL] fetch_failed', { message: error.message, retryDelay: currentRetryDelay, consecutiveFailures });
 
         events.emit('API_ERROR', errorObj);
     }
@@ -222,16 +222,16 @@ export function stopPolling() {
         clearTimeout(pollingInterval);
         pollingInterval = null;
     }
-    console.log('[SEVCS API] Polling STOPPED');
+    console.log('[VoltPark API] Polling STOPPED');
 }
 
 export async function resync() {
-    console.log('[SEVCS API] Initiating Resync...');
+    console.log('[VoltPark API] Initiating Resync...');
     try {
         await fetchStatus();
-        console.log('[SEVCS API] Resync SUCCESS');
+        console.log('[VoltPark API] Resync SUCCESS');
     } catch (e) {
-        console.error('[SEVCS API] Resync FAILED:', e);
+        console.error('[VoltPark API] Resync FAILED:', e);
         throw e;
     }
 }
@@ -251,7 +251,7 @@ export async function executeAction(endpoint, payload, intentKey = null) {
     // 0. Policy Guard: Allow financial actions even during desync
     console.log(`[API] executeAction called: ${endpoint}`, payload);
     const isQuoteBackedBooking = endpoint === 'book' && !!payload?.quote_id;
-    const isCriticalVisionAction = !['recharge', 'login', 'signup', 'find_slot'].includes(endpoint) && !isQuoteBackedBooking;
+    const isCriticalVisionAction = !['recharge', 'login', 'signup', 'find_slot', 'authorize', 'start_charging'].includes(endpoint) && !isQuoteBackedBooking;
     
     if (isCriticalVisionAction && !appState.allowActions) {
         const blockMessage = 'System not synchronized. Please wait for health indicator to turn Green.';
@@ -280,7 +280,7 @@ export async function executeAction(endpoint, payload, intentKey = null) {
     const versionAtClick = appState.snapshotVersion;
     const requestId = `req_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
 
-    console.log(`[SEVCS API] Executing ${endpoint} (ID: ${requestId})`);
+    console.log(`[VoltPark API] Executing ${endpoint} (ID: ${requestId})`);
     registerAction(requestId, versionAtClick, endpoint, intentKey);
 
     // Simulation Intercept (Admin Infrastructure)
@@ -302,7 +302,7 @@ export async function executeAction(endpoint, payload, intentKey = null) {
         }
 
         if (success) {
-            console.log(`[SEVCS ADMIN] ${endpoint} SUCCESS - Local State Updated`);
+            console.log(`[VoltPark ADMIN] ${endpoint} SUCCESS - Local State Updated`);
             // Instant local feedback
             events.emit('STATE_UPDATED', appState);
             
@@ -328,7 +328,7 @@ export async function executeAction(endpoint, payload, intentKey = null) {
         });
 
         if (!result.ok) {
-            const errorMsg = result.data?.message || result.error || `HTTP Error: ${result.status}`;
+            const errorMsg = result.data?.message || result.data?.code || result.error || `HTTP Error: ${result.status}`;
             throw new Error(errorMsg);
         }
 
@@ -336,7 +336,7 @@ export async function executeAction(endpoint, payload, intentKey = null) {
 
         // Freeze Race Guard: Check before resolving
         if (appState.snapshot?.freeze_state) {
-            console.warn('[SEVCS API] Response received during FREEZE. Marking as UNKNOWN.');
+            console.warn('[VoltPark API] Response received during FREEZE. Marking as UNKNOWN.');
             resolveAction(requestId, { ...data, status: 'UNKNOWN', error: 'System frozen during completion' });
             return { ...data, status: 'UNKNOWN' };
         }
@@ -354,7 +354,7 @@ export async function executeAction(endpoint, payload, intentKey = null) {
         return data;
 
     } catch (error) {
-        console.error(`[SEVCS API] Action ${endpoint} Failed:`, error);
+        console.error(`[VoltPark API] Action ${endpoint} Failed:`, error);
         events.emit('API_ERROR', { code: 'ACTION_FAILED', retryable: false, message: error.message });
         const errorRes = { status: 'ERROR', error: error.message };
         resolveAction(requestId, errorRes);
@@ -385,7 +385,7 @@ export async function updateSlotType(slotId, chargerType) {
  * Flush pending actions with optional scope filtering
  */
 export function resetPendingActions(filter = {}) {
-    console.warn('[SEVCS API] Scoped Action Reset:', filter);
+    console.warn('[VoltPark API] Scoped Action Reset:', filter);
     
     if (!filter.source) {
         appState.pendingActions.clear();

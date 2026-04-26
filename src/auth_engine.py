@@ -190,8 +190,10 @@ class AuthEngine:
             if slot_id in self.bookings:
                 self.bookings[slot_id]["status"] = "ACTIVE"
                 logger.info(f"[AUTH] CONSUMED Booking for Slot {slot_id+1} (ACTIVE)")
+            # Keep authorization active while charging is in progress.
+            # Clearing it here causes CHARGING state to be immediately revoked by runtime checks.
             if slot_id in self.authorizations:
-                self.authorizations[slot_id]["status"] = "NONE"
+                self.authorizations[slot_id]["status"] = "AUTHORIZED"
 
     def revoke_authorization(self, slot_id):
         """
