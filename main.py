@@ -476,6 +476,48 @@ def _build_user_active_sessions(username):
     sessions.sort(key=lambda x: x.get("started_at", 0.0), reverse=True)
     return sessions
 
+def _build_admin_kpis(now_ts):
+    day_ago = float(now_ts) - 86400.0
+    with G_STATE.vision_lock, G_STATE.session_lock:
+        receipts = list(G_STATE.payment_receipts.values())
+        quotes = G_STATE.pricing_quotes
+
+        def _receipt_amount(receipt):
+            amount = receipt.get("amount")
+            if amount is not None:
+                try:
+                    return float(amount)
+                except (TypeError, ValueError):
+                    pass
+            quote_id = receipt.get("quote_id")
+            q = quotes.get(quote_id, {})
+            return float(q.get("total_price", 0.0))
+
+        def _receipt_energy(receipt):
+            quote_id = receipt.get("quote_id")
+            q = quotes.get(quote_id, {})
+            return float(q.get("requested_kwh", 0.0))
+
+        def _aggregate(bucket):
+            session_count = len(bucket)
+            revenue = round(sum(_receipt_amount(r) for r in bucket), 2)
+            energy = round(sum(_receipt_energy(r) for r in bucket), 2)
+            avg_session_value = round((revenue / session_count), 2) if session_count > 0 else 0.0
+            avg_kwh_per_session = round((energy / session_count), 2) if session_count > 0 else 0.0
+            return {
+                "total_revenue": revenue,
+                "total_energy_kwh": energy,
+                "session_count": session_count,
+                "avg_session_value": avg_session_value,
+                "avg_kwh_per_session": avg_kwh_per_session
+            }
+
+        receipts_24h = [r for r in receipts if float(r.get("processed_at", 0.0)) >= day_ago]
+        return {
+            "last24h": _aggregate(receipts_24h),
+            "lifetime": _aggregate(receipts)
+        }
+
 def build_degraded_status_snapshot(username, reason):
     """Always return a schema-compatible status payload for UI safety."""
     now = utils.system_now(caller="api_thread")
@@ -500,6 +542,22 @@ def build_degraded_status_snapshot(username, reason):
         "user_wallet": G_STATE.wallets.get(username, {"balance": 0.0, "currency": "USD"}),
         "user_bookings": [],
         "user_active_sessions": [],
+        "admin_kpis": {
+            "last24h": {
+                "total_revenue": 0.0,
+                "total_energy_kwh": 0.0,
+                "session_count": 0,
+                "avg_session_value": 0.0,
+                "avg_kwh_per_session": 0.0
+            },
+            "lifetime": {
+                "total_revenue": 0.0,
+                "total_energy_kwh": 0.0,
+                "session_count": 0,
+                "avg_session_value": 0.0,
+                "avg_kwh_per_session": 0.0
+            }
+        },
         "dev_mode": DEV_MODE
     }
 
@@ -558,6 +616,7 @@ def get_status():
         snapshot["user_wallet"] = G_STATE.wallets.get(username, {"balance": 0.0, "currency": "USD"})
         snapshot["user_bookings"] = user_bookings
         snapshot["user_active_sessions"] = _build_user_active_sessions(username)
+        snapshot["admin_kpis"] = _build_admin_kpis(now)
         # Keep producer timestamp untouched for frontend freshness logic.
         snapshot["api_timestamp"] = now
         snapshot["dev_mode"] = DEV_MODE

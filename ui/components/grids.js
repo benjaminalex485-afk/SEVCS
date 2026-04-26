@@ -4,6 +4,86 @@ import { events } from '../app/events.js';
 export function initGrids() {
     const slotContainer = document.getElementById('slot-grid-container');
     const queueContainer = document.getElementById('queue-table-container');
+    const kpiContainer = document.getElementById('admin-kpi-container');
+
+    function formatCurrency(value) {
+        return `$${Number(value || 0).toFixed(2)}`;
+    }
+
+    function formatKwh(value) {
+        return `${Number(value || 0).toFixed(2)} kWh`;
+    }
+
+    function renderKpiCards(snapshot) {
+        if (!kpiContainer) return;
+        if (!snapshot) {
+            kpiContainer.innerHTML = `
+                <div class="card">
+                    <h2>Station KPI (Last 24h)</h2>
+                    <p class="mono" style="color: var(--text-secondary)">Waiting for metrics...</p>
+                </div>
+                <div class="card">
+                    <h2>Station KPI (Lifetime)</h2>
+                    <p class="mono" style="color: var(--text-secondary)">Waiting for metrics...</p>
+                </div>
+            `;
+            return;
+        }
+
+        const slots = Array.isArray(snapshot.slots) ? snapshot.slots : [];
+        const queueLen = Array.isArray(snapshot.queue) ? snapshot.queue.length : 0;
+        const occupied = slots.filter((s) => String(s.state || '').toUpperCase() !== 'FREE').length;
+        const occupancyPct = slots.length > 0 ? (occupied / slots.length) * 100 : 0;
+        const activeSessionsNow = slots.filter((s) => String(s.state || '').toUpperCase() === 'CHARGING').length;
+
+        const zeroMetric = {
+            total_revenue: 0,
+            total_energy_kwh: 0,
+            session_count: 0,
+            avg_session_value: 0,
+            avg_kwh_per_session: 0
+        };
+        const adminKpis = snapshot.admin_kpis || {};
+        const last24h = { ...zeroMetric, ...(adminKpis.last24h || {}) };
+        const lifetime = { ...zeroMetric, ...(adminKpis.lifetime || {}) };
+
+        const cardHtml = (title, metric) => `
+            <div class="card">
+                <h2>${title}</h2>
+                <div class="admin-kpi-grid">
+                    <div class="admin-kpi-item">
+                        <div class="admin-kpi-label">Total Revenue</div>
+                        <div class="admin-kpi-value">${formatCurrency(metric.total_revenue)}</div>
+                    </div>
+                    <div class="admin-kpi-item">
+                        <div class="admin-kpi-label">Total Energy</div>
+                        <div class="admin-kpi-value">${formatKwh(metric.total_energy_kwh)}</div>
+                    </div>
+                    <div class="admin-kpi-item">
+                        <div class="admin-kpi-label">Active Sessions</div>
+                        <div class="admin-kpi-value">${activeSessionsNow}</div>
+                    </div>
+                    <div class="admin-kpi-item">
+                        <div class="admin-kpi-label">Avg Session Value</div>
+                        <div class="admin-kpi-value">${formatCurrency(metric.avg_session_value)}</div>
+                    </div>
+                    <div class="admin-kpi-item">
+                        <div class="admin-kpi-label">Avg kWh / Session</div>
+                        <div class="admin-kpi-value">${Number(metric.avg_kwh_per_session || 0).toFixed(2)}</div>
+                    </div>
+                    <div class="admin-kpi-item">
+                        <div class="admin-kpi-label">Occupancy / Queue</div>
+                        <div class="admin-kpi-value">${occupancyPct.toFixed(1)}% / ${queueLen}</div>
+                    </div>
+                </div>
+            </div>
+        `;
+
+        kpiContainer.innerHTML = `
+            ${cardHtml('Station KPI (Last 24h)', last24h)}
+            ${cardHtml('Station KPI (Lifetime)', lifetime)}
+        `;
+    }
 
     // Delegated click handler for slots
     slotContainer.addEventListener('click', async (e) => {
@@ -48,6 +128,10 @@ export function initGrids() {
     events.on('STATE_UPDATED', (state) => {
         const snapshot = state.snapshot;
         const isAdmin = state.uiMode === 'ADMIN';
+        const mainDashboard = document.getElementById('main-dashboard');
+        const dataPanel = document.querySelector('.data-panel');
+        if (mainDashboard) mainDashboard.classList.toggle('admin-layout', isAdmin);
+        if (dataPanel) dataPanel.classList.toggle('admin-layout', isAdmin);
 
         // Performance Guard: Only re-render if data has actually changed
         const currentHash = snapshot ? `${snapshot.state_hash}_${snapshot.snapshot_sequence}_${isAdmin}` : 'empty';
@@ -129,5 +213,12 @@ export function initGrids() {
                 `}
             </div>
         `;
+
+        // 3. Render KPI Cards (ADMIN ONLY)
+        if (isAdmin) {
+            renderKpiCards(snapshot);
+        } else if (kpiContainer) {
+            kpiContainer.innerHTML = '';
+        }
     });
 }
