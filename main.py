@@ -1042,7 +1042,7 @@ def availability_api():
         ]
     logger.info(f"[CHARGE_FLOW] availability_requested user={username} free_slots={len(slots)}")
     return jsonify({
-        "status": "success",
+        "status": "success", 
         "slots": slots,
         "generated_at": utils.system_now(caller="api_thread")
     })
