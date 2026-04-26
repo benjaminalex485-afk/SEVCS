@@ -59,8 +59,18 @@ function bootstrap() {
         lastDisplayState = state.displayState;
         
         // Toggle logout button
-        document.getElementById('btn-logout').style.display = 
-            state.authStatus !== 'GUEST' ? 'block' : 'none';
+        const isLoggedIn = state.authStatus !== 'GUEST';
+        document.getElementById('btn-logout').style.display = isLoggedIn ? 'block' : 'none';
+        const userChip = document.getElementById('header-user-chip');
+        if (userChip) {
+            if (isLoggedIn && state.session?.userId) {
+                userChip.textContent = state.session.userId;
+                userChip.classList.remove('hidden');
+            } else {
+                userChip.textContent = 'Guest';
+                userChip.classList.add('hidden');
+            }
+        }
         
         // Hide/Show main dashboard based on auth
         const isAuth = state.authStatus === 'AUTHENTICATED' || (state.authStatus === 'AUTHENTICATED_PENDING' && state.lastSequence > -1);

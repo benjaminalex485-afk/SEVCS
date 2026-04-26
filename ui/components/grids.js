@@ -73,13 +73,13 @@ export function initGrids() {
                                      title="${slot.state === 'FREE' ? 'Click to book' : ''}">
                                     
                                     <div style="display: flex; justify-content: space-between; align-items: flex-start">
-                                        <div style="font-size: 0.7rem; color: var(--text-secondary)">ID: ${slot.slot_id}</div>
+                                        <div style="font-size: 0.7rem; color: var(--text-secondary)">Slot ${Number(slot.slot_id) + 1}</div>
                                         ${isAdmin ? `
                                             <button class="btn-remove-slot" data-id="${slot.slot_id}" title="Remove Slot">×</button>
                                         ` : ''}
                                     </div>
 
-                                    <div style="font-weight: 700; margin: 4px 0">${slot.state}</div>
+                                    <div class="slot-state-label">${slot.state}</div>
                                     <div class="mono" style="font-size: 0.75rem">${slot.assigned_global_id ? 'V-' + slot.assigned_global_id : '---'}</div>
                                     
                                     <div class="slot-type-badge ${slot.charger_type?.toLowerCase() || 'standard'}">

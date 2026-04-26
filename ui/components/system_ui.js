@@ -44,11 +44,11 @@ export function initSystemUI() {
         
         healthIndicator.className = `health-indicator ${healthLabel.toLowerCase()}`;
         if (state.snapshot?.dev_mode) {
-            healthIndicator.innerText = `[DEV MODE] HEALTH: ${healthLabel}`;
+            healthIndicator.innerText = `[DEV] ${healthLabel}`;
             healthIndicator.style.border = '2px solid #ffaa00';
             healthIndicator.style.color = '#ffaa00';
         } else {
-            healthIndicator.innerText = `HEALTH: ${healthLabel} (${healthScore}%)`;
+            healthIndicator.innerText = `${healthLabel} ${healthScore}%`;
             healthIndicator.style.border = '';
             healthIndicator.style.color = '';
         }
