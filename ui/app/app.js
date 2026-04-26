@@ -15,19 +15,25 @@ import { appState, performHardReset } from './state_v3.js';
 function bootstrap() {
     console.log('[VoltPark] Initializing Deterministic UI...');
 
-    // 0. Emergency Catch-All
+    // 0. Emergency Catch-All (dev-only)
+    const params = new URLSearchParams(window.location.search);
+    const isDevResetEnabled = params.has('devreset') || localStorage.getItem('voltpark_dev_reset') === '1';
     const resetBtn = document.getElementById('btn-hard-reset');
     if (resetBtn) {
-        console.log('[VoltPark] Emergency Reset Button Found');
-        resetBtn.addEventListener('click', () => {
-            console.warn('[VoltPark] Emergency Reset Triggered');
-            if (confirm('Clear all local session data and reload?')) {
-                localStorage.clear();
-                location.reload();
-            }
-        });
-        // Visual indicator that it's wired
-        resetBtn.style.border = '2px solid white';
+        if (isDevResetEnabled) {
+            console.log('[VoltPark] Emergency Reset Button Enabled (dev mode)');
+            resetBtn.style.display = 'block';
+            resetBtn.style.border = '2px solid white';
+            resetBtn.addEventListener('click', () => {
+                console.warn('[VoltPark] Emergency Reset Triggered');
+                if (confirm('Clear all local session data and reload?')) {
+                    localStorage.clear();
+                    location.reload();
+                }
+            });
+        } else {
+            resetBtn.style.display = 'none';
+        }
     }
 
     // 1. Initialize Components

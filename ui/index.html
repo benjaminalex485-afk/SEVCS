@@ -38,7 +38,7 @@
                 <button class="btn-toggle" id="btn-mode-user">USER</button>
             </div>
             <button class="btn-logout" id="btn-logout" style="display: none;">Logout</button>
-            <button class="btn-logout" id="btn-hard-reset" title="Clear all local data and logout">Emergency Reset</button>
+            <button class="btn-logout" id="btn-hard-reset" title="Clear all local data and logout" style="display: none;">Emergency Reset</button>
         </div>
         <div id="header-status" class="header-status">
             <!-- Polling Indicator & Latency -->
@@ -62,22 +62,6 @@
         </section>
     </main>
 
-    <script>
-        // Emergency Reset - Standalone Logic
-        document.addEventListener('DOMContentLoaded', () => {
-            const btn = document.getElementById('btn-hard-reset');
-            if (btn) {
-                btn.style.border = '3px solid yellow'; // High visibility
-                btn.onclick = (e) => {
-                    e.preventDefault();
-                    if (confirm('CLEAR LOCAL STORAGE AND RELOAD?')) {
-                        localStorage.clear();
-                        window.location.href = window.location.pathname + '?reset=' + Date.now();
-                    }
-                };
-            }
-        });
-    </script>
     <script type="module" src="app/app.js?v=9"></script>
 </body>
 </html>
