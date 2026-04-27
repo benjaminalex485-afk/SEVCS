@@ -455,6 +455,11 @@ body {
     color: var(--accent-red);
 }
 
+.urgency-quote-alert {
+    color: #f59e0b;
+    font-weight: 700;
+}
+
 .slot-cap-editor {
     margin-top: 10px;
     display: grid;

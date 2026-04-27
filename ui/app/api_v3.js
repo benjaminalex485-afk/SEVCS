@@ -438,6 +438,26 @@ export async function updateSlotType(slotId, chargerTypes, chargingLevels) {
     });
 }
 
+export async function getAdminPricingSettings() {
+    const result = await safeFetch(`${BASE_URL}/api/admin_pricing_settings`, { method: 'GET' });
+    if (!result.ok) {
+        throw new Error(result.data?.message || result.error || `Settings fetch failed (${result.status})`);
+    }
+    return result.data;
+}
+
+export async function updateAdminPricingSettings(highUrgencyMultiplier) {
+    const result = await safeFetch(`${BASE_URL}/api/admin_pricing_settings`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ payload: { high_urgency_multiplier: highUrgencyMultiplier } })
+    });
+    if (!result.ok) {
+        throw new Error(result.data?.message || result.error || `Settings update failed (${result.status})`);
+    }
+    return result.data;
+}
+
 /**
  * Flush pending actions with optional scope filtering
  */

@@ -129,6 +129,9 @@ function normalizeSnapshot(s) {
         queue: Array.isArray(s.queue) ? s.queue : [],
         user_bookings: Array.isArray(s.user_bookings) ? s.user_bookings : [],
         user_active_sessions: Array.isArray(s.user_active_sessions) ? s.user_active_sessions : [],
+        pricing_settings: {
+            high_urgency_multiplier: Number(s.pricing_settings?.high_urgency_multiplier || 1.25)
+        },
         admin_kpis: s.admin_kpis || {
             last24h: {
                 total_revenue: 0,
@@ -692,6 +695,7 @@ function startSimulation(forceOverride = false) {
             system_mode: "SIMULATION",
             system_health: 95,
             freeze_state: false,
+            pricing_settings: appState.snapshot?.pricing_settings || { high_urgency_multiplier: 1.25 },
             slots: appState.simSlots.map(s => ({...s})),
             queue: [],
             timestamp: Date.now() / 1000,

@@ -1,5 +1,5 @@
 import { events } from '../app/events.js';
-import { executeAction } from '../app/api_v3.js';
+import { executeAction, getAdminPricingSettings, updateAdminPricingSettings } from '../app/api_v3.js';
 import { appState } from '../app/state_v3.js';
 
 export function initSimulationUI() {
@@ -9,11 +9,16 @@ export function initSimulationUI() {
     events.on('STATE_UPDATED', (state) => render(state));
 
     let lastRenderedHash = null;
+    let pricingUi = { value: '1.25', loading: false, message: '', tone: 'ok' };
 
     function render(state = {}) {
         const isAdmin = appState.uiMode === 'ADMIN';
 
-        const currentHash = `${isAdmin}_${appState.isSimulating}_${appState.requestHistory.length}`;
+        const serverMultiplier = Number(state?.snapshot?.pricing_settings?.high_urgency_multiplier || 1.25);
+        if (!pricingUi.loading && Number.isFinite(serverMultiplier)) {
+            pricingUi.value = String(serverMultiplier);
+        }
+        const currentHash = `${isAdmin}_${appState.isSimulating}_${appState.requestHistory.length}_${serverMultiplier}_${pricingUi.loading}_${pricingUi.message}`;
         if (currentHash === lastRenderedHash) return;
         lastRenderedHash = currentHash;
 
@@ -61,6 +66,23 @@ export function initSimulationUI() {
                         `).join('') : '<tr><td colspan="4" style="text-align: center; color: var(--text-secondary)">No requests logged.</td></tr>'}
                     </tbody>
                 </table>
+                <div class="card" style="margin-top: 1rem; background: rgba(255,255,255,0.02)">
+                    <h3 style="margin-bottom: 0.5rem;">Premium Payout</h3>
+                    <div class="mono" style="font-size: 0.72rem; color: var(--text-secondary); margin-bottom: 0.4rem;">
+                        High urgency quote multiplier
+                    </div>
+                    <div style="display:flex; gap:0.5rem; align-items:center;">
+                        <input type="number" id="high-urgency-multiplier" min="1" max="5" step="0.05"
+                            value="${Number.isFinite(Number(pricingUi.value)) ? Number(pricingUi.value).toFixed(2) : (Number.isFinite(serverMultiplier) ? serverMultiplier.toFixed(2) : '1.25')}"
+                            ${pricingUi.loading ? 'disabled' : ''} style="max-width:120px;" />
+                        <button class="btn btn-outline" id="btn-save-urgency-multiplier" ${pricingUi.loading ? 'disabled' : ''}>
+                            ${pricingUi.loading ? 'Saving...' : 'Save'}
+                        </button>
+                    </div>
+                    <div class="mono ${pricingUi.tone === 'error' ? 'slot-cap-feedback--err' : 'slot-cap-feedback--ok'}" style="margin-top:0.4rem; min-height:1rem;">
+                        ${pricingUi.message || ''}
+                    </div>
+                </div>
             </div>
         `;
 
@@ -88,6 +110,28 @@ export function initSimulationUI() {
         document.getElementById('btn-book')?.addEventListener('click', () => executeAction('book', {}));
         document.getElementById('btn-release')?.addEventListener('click', () => executeAction('release', {}));
         document.getElementById('btn-stop')?.addEventListener('click', () => executeAction('emergency_stop', {}));
+        document.getElementById('btn-save-urgency-multiplier')?.addEventListener('click', async () => {
+            const input = document.getElementById('high-urgency-multiplier');
+            const nextValue = Number(input?.value || 1.25);
+            pricingUi.loading = true;
+            pricingUi.message = '';
+            pricingUi.tone = 'ok';
+            lastRenderedHash = null;
+            render(state);
+            try {
+                const res = await updateAdminPricingSettings(nextValue);
+                pricingUi.value = String(res?.high_urgency_multiplier ?? nextValue);
+                pricingUi.message = `Saved (${Number(pricingUi.value).toFixed(2)}x)`;
+                pricingUi.tone = 'ok';
+            } catch (err) {
+                pricingUi.message = err?.message || 'Save failed';
+                pricingUi.tone = 'error';
+            } finally {
+                pricingUi.loading = false;
+                lastRenderedHash = null;
+                render(appState);
+            }
+        });
 
         document.getElementById('btn-sim-dup')?.addEventListener('click', () => {
             const payload = { simulated_duplicate: true };
@@ -106,6 +150,19 @@ export function initSimulationUI() {
             events.emit('FORCE_GAP_SIMULATION');
         });
     }
+
+    (async () => {
+        try {
+            const settings = await getAdminPricingSettings();
+            const v = Number(settings?.high_urgency_multiplier);
+            if (Number.isFinite(v)) pricingUi.value = String(v);
+        } catch (_) {
+            // Non-fatal: use server snapshot/default value.
+        } finally {
+            lastRenderedHash = null;
+            render(appState);
+        }
+    })();
 
     render();
 }

@@ -45,6 +45,9 @@ DEV_MODE = utils.DEV_MODE
 ALIGN_THRESHOLD = 0.75 if not DEV_MODE else 0.3
 AUTH_WINDOW = 1.0 if not DEV_MODE else 10.0 # Relaxed early authorization window
 STRICT_MODE = CONFIG.get("strict_mode", False) if not DEV_MODE else False
+RUNTIME_STATE_PATH = os.path.join(os.path.dirname(__file__), "runtime_state.json")
+RUNTIME_STATE_SCHEMA_VERSION = 1
+DEFAULT_HIGH_URGENCY_MULTIPLIER = 1.25
 # Freeze configuration after initial load and validation
 # CONFIG = utils.freeze_config(CONFIG)
 
@@ -115,6 +118,9 @@ class GlobalState:
         self.payment_receipts = {}
         # (slot_id|date|time_window) -> booking metadata
         self.slot_time_reservations = {}
+        self.pricing_settings = {
+            "high_urgency_multiplier": float(DEFAULT_HIGH_URGENCY_MULTIPLIER)
+        }
 
 G_STATE = GlobalState()
 
@@ -488,6 +494,137 @@ def _get_slot_charger_type(slot):
     return getattr(slot, "charger_type", "STANDARD")
 
 
+def _normalize_high_urgency_multiplier(raw_value):
+    try:
+        value = float(raw_value)
+    except (TypeError, ValueError):
+        return float(DEFAULT_HIGH_URGENCY_MULTIPLIER)
+    return max(1.0, min(5.0, value))
+
+
+def _runtime_state_payload():
+    admin_slots = []
+    for slot in G_STATE.slots:
+        charger_types, charging_levels = _get_slot_capabilities(slot)
+        admin_slots.append({
+            "slot_id": int(slot.slot_id),
+            "charger_types": list(charger_types),
+            "charging_levels": list(charging_levels),
+        })
+    return {
+        "schema_version": int(RUNTIME_STATE_SCHEMA_VERSION),
+        "saved_at": float(utils.system_now(caller="api_thread")),
+        "users_db": list(G_STATE.users_db),
+        "wallets": dict(G_STATE.wallets),
+        "slot_time_reservations": dict(G_STATE.slot_time_reservations),
+        "pricing_quotes": dict(G_STATE.pricing_quotes),
+        "payment_receipts": dict(G_STATE.payment_receipts),
+        "admin_slots": admin_slots,
+        "pricing_settings": {
+            "high_urgency_multiplier": float(
+                _normalize_high_urgency_multiplier(
+                    (G_STATE.pricing_settings or {}).get("high_urgency_multiplier")
+                )
+            )
+        }
+    }
+
+
+def _persist_runtime_state():
+    try:
+        payload = _runtime_state_payload()
+        with open(RUNTIME_STATE_PATH, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=True, indent=2)
+    except Exception as exc:
+        logger.warning("[PERSIST] Failed to save runtime state: %s", exc)
+
+
+def _restore_runtime_state(base_slots):
+    slots = list(base_slots or [])
+    if not os.path.exists(RUNTIME_STATE_PATH):
+        return slots
+    try:
+        with open(RUNTIME_STATE_PATH, "r", encoding="utf-8") as f:
+            persisted = json.load(f) or {}
+    except Exception as exc:
+        logger.warning("[PERSIST] Failed to read runtime state. Using defaults. error=%s", exc)
+        return slots
+
+    try:
+        wallets = persisted.get("wallets")
+        users_db = persisted.get("users_db")
+        if isinstance(users_db, list):
+            restored_users = []
+            for row in users_db:
+                if not isinstance(row, dict):
+                    continue
+                username = str(row.get("username", "")).strip()
+                password = str(row.get("password", ""))
+                role = str(row.get("role", "user")).lower()
+                if not username or role not in {"admin", "user"}:
+                    continue
+                restored_users.append({
+                    "username": username,
+                    "password": password,
+                    "role": role
+                })
+            if restored_users:
+                G_STATE.users_db = restored_users
+
+        if isinstance(wallets, dict):
+            restored_wallets = collections.defaultdict(lambda: {"balance": 0.0, "currency": "USD"})
+            for username, wallet in wallets.items():
+                if not isinstance(wallet, dict):
+                    continue
+                restored_wallets[str(username)] = {
+                    "balance": float(wallet.get("balance", 0.0)),
+                    "currency": str(wallet.get("currency", "USD") or "USD"),
+                }
+            G_STATE.wallets = restored_wallets
+
+        if isinstance(persisted.get("slot_time_reservations"), dict):
+            G_STATE.slot_time_reservations = persisted.get("slot_time_reservations")
+        if isinstance(persisted.get("pricing_quotes"), dict):
+            G_STATE.pricing_quotes = persisted.get("pricing_quotes")
+        if isinstance(persisted.get("payment_receipts"), dict):
+            G_STATE.payment_receipts = persisted.get("payment_receipts")
+
+        persisted_settings = persisted.get("pricing_settings") or {}
+        G_STATE.pricing_settings["high_urgency_multiplier"] = _normalize_high_urgency_multiplier(
+            persisted_settings.get("high_urgency_multiplier", DEFAULT_HIGH_URGENCY_MULTIPLIER)
+        )
+
+        admin_slots = persisted.get("admin_slots")
+        if isinstance(admin_slots, list) and len(admin_slots) > 0:
+            if not slots:
+                logger.warning("[PERSIST] Cannot restore admin slots: no base polygons available.")
+                return slots
+            target_len = len(admin_slots)
+            while len(slots) < target_len:
+                clone_poly = np.array(slots[-1].polygon, np.int32)
+                slots.append(Slot(len(slots), clone_poly))
+            if len(slots) > target_len:
+                slots = slots[:target_len]
+            for idx, slot in enumerate(slots):
+                slot.slot_id = idx
+                entry = admin_slots[idx] if idx < len(admin_slots) and isinstance(admin_slots[idx], dict) else {}
+                slot.charger_types = _normalize_enum_list(
+                    entry.get("charger_types"), ALLOWED_CHARGER_TYPES, ["AC_WIRED"]
+                )
+                slot.charging_levels = _normalize_enum_list(
+                    entry.get("charging_levels"), ALLOWED_CHARGING_LEVELS, ["LEVEL_2"]
+                )
+                _get_slot_capabilities(slot)
+        logger.info(
+            "[PERSIST] Runtime state restored: wallets=%d bookings=%d quotes=%d receipts=%d slots=%d",
+            len(G_STATE.wallets), len(G_STATE.slot_time_reservations), len(G_STATE.pricing_quotes),
+            len(G_STATE.payment_receipts), len(slots)
+        )
+    except Exception as exc:
+        logger.warning("[PERSIST] Runtime state restore partially failed: %s", exc)
+    return slots
+
+
 def _resolve_admin_slot_index(slot_id_raw, n_slots):
     """Map admin payload slot_id to G_STATE.slots index. Snapshot slot_id is 0-based; payloads may use 1-based."""
     try:
@@ -663,6 +800,13 @@ def build_degraded_status_snapshot(username, reason):
                 "avg_kwh_per_session": 0.0
             }
         },
+        "pricing_settings": {
+            "high_urgency_multiplier": float(
+                _normalize_high_urgency_multiplier(
+                    (G_STATE.pricing_settings or {}).get("high_urgency_multiplier")
+                )
+            )
+        },
         "dev_mode": DEV_MODE
     }
 
@@ -724,6 +868,13 @@ def get_status():
         snapshot["user_bookings"] = user_bookings
         snapshot["user_active_sessions"] = _build_user_active_sessions(username)
         snapshot["admin_kpis"] = _build_admin_kpis(now)
+        snapshot["pricing_settings"] = {
+            "high_urgency_multiplier": float(
+                _normalize_high_urgency_multiplier(
+                    (G_STATE.pricing_settings or {}).get("high_urgency_multiplier")
+                )
+            )
+        }
         # Keep producer timestamp untouched for frontend freshness logic.
         snapshot["api_timestamp"] = now
         snapshot["dev_mode"] = DEV_MODE
@@ -958,6 +1109,7 @@ def signup_api():
     # Add to in-memory DB
     new_user = {"username": email, "password": password, "role": "user", "name": name}
     G_STATE.users_db.append(new_user)
+    _persist_runtime_state()
     logger.info(f"[API] New user registered: {email}")
     return jsonify({"status": "success", "message": "Account created successfully", "success": True})
 
@@ -1057,6 +1209,7 @@ def book_slot_api():
                 "auth_code": code,
                 "created_at": utils.system_now(caller="api_thread")
             }
+            _persist_runtime_state()
         return jsonify({"status": "success", "slot_id": assigned_idx + 1, "auth_code": code})
     
     no_slot_msg = "No slots match selected Charger Type / Charging Level." if (req_ct or req_cl) else "No slots available"
@@ -1112,6 +1265,7 @@ def cancel_booking_api():
 
         if slot.state in [SlotState.AUTH_PENDING, SlotState.AUTH_ACTIVE, SlotState.ALIGNMENT_PENDING]:
             slot.set_state(SlotState.FREE)
+        _persist_runtime_state()
 
     G_STATE.last_snapshot_version += 1
     logger.info(
@@ -1161,6 +1315,7 @@ def pricing_quote_api():
     requested_kwh = data.get("requested_kwh", 20)
     charge_rate_kw = data.get("charge_rate_kw", 7)
     allow_waitlist = bool(data.get("allow_waitlist", False))
+    urgency = str(data.get("urgency", "LOW") or "LOW").strip().upper()
     if slot_id is None or not date or not time_window:
         return jsonify({"status": "error", "message": "slot_id, date, and time_window are required"}), 400
     try:
@@ -1191,10 +1346,14 @@ def pricing_quote_api():
         charger_types, charging_levels = _get_slot_capabilities(slot)
 
     base_price = 10.0 if charger_type == "STANDARD" else 18.0
-    multiplier = _get_time_multiplier(time_window)
+    time_multiplier = _get_time_multiplier(time_window)
+    high_urgency_multiplier = _normalize_high_urgency_multiplier(
+        (G_STATE.pricing_settings or {}).get("high_urgency_multiplier", DEFAULT_HIGH_URGENCY_MULTIPLIER)
+    )
+    urgency_multiplier = high_urgency_multiplier if urgency == "HIGH" else 1.0
     energy_factor = requested_kwh / 20.0
     rate_factor = 1.0 + ((charge_rate_kw - 7.0) / 100.0)
-    total_price = round(base_price * multiplier * energy_factor * rate_factor, 2)
+    total_price = round(base_price * time_multiplier * urgency_multiplier * energy_factor * rate_factor, 2)
     quote_id = f"q_{int(utils.system_now(caller='api_thread')*1000)}_{slot_idx}"
     expires_at = utils.system_now(caller="api_thread") + 300.0
     quote_payload = {
@@ -1206,8 +1365,12 @@ def pricing_quote_api():
         "charging_levels": charging_levels,
         "date": date,
         "time_window": time_window,
+        "urgency": urgency,
         "unit_price": base_price,
-        "multiplier": multiplier,
+        "multiplier": time_multiplier,
+        "time_multiplier": time_multiplier,
+        "urgency_multiplier": urgency_multiplier,
+        "urgency_surcharge_applied": bool(urgency_multiplier > 1.0),
         "requested_kwh": requested_kwh,
         "charge_rate_kw": charge_rate_kw,
         "total_price": total_price,
@@ -1218,6 +1381,7 @@ def pricing_quote_api():
         "allow_waitlist": allow_waitlist
     }
     G_STATE.pricing_quotes[quote_id] = quote_payload
+    _persist_runtime_state()
     logger.info(f"[CHARGE_FLOW] quote_generated quote_id={quote_id} slot={slot_idx} total={total_price}")
     return jsonify({"status": "success", **quote_payload})
 
@@ -1266,6 +1430,7 @@ def payment_mock_api():
         "processed_at": utils.system_now(caller="api_thread")
     }
     G_STATE.payment_receipts[payment_id] = receipt
+    _persist_runtime_state()
     G_STATE.last_snapshot_version += 1
     logger.info(f"[CHARGE_FLOW] payment_wallet_result payment_id={payment_id} quote_id={quote_id} user={username} amount={total_price} balance={wallet['balance']}")
     return jsonify(receipt)
@@ -1285,6 +1450,7 @@ def admin_add_slot_api():
             new_slot.charging_levels = requested_levels
         _get_slot_capabilities(new_slot)
         G_STATE.slots.append(new_slot)
+        _persist_runtime_state()
     logger.info(f"[ADMIN] Added slot {slot_id + 1} (types={new_slot.charger_types}, levels={new_slot.charging_levels})")
     return jsonify({
         "status": "success",
@@ -1306,6 +1472,7 @@ def admin_remove_slot_api():
         # Reindex for predictable UI behavior
         for idx, slot in enumerate(G_STATE.slots):
             slot.slot_id = idx
+        _persist_runtime_state()
     logger.info(f"[ADMIN] Removed slot {target_slot + 1}")
     return jsonify({"status": "success"})
 
@@ -1324,6 +1491,7 @@ def admin_update_slot_type_api():
         if requested_levels:
             slot.charging_levels = requested_levels
         _get_slot_capabilities(slot)
+        _persist_runtime_state()
     logger.info(f"[ADMIN] Updated slot {target_slot + 1} capabilities to types={slot.charger_types}, levels={slot.charging_levels}")
     return jsonify({
         "status": "success",
@@ -1331,6 +1499,35 @@ def admin_update_slot_type_api():
         "charger_type": _get_slot_charger_type(slot),
         "charger_types": list(slot.charger_types),
         "charging_levels": list(slot.charging_levels),
+    })
+
+
+@api_app.route('/api/admin_pricing_settings', methods=['GET'])
+def admin_pricing_settings_get_api():
+    with G_STATE.vision_lock:
+        high_multiplier = _normalize_high_urgency_multiplier(
+            (G_STATE.pricing_settings or {}).get("high_urgency_multiplier", DEFAULT_HIGH_URGENCY_MULTIPLIER)
+        )
+        G_STATE.pricing_settings["high_urgency_multiplier"] = high_multiplier
+    return jsonify({
+        "status": "success",
+        "high_urgency_multiplier": high_multiplier
+    })
+
+
+@api_app.route('/api/admin_pricing_settings', methods=['POST'])
+def admin_pricing_settings_update_api():
+    data = get_request_data()
+    if "high_urgency_multiplier" not in data:
+        return jsonify({"status": "error", "message": "high_urgency_multiplier is required"}), 400
+    normalized = _normalize_high_urgency_multiplier(data.get("high_urgency_multiplier"))
+    with G_STATE.vision_lock:
+        G_STATE.pricing_settings["high_urgency_multiplier"] = normalized
+        _persist_runtime_state()
+    logger.info("[ADMIN] Updated high urgency multiplier to %.3f", normalized)
+    return jsonify({
+        "status": "success",
+        "high_urgency_multiplier": normalized
     })
 
 @api_app.route('/api/recharge', methods=['POST'])
@@ -1343,6 +1540,7 @@ def recharge_api():
         return jsonify({"status": "error", "message": "Invalid amount"}), 400
         
     G_STATE.wallets[username]["balance"] += amount
+    _persist_runtime_state()
     logger.info(f"[WALLET] User {username} recharged ${amount}. New balance: ${G_STATE.wallets[username]['balance']}")
     
     # Force a version bump so UI sees the change immediately
@@ -1564,6 +1762,7 @@ def main():
     alignment_engine = AlignmentEngine()
     visualizer = Visualizer()
     slots = [Slot(i, poly) for i, poly in enumerate(CONFIG.get('slots', []))]
+    slots = _restore_runtime_state(slots)
     G_STATE.auth_engine.clear_all()
     with G_STATE.vision_lock:
         G_STATE.slots, G_STATE.queue_manager, G_STATE.camera_online = slots, queue_manager, False

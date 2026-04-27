@@ -277,6 +277,9 @@ export function initUserUI() {
                     <p class="mono">Quote generated</p>
                     <p class="mono">Price: $${chargeFlowState.data.quote.total_price.toFixed(2)}</p>
                     <p class="mono">Multiplier: ${chargeFlowState.data.quote.multiplier}</p>
+                    ${chargeFlowState.data.quote.urgency_surcharge_applied ? `
+                        <p class="mono urgency-quote-alert">High urgency surcharge applied (+${chargeFlowState.data.quote.urgency_multiplier}x).</p>
+                    ` : ''}
                     <p class="mono">Requested: ${chargeFlowState.data.quote.requested_kwh} kWh @ ${chargeFlowState.data.quote.charge_rate_kw} kW</p>
                     <p class="mono">Expiry: ${new Date(chargeFlowState.data.quote.expires_at * 1000).toLocaleTimeString()}</p>
                     <button class="primary-btn btn-small" data-flow-action="pay">Proceed to Payment</button>
@@ -363,6 +366,7 @@ export function initUserUI() {
             slot_id: chargeFlowState.data.slot_id,
             date: chargeFlowState.data.date,
             time_window: chargeFlowState.data.time_window,
+            urgency: document.getElementById('user-urgency')?.value || 'LOW',
             requested_kwh: chargeFlowState.data.requested_kwh,
             charge_rate_kw: chargeFlowState.data.charge_rate_kw,
             allow_waitlist: chargeFlowState.data.allow_waitlist,
