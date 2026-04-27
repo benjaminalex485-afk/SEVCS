@@ -48,6 +48,12 @@ STRICT_MODE = CONFIG.get("strict_mode", False) if not DEV_MODE else False
 RUNTIME_STATE_PATH = os.path.join(os.path.dirname(__file__), "runtime_state.json")
 RUNTIME_STATE_SCHEMA_VERSION = 1
 DEFAULT_HIGH_URGENCY_MULTIPLIER = 1.25
+DEFAULT_USERS_DB = [
+    {"username": "admin", "password": "admin", "role": "admin"},
+    {"username": "user", "password": "user", "role": "user"},
+    {"username": "test3@gmail.com", "password": "123", "role": "user"},
+    {"username": "test4@gmail.com", "password": "123", "role": "user"}
+]
 # Freeze configuration after initial load and validation
 # CONFIG = utils.freeze_config(CONFIG)
 
@@ -105,12 +111,7 @@ class GlobalState:
         self.auth_engine = AuthEngine()
         self.sessions = {}          # slot_idx -> {battery_pct, power, energy, start_time}
         
-        self.users_db = [
-            {"username": "admin", "password": "admin", "role": "admin"},
-            {"username": "user", "password": "user", "role": "user"},
-            {"username": "test3@gmail.com", "password": "123", "role": "user"},
-            {"username": "test4@gmail.com", "password": "123", "role": "user"}
-        ]
+        self.users_db = copy.deepcopy(DEFAULT_USERS_DB)
         self.wallets = collections.defaultdict(lambda: {"balance": 0.0, "currency": "USD"})
         # Pre-seed some balance for testing
         self.wallets["test3@gmail.com"]["balance"] = 100.0
@@ -530,6 +531,16 @@ def _runtime_state_payload():
     }
 
 
+def _reset_wallet_defaults():
+    restored = collections.defaultdict(lambda: {"balance": 0.0, "currency": "USD"})
+    restored["test3@gmail.com"]["balance"] = 100.0
+    G_STATE.wallets = restored
+
+
+def _base_slots_from_config():
+    return [Slot(i, poly) for i, poly in enumerate(CONFIG.get("slots", []))]
+
+
 def _persist_runtime_state():
     try:
         payload = _runtime_state_payload()
@@ -563,11 +574,14 @@ def _restore_runtime_state(base_slots):
                 role = str(row.get("role", "user")).lower()
                 if not username or role not in {"admin", "user"}:
                     continue
-                restored_users.append({
+                entry = {
                     "username": username,
                     "password": password,
                     "role": role
-                })
+                }
+                if "name" in row and str(row.get("name", "")).strip():
+                    entry["name"] = str(row.get("name", "")).strip()
+                restored_users.append(entry)
             if restored_users:
                 G_STATE.users_db = restored_users
 
@@ -1530,6 +1544,63 @@ def admin_pricing_settings_update_api():
         "high_urgency_multiplier": normalized
     })
 
+
+@api_app.route('/api/admin_reset_persisted_data', methods=['POST'])
+def admin_reset_persisted_data_api():
+    data = get_request_data()
+    requested_fields = data.get("fields")
+    if not isinstance(requested_fields, list) or len(requested_fields) == 0:
+        return jsonify({"status": "error", "message": "fields must be a non-empty array"}), 400
+
+    allowed_fields = {
+        "wallets",
+        "bookings",
+        "quotes",
+        "payments",
+        "admin_slots",
+        "urgency_multiplier",
+        "users",
+    }
+    normalized_fields = []
+    for raw in requested_fields:
+        key = str(raw or "").strip().lower()
+        if key in allowed_fields and key not in normalized_fields:
+            normalized_fields.append(key)
+    if not normalized_fields:
+        return jsonify({"status": "error", "message": "No valid reset fields selected"}), 400
+
+    with G_STATE.vision_lock:
+        if "wallets" in normalized_fields:
+            _reset_wallet_defaults()
+        if "bookings" in normalized_fields:
+            G_STATE.slot_time_reservations = {}
+            with G_STATE.auth_engine.lock:
+                G_STATE.auth_engine.bookings.clear()
+                G_STATE.auth_engine.authorizations.clear()
+        if "quotes" in normalized_fields:
+            G_STATE.pricing_quotes = {}
+        if "payments" in normalized_fields:
+            G_STATE.payment_receipts = {}
+        if "admin_slots" in normalized_fields:
+            restored_slots = _base_slots_from_config()
+            G_STATE.slots = restored_slots
+            for idx, slot in enumerate(G_STATE.slots):
+                slot.slot_id = idx
+                _get_slot_capabilities(slot)
+        if "urgency_multiplier" in normalized_fields:
+            G_STATE.pricing_settings["high_urgency_multiplier"] = float(DEFAULT_HIGH_URGENCY_MULTIPLIER)
+        if "users" in normalized_fields:
+            G_STATE.users_db = copy.deepcopy(DEFAULT_USERS_DB)
+
+        _persist_runtime_state()
+
+    logger.info("[ADMIN] Reset persisted fields: %s", ",".join(normalized_fields))
+    return jsonify({
+        "status": "success",
+        "message": "Persisted data reset completed",
+        "reset_fields": normalized_fields
+    })
+
 @api_app.route('/api/recharge', methods=['POST'])
 def recharge_api():
     inner_data = get_request_data()
@@ -1761,7 +1832,7 @@ def main():
     queue_manager = QueueManager(max_dist=dist_norm)
     alignment_engine = AlignmentEngine()
     visualizer = Visualizer()
-    slots = [Slot(i, poly) for i, poly in enumerate(CONFIG.get('slots', []))]
+    slots = _base_slots_from_config()
     slots = _restore_runtime_state(slots)
     G_STATE.auth_engine.clear_all()
     with G_STATE.vision_lock:

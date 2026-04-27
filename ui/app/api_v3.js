@@ -458,6 +458,18 @@ export async function updateAdminPricingSettings(highUrgencyMultiplier) {
     return result.data;
 }
 
+export async function resetPersistedData(fields) {
+    const result = await safeFetch(`${BASE_URL}/api/admin_reset_persisted_data`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ payload: { fields } })
+    });
+    if (!result.ok) {
+        throw new Error(result.data?.message || result.error || `Persisted reset failed (${result.status})`);
+    }
+    return result.data;
+}
+
 /**
  * Flush pending actions with optional scope filtering
  */

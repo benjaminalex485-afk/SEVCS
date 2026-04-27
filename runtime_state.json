@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "saved_at": 1777270032.4851236,
+  "saved_at": 1777271800.3418546,
   "users_db": [
     {
       "username": "admin",
@@ -21,111 +21,22 @@
       "username": "test4@gmail.com",
       "password": "123",
       "role": "user"
-    },
-    {
-      "username": "johndoe@gmail.com",
-      "password": "12356789",
-      "role": "user",
-      "name": "John Doe"
     }
   ],
   "wallets": {
     "test3@gmail.com": {
       "balance": 100.0,
       "currency": "USD"
-    },
-    "johndoe@gmail.com": {
-      "balance": 26.6,
-      "currency": "USD"
     }
   },
-  "slot_time_reservations": {
-    "0|2026-04-27|06:00-12:00": {
-      "quote_id": "q_1777270018322_0",
-      "username": "johndoe@gmail.com",
-      "slot_id": 0,
-      "date": "2026-04-27",
-      "time_window": "06:00-12:00",
-      "auth_code": "745802",
-      "created_at": 1777270032.4851236
-    }
-  },
-  "pricing_quotes": {
-    "q_1777269714961_0": {
-      "quote_id": "q_1777269714961_0",
-      "username": "johndoe@gmail.com",
-      "slot_id": 0,
-      "charger_type": "STANDARD",
-      "charger_types": [
-        "AC_WIRED"
-      ],
-      "charging_levels": [
-        "LEVEL_2"
-      ],
-      "date": "2026-04-27",
-      "time_window": "06:00-12:00",
-      "urgency": "HIGH",
-      "unit_price": 10.0,
-      "multiplier": 1.0,
-      "time_multiplier": 1.0,
-      "urgency_multiplier": 1.25,
-      "urgency_surcharge_applied": true,
-      "requested_kwh": 20.0,
-      "charge_rate_kw": 7.0,
-      "total_price": 12.5,
-      "currency": "USD",
-      "expires_at": 1777270014.9610858,
-      "paid": false,
-      "consumed": false,
-      "allow_waitlist": false
-    },
-    "q_1777270018322_0": {
-      "quote_id": "q_1777270018322_0",
-      "username": "johndoe@gmail.com",
-      "slot_id": 0,
-      "charger_type": "FAST",
-      "charger_types": [
-        "AC_WIRED",
-        "DC_WIRED"
-      ],
-      "charging_levels": [
-        "LEVEL_2"
-      ],
-      "date": "2026-04-27",
-      "time_window": "06:00-12:00",
-      "urgency": "HIGH",
-      "unit_price": 18.0,
-      "multiplier": 1.0,
-      "time_multiplier": 1.0,
-      "urgency_multiplier": 1.3,
-      "urgency_surcharge_applied": true,
-      "requested_kwh": 20.0,
-      "charge_rate_kw": 7.0,
-      "total_price": 23.4,
-      "currency": "USD",
-      "expires_at": 1777270318.3226235,
-      "paid": true,
-      "consumed": true,
-      "allow_waitlist": false
-    }
-  },
-  "payment_receipts": {
-    "pay_1777270032475": {
-      "status": "success",
-      "payment_id": "pay_1777270032475",
-      "quote_id": "q_1777270018322_0",
-      "method": "WALLET",
-      "amount": 23.4,
-      "wallet_balance": 26.6,
-      "processed_at": 1777270032.4751506
-    }
-  },
+  "slot_time_reservations": {},
+  "pricing_quotes": {},
+  "payment_receipts": {},
   "admin_slots": [
     {
       "slot_id": 0,
       "charger_types": [
-        "AC_WIRED",
-        "DC_WIRED"
+        "AC_WIRED"
       ],
       "charging_levels": [
         "LEVEL_2"
@@ -137,20 +48,16 @@
         "AC_WIRED"
       ],
       "charging_levels": [
-        "LEVEL_1",
-        "LEVEL_2",
-        "LEVEL_3"
+        "LEVEL_2"
       ]
     },
     {
       "slot_id": 2,
       "charger_types": [
-        "AC_WIRED",
-        "WIRELESS"
+        "AC_WIRED"
       ],
       "charging_levels": [
-        "LEVEL_2",
-        "LEVEL_3"
+        "LEVEL_2"
       ]
     },
     {
@@ -164,6 +71,6 @@
     }
   ],
   "pricing_settings": {
-    "high_urgency_multiplier": 1.3
+    "high_urgency_multiplier": 1.25
   }
 }

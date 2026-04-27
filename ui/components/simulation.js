@@ -1,5 +1,5 @@
 import { events } from '../app/events.js';
-import { executeAction, getAdminPricingSettings, updateAdminPricingSettings } from '../app/api_v3.js';
+import { executeAction, getAdminPricingSettings, updateAdminPricingSettings, resetPersistedData } from '../app/api_v3.js';
 import { appState } from '../app/state_v3.js';
 
 export function initSimulationUI() {
@@ -10,6 +10,16 @@ export function initSimulationUI() {
 
     let lastRenderedHash = null;
     let pricingUi = { value: '1.25', loading: false, message: '', tone: 'ok' };
+    let resetUi = { loading: false, message: '', tone: 'ok', selected: new Set() };
+    const RESET_FIELDS = [
+        { key: 'wallets', label: 'Wallet balances' },
+        { key: 'bookings', label: 'Bookings / reservations' },
+        { key: 'quotes', label: 'Generated quotes' },
+        { key: 'payments', label: 'Payment receipts' },
+        { key: 'admin_slots', label: 'Admin slot capabilities and slot count' },
+        { key: 'urgency_multiplier', label: 'High urgency multiplier setting' },
+        { key: 'users', label: 'Registered users (keeps default built-in users)' }
+    ];
 
     function render(state = {}) {
         const isAdmin = appState.uiMode === 'ADMIN';
@@ -18,7 +28,7 @@ export function initSimulationUI() {
         if (!pricingUi.loading && Number.isFinite(serverMultiplier)) {
             pricingUi.value = String(serverMultiplier);
         }
-        const currentHash = `${isAdmin}_${appState.isSimulating}_${appState.requestHistory.length}_${serverMultiplier}_${pricingUi.loading}_${pricingUi.message}`;
+        const currentHash = `${isAdmin}_${appState.isSimulating}_${appState.requestHistory.length}_${serverMultiplier}_${pricingUi.loading}_${pricingUi.message}_${resetUi.loading}_${resetUi.message}_${Array.from(resetUi.selected).sort().join('|')}`;
         if (currentHash === lastRenderedHash) return;
         lastRenderedHash = currentHash;
 
@@ -83,6 +93,26 @@ export function initSimulationUI() {
                         ${pricingUi.message || ''}
                     </div>
                 </div>
+                <div class="card persisted-reset-card">
+                    <h3 style="margin-bottom: 0.5rem;">Persisted Data Reset</h3>
+                    <div class="mono persisted-reset-help">
+                        Select fields to delete from persisted storage, then confirm reset.
+                    </div>
+                    <div class="persisted-reset-list">
+                        ${RESET_FIELDS.map((entry) => `
+                            <label class="persisted-reset-option">
+                                <input type="checkbox" class="persisted-reset-checkbox" data-reset-field="${entry.key}" ${resetUi.selected.has(entry.key) ? 'checked' : ''} ${resetUi.loading ? 'disabled' : ''} />
+                                <span>${entry.label}</span>
+                            </label>
+                        `).join('')}
+                    </div>
+                    <button class="btn btn-danger" id="btn-reset-persisted-data" ${resetUi.loading ? 'disabled' : ''}>
+                        ${resetUi.loading ? 'Resetting...' : 'Reset Selected'}
+                    </button>
+                    <div class="mono ${resetUi.tone === 'error' ? 'slot-cap-feedback--err' : 'slot-cap-feedback--ok'}" style="margin-top:0.4rem; min-height:1rem;">
+                        ${resetUi.message || ''}
+                    </div>
+                </div>
             </div>
         `;
 
@@ -128,6 +158,52 @@ export function initSimulationUI() {
                 pricingUi.tone = 'error';
             } finally {
                 pricingUi.loading = false;
+                lastRenderedHash = null;
+                render(appState);
+            }
+        });
+        document.querySelectorAll('.persisted-reset-checkbox').forEach((el) => {
+            el.addEventListener('change', (ev) => {
+                const field = String(ev.target?.dataset?.resetField || '');
+                if (!field) return;
+                if (ev.target.checked) {
+                    resetUi.selected.add(field);
+                } else {
+                    resetUi.selected.delete(field);
+                }
+                resetUi.message = '';
+                lastRenderedHash = null;
+                render(appState);
+            });
+        });
+        document.getElementById('btn-reset-persisted-data')?.addEventListener('click', async () => {
+            const selected = Array.from(resetUi.selected);
+            if (selected.length === 0) {
+                resetUi.message = 'Select at least one field to reset.';
+                resetUi.tone = 'error';
+                lastRenderedHash = null;
+                render(appState);
+                return;
+            }
+            const confirmMsg = `Reset persisted data for: ${selected.join(', ')} ?`;
+            if (!confirm(confirmMsg)) return;
+            resetUi.loading = true;
+            resetUi.message = '';
+            resetUi.tone = 'ok';
+            lastRenderedHash = null;
+            render(appState);
+            try {
+                const res = await resetPersistedData(selected);
+                const done = Array.isArray(res?.reset_fields) ? res.reset_fields : selected;
+                resetUi.message = `Reset complete (${done.join(', ')})`;
+                resetUi.tone = 'ok';
+                resetUi.selected = new Set();
+                pricingUi.message = '';
+            } catch (err) {
+                resetUi.message = err?.message || 'Reset failed';
+                resetUi.tone = 'error';
+            } finally {
+                resetUi.loading = false;
                 lastRenderedHash = null;
                 render(appState);
             }
