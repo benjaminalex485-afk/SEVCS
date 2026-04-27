@@ -56,8 +56,8 @@ export const appState = {
     lastProcessedSource: null,
     allowActions: false,
     simSlots: [
-        {slot_id: 1, state: "FREE", charger_type: "FAST", assigned_global_id: null},
-        {slot_id: 2, state: "FREE", charger_type: "STANDARD", assigned_global_id: null}
+        {slot_id: 1, state: "FREE", charger_type: "STANDARD", charger_types: ["AC_WIRED"], charging_levels: ["LEVEL_2"], assigned_global_id: null},
+        {slot_id: 2, state: "FREE", charger_type: "FAST", charger_types: ["DC_WIRED"], charging_levels: ["LEVEL_3"], assigned_global_id: null}
     ],
     
     // Constants
@@ -104,6 +104,20 @@ function deepFreeze(obj) {
  * Contract-Enforced Normalization
  */
 function normalizeSnapshot(s) {
+    const normalizedSlots = (Array.isArray(s.slots) ? s.slots : []).map((slot) => {
+        const chargerTypes = Array.isArray(slot?.charger_types) && slot.charger_types.length > 0
+            ? slot.charger_types
+            : [String(slot?.charger_type || '').toUpperCase() === 'FAST' ? 'DC_WIRED' : 'AC_WIRED'];
+        const chargingLevels = Array.isArray(slot?.charging_levels) && slot.charging_levels.length > 0
+            ? slot.charging_levels
+            : [String(slot?.charger_type || '').toUpperCase() === 'FAST' ? 'LEVEL_3' : 'LEVEL_2'];
+        return {
+            ...slot,
+            charger_types: chargerTypes,
+            charging_levels: chargingLevels,
+            charger_type: slot?.charger_type || (chargingLevels.includes('LEVEL_3') ? 'FAST' : 'STANDARD')
+        };
+    });
     return {
         snapshot_sequence: Number(s.snapshot_sequence),
         snapshot_version: Number(s.snapshot_version),
@@ -111,7 +125,7 @@ function normalizeSnapshot(s) {
         system_mode: String(s.system_mode || s.mode || ""),
         system_health: Number(s.system_health || s.health || 0),
         freeze_state: Boolean(s.freeze_state),
-        slots: Array.isArray(s.slots) ? s.slots : [],
+        slots: normalizedSlots,
         queue: Array.isArray(s.queue) ? s.queue : [],
         user_bookings: Array.isArray(s.user_bookings) ? s.user_bookings : [],
         user_active_sessions: Array.isArray(s.user_active_sessions) ? s.user_active_sessions : [],

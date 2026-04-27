@@ -94,9 +94,19 @@ export async function signup(profile) {
     return { success: false, message: result.data?.message || result.error || 'Signup failed' };
 }
 
-export async function getAvailability(username = null) {
+export async function getAvailability(username = null, capabilityFilter = null) {
     const url = new URL(`${BASE_URL}/api/availability`);
     if (username) url.searchParams.append('username', username);
+    if (capabilityFilter?.charger_types?.length) {
+        for (const t of capabilityFilter.charger_types) {
+            url.searchParams.append('charger_types', t);
+        }
+    }
+    if (capabilityFilter?.charging_levels?.length) {
+        for (const lv of capabilityFilter.charging_levels) {
+            url.searchParams.append('charging_levels', lv);
+        }
+    }
     const result = await safeFetch(url.toString(), { method: 'GET' });
     if (!result.ok) {
         throw new Error(result.data?.message || result.error || `Availability failed (${result.status})`);
@@ -247,11 +257,35 @@ events.on('RESYNC_STARTED', () => {
  */
 const ACTION_TIMEOUT_MS = appState.INTENT_TIMEOUT_MS;
 
+/** Align sim admin payloads with production: snapshot slot_id is 0-based; sim rows may use 1-based ids. */
+function simAdminSlotFromPayload(payloadSlotId, simSlots) {
+    const n = simSlots.length;
+    const r = Number(payloadSlotId);
+    if (!Number.isFinite(r) || n === 0) return null;
+    if (r >= 0 && r < n) return simSlots[r];
+    if (r >= 1 && r <= n) return simSlots[r - 1];
+    return simSlots.find((s) => Number(s.slot_id) === r) || null;
+}
+
+function simAdminSlotIndexFromPayload(payloadSlotId, simSlots) {
+    const n = simSlots.length;
+    const r = Number(payloadSlotId);
+    if (!Number.isFinite(r) || n === 0) return -1;
+    if (r >= 0 && r < n) return r;
+    if (r >= 1 && r <= n) return r - 1;
+    return simSlots.findIndex((s) => Number(s.slot_id) === r);
+}
+
 export async function executeAction(endpoint, payload, intentKey = null) {
     // 0. Policy Guard: Allow financial actions even during desync
     console.log(`[API] executeAction called: ${endpoint}`, payload);
     const isQuoteBackedBooking = endpoint === 'book' && !!payload?.quote_id;
-    const isCriticalVisionAction = !['recharge', 'cancel_booking', 'login', 'signup', 'find_slot', 'authorize', 'start_charging'].includes(endpoint) && !isQuoteBackedBooking;
+    // Admin slot CRUD is configuration, not vision-frame booking; allow while snapshots catch up.
+    const nonVisionGatedEndpoints = new Set([
+        'recharge', 'cancel_booking', 'login', 'signup', 'find_slot', 'authorize', 'start_charging',
+        'admin_add_slot', 'admin_remove_slot', 'admin_update_slot_type'
+    ]);
+    const isCriticalVisionAction = !nonVisionGatedEndpoints.has(endpoint) && !isQuoteBackedBooking;
     
     if (isCriticalVisionAction && !appState.allowActions) {
         const blockMessage = 'System not synchronized. Please wait for health indicator to turn Green.';
@@ -288,15 +322,30 @@ export async function executeAction(endpoint, payload, intentKey = null) {
         let success = false;
         if (endpoint === 'admin_add_slot') {
             const newId = appState.simSlots.length > 0 ? Math.max(...appState.simSlots.map(s => s.slot_id)) + 1 : 1;
-            appState.simSlots.push({ slot_id: newId, state: 'FREE', charger_type: payload.charger_type || 'STANDARD', assigned_global_id: null });
+            const chargerTypes = Array.isArray(payload.charger_types) && payload.charger_types.length > 0 ? payload.charger_types : ['AC_WIRED'];
+            const chargingLevels = Array.isArray(payload.charging_levels) && payload.charging_levels.length > 0 ? payload.charging_levels : ['LEVEL_2'];
+            appState.simSlots.push({
+                slot_id: newId,
+                state: 'FREE',
+                charger_type: payload.charger_type || 'STANDARD',
+                charger_types: chargerTypes,
+                charging_levels: chargingLevels,
+                assigned_global_id: null
+            });
             success = true;
         } else if (endpoint === 'admin_remove_slot') {
-            appState.simSlots = appState.simSlots.filter(s => s.slot_id != payload.slot_id);
-            success = true;
+            const idx = simAdminSlotIndexFromPayload(payload.slot_id, appState.simSlots);
+            if (idx >= 0) {
+                appState.simSlots.splice(idx, 1);
+                appState.simSlots.forEach((s, i) => { s.slot_id = i; });
+                success = true;
+            }
         } else if (endpoint === 'admin_update_slot_type') {
-            const slot = appState.simSlots.find(s => s.slot_id == payload.slot_id);
+            const slot = simAdminSlotFromPayload(payload.slot_id, appState.simSlots);
             if (slot) {
-                slot.charger_type = payload.charger_type;
+                slot.charger_types = Array.isArray(payload.charger_types) && payload.charger_types.length > 0 ? payload.charger_types : slot.charger_types || ['AC_WIRED'];
+                slot.charging_levels = Array.isArray(payload.charging_levels) && payload.charging_levels.length > 0 ? payload.charging_levels : slot.charging_levels || ['LEVEL_2'];
+                slot.charger_type = payload.charger_type || slot.charger_type;
                 success = true;
             }
         }
@@ -305,13 +354,17 @@ export async function executeAction(endpoint, payload, intentKey = null) {
             console.log(`[VoltPark ADMIN] ${endpoint} SUCCESS - Local State Updated`);
             // Instant local feedback
             events.emit('STATE_UPDATED', appState);
-            
+
+            const simResponse = {
+                status: 'OK',
+                snapshot_version: appState.snapshotVersion + 1,
+                snapshot_sequence: appState.lastSequence + 1
+            };
             setTimeout(() => {
-                const response = { status: 'OK', snapshot_version: appState.snapshotVersion + 1, snapshot_sequence: appState.lastSequence + 1 };
-                events.emit('ACTION_RESPONSE', { requestId, endpoint, status: 'NEW', ...response, payload: response });
-                resolveAction(requestId, response);
+                events.emit('ACTION_RESPONSE', { requestId, endpoint, status: 'NEW', ...simResponse, payload: simResponse });
+                resolveAction(requestId, simResponse);
             }, 500);
-            return;
+            return { ...simResponse };
         }
     }
 
@@ -369,16 +422,20 @@ export async function bookSlot(slotId) {
 /**
  * Administrative Infrastructure Management
  */
-export async function addSlot(chargerType = 'STANDARD') {
-    return executeAction('admin_add_slot', { charger_type: chargerType });
+export async function addSlot(chargerTypes = ['AC_WIRED'], chargingLevels = ['LEVEL_2']) {
+    return executeAction('admin_add_slot', { charger_types: chargerTypes, charging_levels: chargingLevels });
 }
 
 export async function removeSlot(slotId) {
     return executeAction('admin_remove_slot', { slot_id: slotId });
 }
 
-export async function updateSlotType(slotId, chargerType) {
-    return executeAction('admin_update_slot_type', { slot_id: slotId, charger_type: chargerType });
+export async function updateSlotType(slotId, chargerTypes, chargingLevels) {
+    return executeAction('admin_update_slot_type', {
+        slot_id: slotId,
+        charger_types: chargerTypes,
+        charging_levels: chargingLevels
+    });
 }
 
 /**

@@ -104,15 +104,6 @@ export function renderAuthUI() {
                     <label>Password</label>
                     <input type="password" id="password" placeholder="••••••••" required>
                 </div>
-                ${isSignup ? `
-                    <div class="input-group">
-                        <label>Vehicle Type</label>
-                        <select id="vehicleType">
-                            <option value="FAST">Fast (DC)</option>
-                            <option value="STANDARD">Standard (AC)</option>
-                        </select>
-                    </div>
-                ` : ''}
                 
                 <button type="submit" class="primary-btn" id="submit-btn">
                     ${isSignup ? 'Create Account' : 'Sign In'}
@@ -149,12 +140,9 @@ export function renderAuthUI() {
         const password = passwordEl.value;
         
         let name = null;
-        let vehicleType = null;
         if (isSignup) {
             const nameEl = document.getElementById('name');
-            const vehicleEl = document.getElementById('vehicleType');
             if (nameEl) name = nameEl.value;
-            if (vehicleEl) vehicleType = vehicleEl.value;
         }
 
         if (appState.authStatus === 'AUTHENTICATING') {
@@ -169,7 +157,7 @@ export function renderAuthUI() {
             let result;
             if (isSignup) {
                 console.log('[VoltPark AUTH] Attempting Signup:', email);
-                result = await signup({ name, email, password, vehicleType });
+                result = await signup({ name, email, password });
                 
                 if (result.success) {
                     container.dataset.mode = 'login';

@@ -28,6 +28,10 @@ class SuggestionState(Enum):
     STABLE = 1    # 1-3s
     COMMITTED = 2 # > 3s
 
+
+DEFAULT_CHARGER_TYPES = ["AC_WIRED"]
+DEFAULT_CHARGING_LEVELS = ["LEVEL_2"]
+
 class Slot:
     def __init__(self, slot_id, polygon):
         self.slot_id = slot_id
@@ -71,6 +75,29 @@ class Slot:
         self.occlusion_timer = 0.0
         self.state_enter_time = utils.system_now(caller="main_loop")
         self.last_update_time = utils.system_now(caller="main_loop")
+        self.charger_types = list(DEFAULT_CHARGER_TYPES)
+        self.charging_levels = list(DEFAULT_CHARGING_LEVELS)
+
+    def get_capabilities(self):
+        charger_types = list(getattr(self, "charger_types", None) or [])
+        charging_levels = list(getattr(self, "charging_levels", None) or [])
+        if charger_types and charging_levels:
+            return charger_types, charging_levels
+
+        legacy_type = str(getattr(self, "charger_type", "") or "").upper()
+        if legacy_type == "FAST":
+            charger_types = charger_types or ["DC_WIRED"]
+            charging_levels = charging_levels or ["LEVEL_3"]
+        else:
+            charger_types = charger_types or list(DEFAULT_CHARGER_TYPES)
+            charging_levels = charging_levels or list(DEFAULT_CHARGING_LEVELS)
+        return charger_types, charging_levels
+
+    def legacy_charger_type(self):
+        charger_types, charging_levels = self.get_capabilities()
+        if "LEVEL_3" in charging_levels or "DC_WIRED" in charger_types:
+            return "FAST"
+        return "STANDARD"
 
     def update_hold(self, now=0.0):
         """FPS-aware HOLD decay logic."""
@@ -93,6 +120,7 @@ class Slot:
 
     def to_dict(self, frame_time=0.0):
         """Pure & Deterministic projection of slot state."""
+        charger_types, charging_levels = self.get_capabilities()
         return {
             "slot_id": int(self.slot_id),
             "state": self.state.name,
@@ -107,7 +135,10 @@ class Slot:
                 "state": self.suggestion_state.name,
                 "stable_for": float(min(frame_time - self.suggestion_timestamp, 10.0)) if self.suggestion_timestamp > 0 else 0.0
             },
-            "occluded": self.occlusion_timer > 0
+            "occluded": self.occlusion_timer > 0,
+            "charger_types": list(charger_types),
+            "charging_levels": list(charging_levels),
+            "charger_type": self.legacy_charger_type()
         }
 
     def force_safe_state(self):

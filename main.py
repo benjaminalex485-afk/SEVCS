@@ -419,8 +419,88 @@ def get_request_data():
         return data["payload"]
     return data
 
+ALLOWED_CHARGER_TYPES = {"AC_WIRED", "DC_WIRED", "WIRELESS"}
+ALLOWED_CHARGING_LEVELS = {"LEVEL_1", "LEVEL_2", "LEVEL_3"}
+LEGACY_TYPE_MAPPING = {
+    "FAST": (["DC_WIRED"], ["LEVEL_3"]),
+    "STANDARD": (["AC_WIRED"], ["LEVEL_2"]),
+}
+
+def _normalize_enum_list(raw_value, allowed, fallback):
+    if raw_value is None:
+        return list(fallback)
+    values = raw_value if isinstance(raw_value, list) else [raw_value]
+    normalized = []
+    for item in values:
+        token = str(item or "").strip().upper()
+        if not token:
+            continue
+        if token in allowed and token not in normalized:
+            normalized.append(token)
+    return normalized or list(fallback)
+
+def _extract_requested_capabilities(data):
+    requested_types = _normalize_enum_list(data.get("charger_types"), ALLOWED_CHARGER_TYPES, [])
+    requested_levels = _normalize_enum_list(data.get("charging_levels"), ALLOWED_CHARGING_LEVELS, [])
+    if not requested_types and data.get("charger_type"):
+        legacy = str(data.get("charger_type") or "").upper()
+        requested_types, requested_levels = LEGACY_TYPE_MAPPING.get(legacy, ([], []))
+    return requested_types, requested_levels
+
+def _get_slot_capabilities(slot):
+    if hasattr(slot, "get_capabilities"):
+        charger_types, charging_levels = slot.get_capabilities()
+    else:
+        legacy = str(getattr(slot, "charger_type", "STANDARD") or "").upper()
+        charger_types, charging_levels = LEGACY_TYPE_MAPPING.get(legacy, LEGACY_TYPE_MAPPING["STANDARD"])
+    charger_types = _normalize_enum_list(charger_types, ALLOWED_CHARGER_TYPES, ["AC_WIRED"])
+    charging_levels = _normalize_enum_list(charging_levels, ALLOWED_CHARGING_LEVELS, ["LEVEL_2"])
+    setattr(slot, "charger_types", charger_types)
+    setattr(slot, "charging_levels", charging_levels)
+    if hasattr(slot, "legacy_charger_type"):
+        legacy_label = slot.legacy_charger_type()
+    else:
+        legacy_label = "FAST" if ("LEVEL_3" in charging_levels or "DC_WIRED" in charger_types) else "STANDARD"
+    setattr(slot, "charger_type", legacy_label)
+    return charger_types, charging_levels
+
+def _slot_matches_capabilities(slot, requested_types, requested_levels):
+    charger_types, charging_levels = _get_slot_capabilities(slot)
+    type_ok = (not requested_types) or bool(set(charger_types).intersection(requested_types))
+    level_ok = (not requested_levels) or bool(set(charging_levels).intersection(requested_levels))
+    return type_ok and level_ok
+
+
+def _capabilities_from_query_args():
+    """Parse optional charger_types / charging_levels from repeated or comma-separated query params."""
+    raw_types = []
+    for t in request.args.getlist("charger_types"):
+        raw_types.extend([x.strip().upper() for x in str(t).split(",") if str(x).strip()])
+    raw_levels = []
+    for t in request.args.getlist("charging_levels"):
+        raw_levels.extend([x.strip().upper() for x in str(t).split(",") if str(x).strip()])
+    types = _normalize_enum_list(raw_types, ALLOWED_CHARGER_TYPES, []) if raw_types else []
+    levels = _normalize_enum_list(raw_levels, ALLOWED_CHARGING_LEVELS, []) if raw_levels else []
+    return types, levels
+
 def _get_slot_charger_type(slot):
+    _get_slot_capabilities(slot)
     return getattr(slot, "charger_type", "STANDARD")
+
+
+def _resolve_admin_slot_index(slot_id_raw, n_slots):
+    """Map admin payload slot_id to G_STATE.slots index. Snapshot slot_id is 0-based; payloads may use 1-based."""
+    try:
+        raw = int(slot_id_raw)
+    except (TypeError, ValueError):
+        return None
+    if n_slots <= 0:
+        return None
+    if 0 <= raw < n_slots:
+        return raw
+    if 1 <= raw <= n_slots:
+        return raw - 1
+    return None
 
 def _get_time_multiplier(time_window):
     if not time_window:
@@ -885,6 +965,7 @@ def signup_api():
 def book_slot_api():
     data = get_request_data()
     username = data.get('username', 'Anonymous')
+    req_ct, req_cl = _extract_requested_capabilities(data)
     identifier = f"{request.remote_addr}:{username}"
     reservation_key = None
     
@@ -913,6 +994,13 @@ def book_slot_api():
             existing_res = G_STATE.slot_time_reservations.get(reservation_key)
             if existing_res and existing_res.get("quote_id") != quote_id:
                 return jsonify({"status": "error", "message": "Slot already booked for selected date/time"}), 409
+            q_slot_idx = int(quote.get("slot_id", -1))
+            if (req_ct or req_cl) and 0 <= q_slot_idx < len(G_STATE.slots):
+                if not _slot_matches_capabilities(G_STATE.slots[q_slot_idx], req_ct, req_cl):
+                    return jsonify({
+                        "status": "error",
+                        "message": "Slot does not support the selected Charger Type / Charging Level"
+                    }), 409
 
     with G_STATE.vision_lock:
         assigned_idx = -1
@@ -930,16 +1018,25 @@ def book_slot_api():
                 assigned_idx = raw_slot_id - 1
             else:
                 return jsonify({"status": "error", "message": "Slot not found"}), 404
+            if (req_ct or req_cl) and not _slot_matches_capabilities(G_STATE.slots[assigned_idx], req_ct, req_cl):
+                return jsonify({
+                    "status": "error",
+                    "message": "Slot does not support the selected Charger Type / Charging Level"
+                }), 409
             logger.info(f"[BOOKING] Manual booking request for Slot {assigned_idx+1}")
         else:
             # AUTO-FIND logic
             for i, slot in enumerate(G_STATE.slots):
+                if (req_ct or req_cl) and not _slot_matches_capabilities(slot, req_ct, req_cl):
+                    continue
                 if slot.locked_track_id is not None:
                     if i not in G_STATE.auth_engine.bookings or G_STATE.auth_engine.is_expired(i):
                         assigned_idx = i
                         break
             if assigned_idx == -1:
                 for i, slot in enumerate(G_STATE.slots):
+                    if (req_ct or req_cl) and not _slot_matches_capabilities(slot, req_ct, req_cl):
+                        continue
                     if slot.state == SlotState.FREE and (i not in G_STATE.auth_engine.bookings or G_STATE.auth_engine.is_expired(i)):
                         assigned_idx = i
                         break
@@ -962,7 +1059,8 @@ def book_slot_api():
             }
         return jsonify({"status": "success", "slot_id": assigned_idx + 1, "auth_code": code})
     
-    return jsonify({"status": "error", "message": "No slots available"}), 400
+    no_slot_msg = "No slots match selected Charger Type / Charging Level." if (req_ct or req_cl) else "No slots available"
+    return jsonify({"status": "error", "message": no_slot_msg}), 400
 
 @api_app.route('/api/cancel_booking', methods=['POST'])
 def cancel_booking_api():
@@ -1031,14 +1129,20 @@ def cancel_booking_api():
 @api_app.route('/api/availability', methods=['GET'])
 def availability_api():
     username = request.args.get("username", "Anonymous")
+    filter_types, filter_levels = _capabilities_from_query_args()
     with G_STATE.vision_lock:
+        free_slots = [s for s in G_STATE.slots if s.state == SlotState.FREE]
+        if filter_types or filter_levels:
+            free_slots = [s for s in free_slots if _slot_matches_capabilities(s, filter_types, filter_levels)]
         slots = [
             {
                 "slot_id": slot.slot_id,
                 "charger_type": _get_slot_charger_type(slot),
+                "charger_types": _get_slot_capabilities(slot)[0],
+                "charging_levels": _get_slot_capabilities(slot)[1],
                 "state": slot.state.name
             }
-            for slot in G_STATE.slots if slot.state == SlotState.FREE
+            for slot in free_slots
         ]
     logger.info(f"[CHARGE_FLOW] availability_requested user={username} free_slots={len(slots)}")
     return jsonify({
@@ -1068,6 +1172,7 @@ def pricing_quote_api():
     requested_kwh = max(5.0, min(120.0, requested_kwh))
     charge_rate_kw = max(3.0, min(150.0, charge_rate_kw))
 
+    req_ct, req_cl = _extract_requested_capabilities(data)
     with G_STATE.vision_lock:
         slot = next((s for s in G_STATE.slots if s.slot_id == slot_idx), None)
         if not slot:
@@ -1077,7 +1182,13 @@ def pricing_quote_api():
         reservation_key = _reservation_key(slot_idx, date, time_window)
         if reservation_key in G_STATE.slot_time_reservations:
             return jsonify({"status": "error", "message": "Slot already booked for selected date/time"}), 409
+        if (req_ct or req_cl) and not _slot_matches_capabilities(slot, req_ct, req_cl):
+            return jsonify({
+                "status": "error",
+                "message": "Slot does not support the selected Charger Type / Charging Level"
+            }), 409
         charger_type = _get_slot_charger_type(slot)
+        charger_types, charging_levels = _get_slot_capabilities(slot)
 
     base_price = 10.0 if charger_type == "STANDARD" else 18.0
     multiplier = _get_time_multiplier(time_window)
@@ -1091,6 +1202,8 @@ def pricing_quote_api():
         "username": username,
         "slot_id": slot_idx,
         "charger_type": charger_type,
+        "charger_types": charger_types,
+        "charging_levels": charging_levels,
         "date": date,
         "time_window": time_window,
         "unit_price": base_price,
@@ -1160,25 +1273,35 @@ def payment_mock_api():
 @api_app.route('/api/admin_add_slot', methods=['POST'])
 def admin_add_slot_api():
     data = get_request_data()
-    charger_type = (data.get('charger_type') or "STANDARD").upper()
+    requested_types, requested_levels = _extract_requested_capabilities(data)
     with G_STATE.vision_lock:
         slot_id = len(G_STATE.slots)
         # Use the last polygon as a placeholder for debug/admin runtime behavior.
         polygon = G_STATE.slots[-1].polygon if G_STATE.slots else np.array([[50, 50], [250, 50], [250, 250], [50, 250]], np.int32)
-        G_STATE.slots.append(Slot(slot_id, polygon))
-    logger.info(f"[ADMIN] Added slot {slot_id + 1} (type={charger_type})")
-    return jsonify({"status": "success", "slot_id": slot_id + 1, "charger_type": charger_type})
+        new_slot = Slot(slot_id, polygon)
+        if requested_types:
+            new_slot.charger_types = requested_types
+        if requested_levels:
+            new_slot.charging_levels = requested_levels
+        _get_slot_capabilities(new_slot)
+        G_STATE.slots.append(new_slot)
+    logger.info(f"[ADMIN] Added slot {slot_id + 1} (types={new_slot.charger_types}, levels={new_slot.charging_levels})")
+    return jsonify({
+        "status": "success",
+        "slot_id": slot_id + 1,
+        "charger_type": _get_slot_charger_type(new_slot),
+        "charger_types": list(new_slot.charger_types),
+        "charging_levels": list(new_slot.charging_levels),
+    })
 
 @api_app.route('/api/admin_remove_slot', methods=['POST'])
 def admin_remove_slot_api():
     data = get_request_data()
-    try:
-        target_slot = int(data.get('slot_id')) - 1
-    except (TypeError, ValueError):
-        return jsonify({"status": "error", "message": "Invalid slot_id"}), 400
     with G_STATE.vision_lock:
-        if target_slot < 0 or target_slot >= len(G_STATE.slots):
-            return jsonify({"status": "error", "message": "Slot not found"}), 404
+        n = len(G_STATE.slots)
+        target_slot = _resolve_admin_slot_index(data.get('slot_id'), n)
+        if target_slot is None:
+            return jsonify({"status": "error", "message": "Invalid slot_id"}), 400
         G_STATE.slots.pop(target_slot)
         # Reindex for predictable UI behavior
         for idx, slot in enumerate(G_STATE.slots):
@@ -1189,17 +1312,26 @@ def admin_remove_slot_api():
 @api_app.route('/api/admin_update_slot_type', methods=['POST'])
 def admin_update_slot_type_api():
     data = get_request_data()
-    try:
-        target_slot = int(data.get('slot_id')) - 1
-    except (TypeError, ValueError):
-        return jsonify({"status": "error", "message": "Invalid slot_id"}), 400
-    charger_type = (data.get('charger_type') or "STANDARD").upper()
+    requested_types, requested_levels = _extract_requested_capabilities(data)
     with G_STATE.vision_lock:
-        if target_slot < 0 or target_slot >= len(G_STATE.slots):
-            return jsonify({"status": "error", "message": "Slot not found"}), 404
-        setattr(G_STATE.slots[target_slot], "charger_type", charger_type)
-    logger.info(f"[ADMIN] Updated slot {target_slot + 1} type to {charger_type}")
-    return jsonify({"status": "success", "slot_id": target_slot + 1, "charger_type": charger_type})
+        n = len(G_STATE.slots)
+        target_slot = _resolve_admin_slot_index(data.get('slot_id'), n)
+        if target_slot is None:
+            return jsonify({"status": "error", "message": "Invalid slot_id"}), 400
+        slot = G_STATE.slots[target_slot]
+        if requested_types:
+            slot.charger_types = requested_types
+        if requested_levels:
+            slot.charging_levels = requested_levels
+        _get_slot_capabilities(slot)
+    logger.info(f"[ADMIN] Updated slot {target_slot + 1} capabilities to types={slot.charger_types}, levels={slot.charging_levels}")
+    return jsonify({
+        "status": "success",
+        "slot_id": target_slot + 1,
+        "charger_type": _get_slot_charger_type(slot),
+        "charger_types": list(slot.charger_types),
+        "charging_levels": list(slot.charging_levels),
+    })
 
 @api_app.route('/api/recharge', methods=['POST'])
 def recharge_api():
@@ -1225,6 +1357,7 @@ def find_slot_api():
     date = data.get("date") or _current_date_str()
     time_window = data.get("time_window") or _current_time_window()
     username = data.get("username", "Anonymous")
+    requested_types, requested_levels = _extract_requested_capabilities(data)
 
     with G_STATE.vision_lock:
         free_candidates = []
@@ -1232,6 +1365,8 @@ def find_slot_api():
         for slot in G_STATE.slots:
             reservation_key = _reservation_key(slot.slot_id, date, time_window)
             if reservation_key in G_STATE.slot_time_reservations:
+                continue
+            if not _slot_matches_capabilities(slot, requested_types, requested_levels):
                 continue
             if slot.state == SlotState.FREE:
                 free_candidates.append(slot)
@@ -1250,6 +1385,8 @@ def find_slot_api():
                 "recommended_slot": {
                     "slot_id": selected.slot_id,
                     "charger_type": _get_slot_charger_type(selected),
+                    "charger_types": _get_slot_capabilities(selected)[0],
+                    "charging_levels": _get_slot_capabilities(selected)[1],
                     "state": selected.state.name
                 }
             })
@@ -1268,13 +1405,16 @@ def find_slot_api():
                 "recommended_slot": {
                     "slot_id": selected_busy.slot_id,
                     "charger_type": _get_slot_charger_type(selected_busy),
+                    "charger_types": _get_slot_capabilities(selected_busy)[0],
+                    "charging_levels": _get_slot_capabilities(selected_busy)[1],
                     "state": selected_busy.state.name
                 },
                 "can_reserve_with_payment": True
             })
 
     logger.info(f"[FIND_SLOT] no_slot_found user={username} date={date} tw={time_window} type={v_type} urgency={urgency}")
-    return jsonify({"status": "error", "message": "No slots available"}), 400
+    mismatch_message = "No slots match selected Charger Type / Charging Level." if (requested_types or requested_levels) else "No slots available"
+    return jsonify({"status": "error", "message": mismatch_message}), 400
 
 @api_app.route('/api/authorize', methods=['POST'])
 def authorize_api():

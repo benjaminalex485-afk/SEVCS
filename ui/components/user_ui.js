@@ -31,6 +31,8 @@ export function initUserUI() {
     const initialFlowData = () => ({
         slot_id: null,
         charger_type: null,
+        charger_types: [],
+        charging_levels: [],
         date: null,
         time_window: null,
         requested_kwh: 20,
@@ -55,6 +57,31 @@ export function initUserUI() {
         const n = Number(slotId);
         if (Number.isNaN(n)) return String(slotId ?? '-');
         return String(n + 1);
+    }
+
+    function readUserCapabilityFilters() {
+        const ct = document.getElementById('user-charger-type');
+        const cl = document.getElementById('user-charging-level');
+        const charger_types = ct?.value ? [ct.value] : [];
+        const charging_levels = cl?.value ? [cl.value] : [];
+        return { charger_types, charging_levels };
+    }
+
+    function userCapabilityFilterActive(filters) {
+        return (filters.charger_types?.length > 0) || (filters.charging_levels?.length > 0);
+    }
+
+    function slotMatchesUserFilters(slot, filters) {
+        if (!userCapabilityFilterActive(filters)) return true;
+        const types = Array.isArray(slot.charger_types) && slot.charger_types.length
+            ? slot.charger_types
+            : (String(slot.charger_type || '').toUpperCase() === 'FAST' ? ['DC_WIRED'] : ['AC_WIRED']);
+        const levels = Array.isArray(slot.charging_levels) && slot.charging_levels.length
+            ? slot.charging_levels
+            : (String(slot.charger_type || '').toUpperCase() === 'FAST' ? ['LEVEL_3'] : ['LEVEL_2']);
+        const typeOk = !filters.charger_types.length || filters.charger_types.some((t) => types.includes(t));
+        const levelOk = !filters.charging_levels.length || filters.charging_levels.some((l) => levels.includes(l));
+        return typeOk && levelOk;
     }
 
     function resetFlow() {
@@ -304,11 +331,16 @@ export function initUserUI() {
     }
 
     async function handleAvailability() {
-        const payload = await getAvailability(appState.session.userId);
+        const cap = readUserCapabilityFilters();
+        const payload = await getAvailability(appState.session.userId, cap);
         chargeFlowState.data.available_slots = payload.slots || [];
         console.log('[ChargeFlow] API_SUCCESS: availability');
         if (chargeFlowState.data.available_slots.length === 0) {
-            setFlowError('No slots available right now');
+            setFlowError(
+                userCapabilityFilterActive(cap)
+                    ? 'No free slots match your Charger Type / Charging Level. Choose Any or adjust admin slot capabilities.'
+                    : 'No slots available right now'
+            );
             return;
         }
         if (chargeFlowState.data.slot_id !== null && !Number.isNaN(Number(chargeFlowState.data.slot_id))) {
@@ -326,6 +358,7 @@ export function initUserUI() {
     }
 
     async function handleQuote() {
+        const cap = readUserCapabilityFilters();
         const quote = await getPricingQuote({
             slot_id: chargeFlowState.data.slot_id,
             date: chargeFlowState.data.date,
@@ -333,7 +366,9 @@ export function initUserUI() {
             requested_kwh: chargeFlowState.data.requested_kwh,
             charge_rate_kw: chargeFlowState.data.charge_rate_kw,
             allow_waitlist: chargeFlowState.data.allow_waitlist,
-            username: appState.session.userId
+            username: appState.session.userId,
+            charger_types: cap.charger_types,
+            charging_levels: cap.charging_levels
         });
         chargeFlowState.data.quote = quote;
         console.log('[ChargeFlow] API_SUCCESS: pricing_quote');
@@ -354,12 +389,15 @@ export function initUserUI() {
     }
 
     async function finalizeBooking() {
+        const cap = readUserCapabilityFilters();
         const res = await executeAction('book', {
             slot_id: chargeFlowState.data.slot_id,
             username: appState.session.userId,
             quote_id: chargeFlowState.data.quote.quote_id,
             date: chargeFlowState.data.date,
-            time_window: chargeFlowState.data.time_window
+            time_window: chargeFlowState.data.time_window,
+            charger_types: cap.charger_types,
+            charging_levels: cap.charging_levels
         }, 'charge_flow_book');
         if (res?.status !== 'success') {
             throw new Error(res?.message || res?.error || 'Booking failed');
@@ -478,6 +516,24 @@ export function initUserUI() {
                             <select id="user-urgency">
                                 <option value="LOW">Low</option>
                                 <option value="HIGH">High</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label>Charger Type</label>
+                            <select id="user-charger-type">
+                                <option value="">Any</option>
+                                <option value="AC_WIRED">AC (Wired)</option>
+                                <option value="DC_WIRED">DC (Wired)</option>
+                                <option value="WIRELESS">Wireless</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label>Charging Level</label>
+                            <select id="user-charging-level">
+                                <option value="">Any</option>
+                                <option value="LEVEL_1">Level 1 (120V)</option>
+                                <option value="LEVEL_2">Level 2 (240V)</option>
+                                <option value="LEVEL_3">Level 3 (DC Fast)</option>
                             </select>
                         </div>
                         <button class="primary-btn" id="btn-find-slot">Find Best Slot</button>
@@ -721,6 +777,8 @@ export function initUserUI() {
                     const result = await executeAction('find_slot', {
                         type: document.getElementById('user-vehicle').value,
                         urgency: document.getElementById('user-urgency').value,
+                        charger_types: [document.getElementById('user-charger-type')?.value].filter(Boolean),
+                        charging_levels: [document.getElementById('user-charging-level')?.value].filter(Boolean),
                         date: lookupDate,
                         time_window: lookupWindow,
                         username: appState.session.userId
@@ -736,6 +794,8 @@ export function initUserUI() {
                     }
                     chargeFlowState.data.slot_id = Number(rec.slot_id);
                     chargeFlowState.data.charger_type = rec.charger_type || 'STANDARD';
+                    chargeFlowState.data.charger_types = Array.isArray(rec.charger_types) ? rec.charger_types : [];
+                    chargeFlowState.data.charging_levels = Array.isArray(rec.charging_levels) ? rec.charging_levels : [];
                     chargeFlowState.data.date = result.date || lookupDate;
                     chargeFlowState.data.time_window = result.time_window || lookupWindow;
                     chargeFlowState.data.allow_waitlist = false;
@@ -764,6 +824,15 @@ export function initUserUI() {
             if (target.id === 'recharge-card-holder') rechargeFlowState.form.cardHolder = target.value;
             if (target.id === 'recharge-card-expiry') rechargeFlowState.form.cardExpiry = target.value;
             if (target.id === 'recharge-card-cvv') rechargeFlowState.form.cardCvv = target.value;
+        });
+
+        container.addEventListener('change', (e) => {
+            const t = e.target;
+            if (!(t instanceof HTMLSelectElement)) return;
+            if (t.id === 'user-charger-type' || t.id === 'user-charging-level') {
+                lastSlotHash = '';
+                update();
+            }
         });
     }
 
@@ -796,30 +865,49 @@ export function initUserUI() {
 
         const slotGridArea = document.getElementById('slot-grid-area');
         if (slotGridArea) {
+            const capFilter = readUserCapabilityFilters();
             const sortedSlots = [...snapshot.slots].sort((a, b) => a.slot_id - b.slot_id);
-            const currentHash = JSON.stringify(sortedSlots.map(s => ({ id: s.slot_id, state: s.state })));
+            const currentHash = JSON.stringify({
+                cap: capFilter,
+                slots: sortedSlots.map((s) => ({
+                    id: s.slot_id,
+                    state: s.state,
+                    ct: s.charger_types,
+                    cl: s.charging_levels
+                }))
+            });
             if (currentHash !== lastSlotHash) {
-                slotGridArea.innerHTML = sortedSlots.map(slot => `
+                slotGridArea.innerHTML = sortedSlots.map((slot) => {
+                    const filterOk = slotMatchesUserFilters(slot, capFilter);
+                    const freeCharge = slot.state === 'FREE' && filterOk;
+                    const freeBlocked = slot.state === 'FREE' && !filterOk;
+                    return `
                     <div class="slot-item ${slot.state.toLowerCase()}">
                         <div class="slot-info">
                             <span class="slot-label">Slot ${displaySlot(slot.slot_id)}</span>
                             <span class="slot-status ${slot.state === 'AUTH_PENDING' ? 'status-pulse' : ''}">${slot.state}</span>
                         </div>
-                        ${slot.state === 'FREE' ? `
+                        ${freeCharge ? `
                             <button class="btn-charge" data-action="book" data-slot-id="${slot.slot_id}">Charge</button>
+                        ` : freeBlocked ? `
+                            <div class="mono slot-filter-mismatch">Does not match Smart Allocation filter</div>
                         ` : slot.state === 'AUTH_PENDING' ? `
                             <button class="btn-charge btn-auth" data-action="authorize" data-slot-id="${slot.slot_id}">Authorize</button>
                         ` : `
                             <div class="assigned-user">ID: ${slot.assigned_global_id || '---'}</div>
                         `}
                     </div>
-                `).join('');
+                `;
+                }).join('');
                 lastSlotHash = currentHash;
             }
         }
 
         const countBadge = document.getElementById('free-slots-count');
-        const freeCount = snapshot.slots.filter(s => s.state === 'FREE').length;
+        const capForCount = readUserCapabilityFilters();
+        const freeCount = snapshot.slots.filter(
+            (s) => s.state === 'FREE' && slotMatchesUserFilters(s, capForCount)
+        ).length;
         if (countBadge) countBadge.innerText = `${freeCount} Free`;
 
         const findBtn = document.getElementById('btn-find-slot');
