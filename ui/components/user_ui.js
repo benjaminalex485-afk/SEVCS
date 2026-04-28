@@ -6,6 +6,7 @@ export function initUserUI() {
     const container = document.getElementById('user-ui-container');
     let isLoading = false;
     let lastSlotHash = "";
+    let lastBookingsHash = "";
     const rechargeFlowState = {
         open: false,
         loading: false,
@@ -25,6 +26,7 @@ export function initUserUI() {
     const bookingCancelState = {
         openKey: null,
         busy: false,
+        busyKey: null,
         message: null
     };
 
@@ -43,7 +45,8 @@ export function initUserUI() {
         auth_code: null,
         available_slots: [],
         wait_eta_minutes: null,
-        wait_message: null
+        wait_message: null,
+        booking_warning: null
     });
 
     const chargeFlowState = {
@@ -131,16 +134,7 @@ export function initUserUI() {
         rechargeFlowState.baselineBalance = 0;
         rechargeFlowState.form = { amount: '50', cardNumber: '', cardHolder: '', cardExpiry: '', cardCvv: '' };
 
-        if (appState.snapshot) {
-            appState.snapshot.user_wallet = appState.snapshot.user_wallet || { balance: 0, currency: 'USD' };
-            const nextBalance = Number(balanceFromResponse);
-            if (Number.isFinite(nextBalance)) {
-                appState.snapshot.user_wallet.balance = nextBalance;
-            } else {
-                const curr = Number(appState.snapshot.user_wallet?.balance || 0);
-                appState.snapshot.user_wallet.balance = curr;
-            }
-        }
+        // Snapshot objects are immutable in state_v3; wallet view should refresh from accepted status snapshots.
         showWalletToast(`Wallet recharged by $${amount.toFixed(2)}.`, 'success');
         renderWalletRechargePanel();
         update();
@@ -235,6 +229,7 @@ export function initUserUI() {
                 const savedRate = Number(chargeFlowState.data.charge_rate_kw || 7);
                 resultArea.innerHTML = `
                     <div class="mono">Selected Slot ${displaySlot(chargeFlowState.data.slot_id)} (${chargeFlowState.data.charger_type})</div>
+                    ${chargeFlowState.data.booking_warning ? `<p class="mono" style="color: var(--accent-orange)">${chargeFlowState.data.booking_warning}</p>` : ''}
                     <div class="form-group">
                         <label>Date</label>
                         <input type="date" id="charge-date" />
@@ -300,8 +295,13 @@ export function initUserUI() {
                 break;
             case "COMPLETE":
                 resultArea.innerHTML = `
-                    <p class="mono">Booking complete</p>
-                    <p class="mono">Auth Code: ${chargeFlowState.data.auth_code}</p>
+                    <p class="mono">${chargeFlowState.data.auth_code === 'QUEUED' ? 'Booking queued' : 'Booking complete'}</p>
+                    ${chargeFlowState.data.auth_code === 'QUEUED'
+                        ? `<p class="mono">Queue Position: ${chargeFlowState.data.queue_position || '-'}</p>
+                           <p class="mono">Estimated Wait: ${chargeFlowState.data.queue_eta ?? '-'} min</p>
+                           <p class="mono">Projected Slot: ${Number.isFinite(chargeFlowState.data.projected_slot_id) && chargeFlowState.data.projected_slot_id >= 0 ? displaySlot(chargeFlowState.data.projected_slot_id) : '-'}</p>`
+                        : `<p class="mono">Auth Code: ${chargeFlowState.data.auth_code}</p>`}
+                    ${chargeFlowState.data.booking_warning ? `<p class="mono" style="color: var(--accent-orange)">${chargeFlowState.data.booking_warning}</p>` : ''}
                     <button class="primary-btn btn-small" data-flow-action="close">Done</button>
                 `;
                 break;
@@ -400,13 +400,26 @@ export function initUserUI() {
             quote_id: chargeFlowState.data.quote.quote_id,
             date: chargeFlowState.data.date,
             time_window: chargeFlowState.data.time_window,
+            urgency: document.getElementById('user-urgency')?.value || 'LOW',
+            allow_waitlist: !!chargeFlowState.data.allow_waitlist,
             charger_types: cap.charger_types,
             charging_levels: cap.charging_levels
         }, 'charge_flow_book');
-        if (res?.status !== 'success') {
+        const status = String(res?.status || '').toLowerCase();
+        if (status !== 'success' && status !== 'queued') {
             throw new Error(res?.message || res?.error || 'Booking failed');
         }
-        chargeFlowState.data.auth_code = res.auth_code || 'N/A';
+        if (status === 'queued') {
+            chargeFlowState.data.queue_position = Number(res.queue_position ?? 0);
+            chargeFlowState.data.queue_eta = Number(res.estimated_wait_minutes ?? 0);
+            chargeFlowState.data.projected_slot_id = Number(res.projected_slot_id ?? -1);
+            chargeFlowState.data.auth_code = 'QUEUED';
+        } else {
+            chargeFlowState.data.auth_code = res.auth_code || 'N/A';
+        }
+        if (res?.warning) {
+            chargeFlowState.data.booking_warning = res.warning;
+        }
         console.log('[ChargeFlow] API_SUCCESS: book');
     }
 
@@ -738,6 +751,7 @@ export function initUserUI() {
                 return;
             }
             if (bookingAction === 'open-cancel') {
+                if (bookingCancelState.busy) return;
                 bookingCancelState.openKey = btn.dataset.bookingKey || null;
                 bookingCancelState.message = null;
                 update();
@@ -746,14 +760,16 @@ export function initUserUI() {
             if (bookingAction === 'close-cancel') {
                 bookingCancelState.openKey = null;
                 bookingCancelState.busy = false;
+                bookingCancelState.busyKey = null;
                 bookingCancelState.message = null;
                 update();
                 return;
             }
             if (bookingAction === 'confirm-cancel') {
                 const bookingKey = btn.dataset.bookingKey || '';
-                if (!bookingKey) return;
+                if (!bookingKey || bookingCancelState.busy) return;
                 bookingCancelState.busy = true;
+                bookingCancelState.busyKey = bookingKey;
                 bookingCancelState.message = null;
                 update();
                 const res = await executeAction('cancel_booking', {
@@ -761,6 +777,7 @@ export function initUserUI() {
                     username: appState.session.userId
                 }, `cancel_booking_${bookingKey}`);
                 bookingCancelState.busy = false;
+                bookingCancelState.busyKey = null;
                 if (res?.status === 'success') {
                     bookingCancelState.openKey = null;
                     bookingCancelState.message = res?.message || 'Booking cancelled';
@@ -803,6 +820,7 @@ export function initUserUI() {
                     chargeFlowState.data.date = result.date || lookupDate;
                     chargeFlowState.data.time_window = result.time_window || lookupWindow;
                     chargeFlowState.data.allow_waitlist = false;
+                    chargeFlowState.data.booking_warning = result.warning || null;
                     if (result.mode === 'WAIT') {
                         chargeFlowState.data.wait_eta_minutes = Number(result.eta_minutes || 0);
                         chargeFlowState.data.wait_message = result.message || 'No slot is currently free.';
@@ -955,13 +973,87 @@ export function initUserUI() {
             }
         }
 
+        const userAlert = snapshot.user_alert;
+        const queueStatus = snapshot.user_queue_status || {};
+        const resultArea = document.getElementById('user-result-area');
+        const currentUser = String(appState.session.userId || '');
+        if (resultArea) {
+            const passiveOwner = String(resultArea.dataset.passiveOwner || '');
+            const queueTextLeak = /\bYou are in queue\b/i.test(resultArea.textContent || '');
+            if (passiveOwner && passiveOwner !== currentUser) {
+                resultArea.innerHTML = '';
+                resultArea.dataset.passiveOwner = '';
+                resultArea.dataset.passiveType = '';
+            } else if (!passiveOwner && queueTextLeak) {
+                // Backward-compat cleanup for stale queue text rendered before owner-tagging.
+                resultArea.innerHTML = '';
+                resultArea.dataset.passiveOwner = '';
+                resultArea.dataset.passiveType = '';
+            }
+        }
+        if (
+            resultArea &&
+            userAlert &&
+            userAlert.message &&
+            chargeFlowState.step === 'IDLE' &&
+            !resultArea.innerHTML.trim()
+        ) {
+            resultArea.innerHTML = `<p class="mono" style="color: var(--accent-orange)">${userAlert.message}</p>`;
+            resultArea.dataset.passiveOwner = currentUser;
+            resultArea.dataset.passiveType = 'alert';
+        } else if (
+            resultArea &&
+            queueStatus.in_queue &&
+            chargeFlowState.step === 'IDLE' &&
+            !resultArea.innerHTML.trim()
+        ) {
+            const projected = Number.isFinite(Number(queueStatus.projected_slot_id)) && Number(queueStatus.projected_slot_id) >= 0
+                ? `Slot ${displaySlot(Number(queueStatus.projected_slot_id))}`
+                : 'TBD';
+            resultArea.innerHTML = `
+                <p class="mono">You are in queue (Position ${queueStatus.position || '-'})</p>
+                <p class="mono">Estimated wait: ${queueStatus.eta_minutes ?? '-'} min</p>
+                <p class="mono">Projected slot: ${projected}</p>
+            `;
+            resultArea.dataset.passiveOwner = currentUser;
+            resultArea.dataset.passiveType = 'queue';
+        } else if (
+            resultArea &&
+            chargeFlowState.step === 'IDLE' &&
+            resultArea.dataset.passiveOwner === currentUser &&
+            !userAlert?.message &&
+            !queueStatus.in_queue
+        ) {
+            resultArea.innerHTML = '';
+            resultArea.dataset.passiveOwner = '';
+            resultArea.dataset.passiveType = '';
+        }
+
         const bookingsTable = document.getElementById('user-bookings-table');
         if (bookingsTable) {
             const rows = Array.isArray(snapshot.user_bookings) ? snapshot.user_bookings : [];
-            if (rows.length === 0) {
-                bookingsTable.innerHTML = `<p class="mono" style="opacity:.8">No bookings yet</p>`;
-            } else {
-                bookingsTable.innerHTML = `
+            const bookingsHash = JSON.stringify({
+                rows: rows.map((b) => ({
+                    booking_key: b.booking_key || '',
+                    slot_id: b.slot_id,
+                    date: b.date,
+                    time_window: b.time_window,
+                    auth_code: b.auth_code,
+                    total_price: b.total_price,
+                    booking_status: b.booking_status,
+                    queue_position: b.queue_position,
+                    eta_minutes: b.eta_minutes
+                })),
+                openKey: bookingCancelState.openKey,
+                busy: bookingCancelState.busy,
+                busyKey: bookingCancelState.busyKey,
+                message: bookingCancelState.message
+            });
+            if (bookingsHash !== lastBookingsHash) {
+                if (rows.length === 0) {
+                    bookingsTable.innerHTML = `<p class="mono" style="opacity:.8">No bookings yet</p>`;
+                } else {
+                    bookingsTable.innerHTML = `
                     <table style="width:100%; border-collapse:collapse; font-size:12px;">
                         <thead>
                             <tr>
@@ -975,20 +1067,30 @@ export function initUserUI() {
                         <tbody>
                             ${rows.map((b) => {
                                 const bookingKey = b.booking_key || '';
+                                const bookingStatus = String(b.booking_status || 'BOOKED').toUpperCase();
+                                const isQueued = bookingStatus === 'QUEUED';
+                                const isAssigned = bookingStatus === 'ASSIGNED';
                                 const isOpen = bookingCancelState.openKey === bookingKey;
                                 const start = parseBookingStart(b.date, b.time_window);
                                 const hoursBefore = start ? ((start.getTime() - Date.now()) / 3600000) : null;
                                 const refundRatio = getRefundRatio(hoursBefore);
                                 const paid = Number(b.total_price || 0);
                                 const estimatedRefund = Math.max(0, paid * refundRatio);
+                                const rowBusy = bookingCancelState.busy && bookingCancelState.busyKey === bookingKey;
                                 return `
                                 <tr>
                                     <td style="padding:4px;">${displaySlot(b.slot_id)}</td>
                                     <td style="padding:4px;">${b.date || '-'}</td>
                                     <td style="padding:4px;">${b.time_window || '-'}</td>
-                                    <td style="padding:4px;" class="mono">${b.auth_code || 'N/A'}</td>
+                                    <td style="padding:4px;" class="mono">${
+                                        isQueued
+                                            ? `QUEUED #${b.queue_position || '-'} (${b.eta_minutes ?? '-'}m)`
+                                            : isAssigned
+                                                ? `ASSIGNED (${b.auth_code || 'N/A'})`
+                                                : (b.auth_code || 'N/A')
+                                    }</td>
                                     <td style="padding:4px;">
-                                        <button class="btn-booking-cancel" data-booking-action="open-cancel" data-booking-key="${bookingKey}">Cancel Booking</button>
+                                        <button class="btn-booking-cancel" data-booking-action="open-cancel" data-booking-key="${bookingKey}" ${bookingCancelState.busy ? 'disabled' : ''}>Cancel Booking</button>
                                     </td>
                                 </tr>
                                 ${isOpen ? `
@@ -1000,7 +1102,7 @@ export function initUserUI() {
                                                     Warning: only part of your money may be refunded. Estimated refund: $${estimatedRefund.toFixed(2)} (${Math.round(refundRatio * 100)}%).
                                                 </div>
                                                 <div style="display:flex; gap:8px;">
-                                                    <button class="primary-btn btn-small" data-booking-action="confirm-cancel" data-booking-key="${bookingKey}" ${bookingCancelState.busy ? 'disabled' : ''}>${bookingCancelState.busy ? 'Cancelling...' : 'Confirm Cancel'}</button>
+                                                    <button class="primary-btn btn-small" data-booking-action="confirm-cancel" data-booking-key="${bookingKey}" ${bookingCancelState.busy ? 'disabled' : ''}>${rowBusy ? 'Cancelling...' : 'Confirm Cancel'}</button>
                                                     <button class="primary-btn btn-small wallet-cancel-btn" data-booking-action="close-cancel" ${bookingCancelState.busy ? 'disabled' : ''}>Keep Booking</button>
                                                 </div>
                                                 ${bookingCancelState.message ? `<p class="status-msg warning" style="margin-top:8px;">${bookingCancelState.message}</p>` : ''}
@@ -1013,6 +1115,8 @@ export function initUserUI() {
                         </tbody>
                     </table>
                 `;
+                }
+                lastBookingsHash = bookingsHash;
             }
         }
 

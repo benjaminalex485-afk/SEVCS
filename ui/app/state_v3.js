@@ -56,8 +56,8 @@ export const appState = {
     lastProcessedSource: null,
     allowActions: false,
     simSlots: [
-        {slot_id: 1, state: "FREE", charger_type: "STANDARD", charger_types: ["AC_WIRED"], charging_levels: ["LEVEL_2"], assigned_global_id: null},
-        {slot_id: 2, state: "FREE", charger_type: "FAST", charger_types: ["DC_WIRED"], charging_levels: ["LEVEL_3"], assigned_global_id: null}
+        {slot_id: 1, state: "FREE", charger_type: "STANDARD", charger_types: ["AC_WIRED"], charging_levels: ["LEVEL_2"], urgent_only: false, assigned_global_id: null},
+        {slot_id: 2, state: "FREE", charger_type: "FAST", charger_types: ["DC_WIRED"], charging_levels: ["LEVEL_3"], urgent_only: false, assigned_global_id: null}
     ],
     
     // Constants
@@ -128,6 +128,7 @@ function normalizeSnapshot(s) {
         slots: normalizedSlots,
         queue: Array.isArray(s.queue) ? s.queue : [],
         user_bookings: Array.isArray(s.user_bookings) ? s.user_bookings : [],
+        user_queue_entries: Array.isArray(s.user_queue_entries) ? s.user_queue_entries : [],
         user_active_sessions: Array.isArray(s.user_active_sessions) ? s.user_active_sessions : [],
         pricing_settings: {
             high_urgency_multiplier: Number(s.pricing_settings?.high_urgency_multiplier || 1.25)
@@ -149,11 +150,79 @@ function normalizeSnapshot(s) {
             }
         },
         user_wallet: s.user_wallet || { balance: 0, currency: 'USD' },
+        user_alert: s.user_alert || null,
+        user_queue_status: s.user_queue_status || {
+            in_queue: false,
+            position: null,
+            eta_minutes: null,
+            projected_slot_id: null,
+            reason: null
+        },
         user_id: s.user_id || null,
         state_hash: String(s.state_hash || ""),
         source: String(s.source || ""),
         latency: Number(s.latency || 0)
     };
+}
+
+function normalizeUserWallet(wallet) {
+    const balance = Number(wallet?.balance ?? 0);
+    const currency = String(wallet?.currency || 'USD');
+    return {
+        balance: Number.isFinite(balance) ? balance : 0,
+        currency
+    };
+}
+
+function userScopedFingerprint(snapshot) {
+    const wallet = normalizeUserWallet(snapshot?.user_wallet);
+    const bookings = Array.isArray(snapshot?.user_bookings) ? snapshot.user_bookings : [];
+    const queueEntries = Array.isArray(snapshot?.user_queue_entries) ? snapshot.user_queue_entries : [];
+    const sessions = Array.isArray(snapshot?.user_active_sessions) ? snapshot.user_active_sessions : [];
+    const queueStatus = snapshot?.user_queue_status || {};
+    return JSON.stringify({
+        wallet,
+        bookings: bookings.map((b) => ({
+            booking_key: b?.booking_key || '',
+            slot_id: Number(b?.slot_id ?? -1),
+            date: String(b?.date || ''),
+            time_window: String(b?.time_window || ''),
+            auth_code: String(b?.auth_code || ''),
+            total_price: Number(b?.total_price ?? 0),
+            booking_status: String(b?.booking_status || 'BOOKED'),
+            queue_position: Number(b?.queue_position ?? -1),
+            eta_minutes: Number(b?.eta_minutes ?? -1)
+        })),
+        queue_entries: queueEntries.map((q) => ({
+            booking_id: String(q?.booking_id || ''),
+            position: Number(q?.position ?? -1),
+            projected_slot_id: Number(q?.projected_slot_id ?? -1),
+            eta_minutes: Number(q?.eta_minutes ?? -1),
+            date: String(q?.date || ''),
+            time_window: String(q?.time_window || ''),
+            urgency: String(q?.urgency || 'LOW'),
+            reason: String(q?.reason || '')
+        })),
+        sessions: sessions.map((s) => ({
+            slot_id: Number(s?.slot_id ?? -1),
+            battery_pct: Number(s?.battery_pct ?? 0),
+            power_kw: Number(s?.power_kw ?? 0),
+            energy_kwh: Number(s?.energy_kwh ?? 0),
+            started_at: Number(s?.started_at ?? 0)
+        })),
+        queue_status: {
+            in_queue: Boolean(queueStatus?.in_queue),
+            position: Number(queueStatus?.position ?? -1),
+            eta_minutes: Number(queueStatus?.eta_minutes ?? -1),
+            projected_slot_id: Number(queueStatus?.projected_slot_id ?? -1),
+            reason: String(queueStatus?.reason || '')
+        }
+    });
+}
+
+function hasUserScopedDelta(nextSnapshot, prevSnapshot) {
+    if (!nextSnapshot || !prevSnapshot) return false;
+    return userScopedFingerprint(nextSnapshot) !== userScopedFingerprint(prevSnapshot);
 }
 
 function isValidSnapshotPayload(s) {
@@ -251,15 +320,17 @@ export function setLatestSnapshot(data, latency) {
 
     // 5. Strict Monotonicity Progression
     if (appState.snapshot && normalized.snapshot_sequence <= appState.lastSequence) {
-        if (normalized.snapshot_sequence === appState.lastSequence && 
-            normalized.state_hash === appState.snapshot.state_hash &&
-            normalized.timestamp === appState.snapshot.timestamp) {
-            return; // True network duplicate
-        }
-        
         if (normalized.snapshot_sequence < appState.lastSequence) {
             appState.stableBackendFrames = 0;
             return;
+        }
+        const hasUserDelta = hasUserScopedDelta(normalized, appState.snapshot);
+        if (
+            !hasUserDelta &&
+            normalized.state_hash === appState.snapshot.state_hash &&
+            normalized.timestamp === appState.snapshot.timestamp
+        ) {
+            return; // True network duplicate
         }
     }
 
@@ -276,7 +347,12 @@ export function setLatestSnapshot(data, latency) {
     }
 
     // 7. Identity Check
-    if (appState.snapshot && normalized.state_hash === appState.snapshot.state_hash && normalized.timestamp === appState.snapshot.timestamp) {
+    if (
+        appState.snapshot &&
+        normalized.state_hash === appState.snapshot.state_hash &&
+        normalized.timestamp === appState.snapshot.timestamp &&
+        !hasUserScopedDelta(normalized, appState.snapshot)
+    ) {
         return;
     }
 
@@ -430,11 +506,21 @@ export function processSnapshot(data) {
     }
 
     // 5. Monotonicity Guard
-    if (newSequence <= oldSequence) {
-        if (newSequence === oldSequence && (Date.now() - appState.lastSnapshotTime) > 1000) {
-            console.warn("[SYNC] SEQUENCE STALL DETECTED");
-        }
+    if (newSequence < oldSequence) {
         return;
+    }
+    if (newSequence === oldSequence) {
+        const allowSameSequence = hasUserScopedDelta(data, appState.snapshot);
+        if (!allowSameSequence) {
+            if ((Date.now() - appState.lastSnapshotTime) > 1000) {
+                console.warn("[SYNC] SEQUENCE STALL DETECTED");
+            }
+            return;
+        }
+        console.log("[SYNC] SAME_SEQUENCE_USER_DELTA_ACCEPTED", {
+            seq: newSequence,
+            balance: data?.user_wallet?.balance
+        });
     }
 
     const gap = newSequence - oldSequence;
@@ -474,6 +560,8 @@ export function processSnapshot(data) {
         if (appState.stableFrames >= 3) {
             appState.isDesync = false;
         }
+    } else if (gap === 0) {
+        // User-scoped delta update (e.g. wallet/bookings refresh) should not alter sync state.
     } else {
         appState.stableFrames = 0;
         if (!appState.isDesync) {

@@ -122,6 +122,10 @@ class GlobalState:
         self.pricing_settings = {
             "high_urgency_multiplier": float(DEFAULT_HIGH_URGENCY_MULTIPLIER)
         }
+        self.urgent_preemption = {}   # slot_idx -> preemption metadata
+        self.urgent_alerts = {}       # username -> alert payload
+        self.booking_queue = []       # queued bookings (dict rows)
+        self.queue_counter = 0
 
 G_STATE = GlobalState()
 
@@ -511,6 +515,7 @@ def _runtime_state_payload():
             "slot_id": int(slot.slot_id),
             "charger_types": list(charger_types),
             "charging_levels": list(charging_levels),
+            "urgent_only": bool(getattr(slot, "urgent_only", False)),
         })
     return {
         "schema_version": int(RUNTIME_STATE_SCHEMA_VERSION),
@@ -520,6 +525,8 @@ def _runtime_state_payload():
         "slot_time_reservations": dict(G_STATE.slot_time_reservations),
         "pricing_quotes": dict(G_STATE.pricing_quotes),
         "payment_receipts": dict(G_STATE.payment_receipts),
+        "booking_queue": list(G_STATE.booking_queue),
+        "queue_counter": int(G_STATE.queue_counter),
         "admin_slots": admin_slots,
         "pricing_settings": {
             "high_urgency_multiplier": float(
@@ -602,6 +609,12 @@ def _restore_runtime_state(base_slots):
             G_STATE.pricing_quotes = persisted.get("pricing_quotes")
         if isinstance(persisted.get("payment_receipts"), dict):
             G_STATE.payment_receipts = persisted.get("payment_receipts")
+        if isinstance(persisted.get("booking_queue"), list):
+            G_STATE.booking_queue = [row for row in persisted.get("booking_queue") if isinstance(row, dict)]
+        try:
+            G_STATE.queue_counter = int(persisted.get("queue_counter", 0))
+        except (TypeError, ValueError):
+            G_STATE.queue_counter = 0
 
         persisted_settings = persisted.get("pricing_settings") or {}
         G_STATE.pricing_settings["high_urgency_multiplier"] = _normalize_high_urgency_multiplier(
@@ -628,6 +641,7 @@ def _restore_runtime_state(base_slots):
                 slot.charging_levels = _normalize_enum_list(
                     entry.get("charging_levels"), ALLOWED_CHARGING_LEVELS, ["LEVEL_2"]
                 )
+                slot.urgent_only = bool(entry.get("urgent_only", False))
                 _get_slot_capabilities(slot)
         logger.info(
             "[PERSIST] Runtime state restored: wallets=%d bookings=%d quotes=%d receipts=%d slots=%d",
@@ -705,6 +719,127 @@ def _refund_ratio_for_hours(hours_before_start):
         return 0.4
     return 0.0
 
+
+URGENT_PREEMPTION_GRACE_SECONDS = 300.0
+URGENT_DEMAND_TTL_SECONDS = 900.0
+
+
+def _slot_is_urgent_only(slot):
+    return bool(getattr(slot, "urgent_only", False))
+
+
+def _active_session_user_for_slot(slot_idx):
+    booking = G_STATE.auth_engine.bookings.get(slot_idx, {})
+    return str(booking.get("user", "") or "")
+
+
+def _latest_quote_for_slot_user(slot_idx, username):
+    latest = None
+    latest_created = -1.0
+    for reservation in G_STATE.slot_time_reservations.values():
+        if not isinstance(reservation, dict):
+            continue
+        if int(reservation.get("slot_id", -1)) != int(slot_idx):
+            continue
+        if str(reservation.get("username", "")) != str(username):
+            continue
+        quote_id = reservation.get("quote_id")
+        quote = G_STATE.pricing_quotes.get(quote_id, {}) if quote_id else {}
+        created = float(reservation.get("created_at", 0.0))
+        if quote and created >= latest_created:
+            latest_created = created
+            latest = quote
+    return latest or {}
+
+
+def _active_booking_urgency(slot_idx, username):
+    quote = _latest_quote_for_slot_user(slot_idx, username)
+    return str(quote.get("urgency", "LOW") or "LOW").strip().upper()
+
+
+def _estimate_preemption_refund(slot_idx, username, session):
+    quote = _latest_quote_for_slot_user(slot_idx, username)
+    total_paid = float(quote.get("total_price", 0.0))
+    if total_paid <= 0:
+        return 0.0
+    battery_pct = float((session or {}).get("battery_pct", 0.0))
+    progress = max(0.0, min(1.0, battery_pct / 100.0))
+    return round(total_paid * (1.0 - progress), 2)
+
+
+def _set_urgent_alert(username, message, level="warning", ttl_sec=120.0):
+    if not username:
+        return
+    now = utils.system_now(caller="api_thread")
+    G_STATE.urgent_alerts[str(username)] = {
+        "message": str(message),
+        "level": str(level or "warning"),
+        "created_at": float(now),
+        "expires_at": float(now + max(5.0, float(ttl_sec))),
+    }
+
+
+def _register_preemption_candidate(slot_idx, urgent_username):
+    now = utils.system_now(caller="api_thread")
+    if slot_idx not in G_STATE.sessions:
+        return False
+    occupant = _active_session_user_for_slot(slot_idx)
+    if not occupant or occupant == urgent_username:
+        return False
+    existing = G_STATE.urgent_preemption.get(slot_idx)
+    if existing and float(existing.get("deadline_at", 0.0)) > now:
+        return True
+    deadline = now + URGENT_PREEMPTION_GRACE_SECONDS
+    G_STATE.urgent_preemption[slot_idx] = {
+        "slot_idx": int(slot_idx),
+        "urgent_username": str(urgent_username),
+        "occupant_username": str(occupant),
+        "requested_at": float(now),
+        "deadline_at": float(deadline),
+        "expires_at": float(now + URGENT_DEMAND_TTL_SECONDS),
+    }
+    mins = int(round(URGENT_PREEMPTION_GRACE_SECONDS / 60.0))
+    _set_urgent_alert(
+        occupant,
+        f"Urgent demand received for Slot {slot_idx + 1}. You may be preempted in ~{mins} min with remaining value refunded.",
+        level="warning",
+        ttl_sec=URGENT_PREEMPTION_GRACE_SECONDS + 30.0,
+    )
+    return True
+
+
+def _register_preemption_for_queued_high(slot_idx, queue_entry):
+    now = utils.system_now(caller="api_thread")
+    if slot_idx not in G_STATE.sessions:
+        return False
+    session = G_STATE.sessions.get(slot_idx, {})
+    occupant = str(session.get("username", "") or _active_session_user_for_slot(slot_idx))
+    occupant_urgency = str(session.get("urgency", "LOW") or "LOW").upper()
+    # Never preempt HIGH with HIGH.
+    if not occupant or occupant == queue_entry.get("username") or occupant_urgency == "HIGH":
+        return False
+    existing = G_STATE.urgent_preemption.get(slot_idx)
+    if existing and float(existing.get("deadline_at", 0.0)) > now:
+        return True
+    deadline = now + URGENT_PREEMPTION_GRACE_SECONDS
+    G_STATE.urgent_preemption[slot_idx] = {
+        "slot_idx": int(slot_idx),
+        "urgent_username": str(queue_entry.get("username", "")),
+        "occupant_username": str(occupant),
+        "requested_at": float(now),
+        "deadline_at": float(deadline),
+        "expires_at": float(now + URGENT_DEMAND_TTL_SECONDS),
+        "queue_booking_id": str(queue_entry.get("booking_id", "")),
+    }
+    mins = int(round(URGENT_PREEMPTION_GRACE_SECONDS / 60.0))
+    _set_urgent_alert(
+        occupant,
+        f"High urgency queue request requires Slot {slot_idx + 1}. Grace ~{mins} min before reassignment.",
+        level="warning",
+        ttl_sec=URGENT_PREEMPTION_GRACE_SECONDS + 30.0,
+    )
+    return True
+
 def _estimate_slot_eta_minutes(slot_idx):
     # Estimate remaining charging time from active session if present.
     session = G_STATE.sessions.get(slot_idx)
@@ -714,6 +849,319 @@ def _estimate_slot_eta_minutes(slot_idx):
     remaining = max(0.0, 100.0 - battery_pct)
     # ~0.1% per second in simulation loop => 60% in 10 minutes.
     return max(1, int(round((remaining / 0.1) / 60.0)))
+
+
+def _queue_priority_value(row):
+    urgency = str(row.get("urgency", "LOW") or "LOW").upper()
+    urgent_rank = 0 if urgency == "HIGH" else 1
+    return (urgent_rank, float(row.get("queued_at", 0.0)))
+
+
+def _best_eta_slot_for_urgency(urgency):
+    urgency = str(urgency or "LOW").upper()
+    candidates = []
+    for slot in G_STATE.slots:
+        if urgency == "HIGH":
+            priority = 0 if _slot_is_urgent_only(slot) else 1
+        else:
+            priority = 1 if _slot_is_urgent_only(slot) else 0
+        eta = _estimate_slot_eta_minutes(slot.slot_id) if slot.state != SlotState.FREE else 0
+        candidates.append((priority, eta, slot.slot_id))
+    if not candidates:
+        return None, None
+    best = sorted(candidates, key=lambda x: (x[0], x[1], x[2]))[0]
+    return int(best[2]), int(best[1])
+
+
+def _user_queue_status(username):
+    rows = [row for row in G_STATE.booking_queue if str(row.get("username", "")) == str(username)]
+    if not rows:
+        return {
+            "in_queue": False,
+            "position": None,
+            "eta_minutes": None,
+            "projected_slot_id": None,
+            "reason": None,
+        }
+    ordered = sorted(G_STATE.booking_queue, key=_queue_priority_value)
+    first = sorted(rows, key=_queue_priority_value)[0]
+    try:
+        pos = ordered.index(first) + 1
+    except ValueError:
+        pos = 1
+    return {
+        "in_queue": True,
+        "position": int(pos),
+        "eta_minutes": int(first.get("eta_minutes", 0)),
+        "projected_slot_id": int(first.get("projected_slot_id", -1)),
+        "reason": str(first.get("reason", "WAITING_FOR_SLOT")),
+    }
+
+
+def _user_queue_entries(username):
+    ordered = sorted(G_STATE.booking_queue, key=_queue_priority_value)
+    entries = []
+    for idx, row in enumerate(ordered, start=1):
+        if str(row.get("username", "")) != str(username):
+            continue
+        assigned_slot_raw = row.get("assigned_slot_id")
+        projected_slot_raw = row.get("projected_slot_id", -1)
+        projected_slot_id = assigned_slot_raw if assigned_slot_raw is not None else projected_slot_raw
+        if projected_slot_id is None:
+            projected_slot_id = -1
+        entries.append({
+            "booking_key": f"queue::{str(row.get('booking_id', ''))}",
+            "booking_id": str(row.get("booking_id", "")),
+            "position": int(idx),
+            "projected_slot_id": int(projected_slot_id),
+            "eta_minutes": int(row.get("eta_minutes", 0)),
+            "date": str(row.get("date", "")),
+            "time_window": str(row.get("time_window", "")),
+            "urgency": str(row.get("urgency", "LOW")),
+            "reason": str(row.get("reason", "WAITING_FOR_SLOT")),
+            "queued_at": float(row.get("queued_at", 0.0)),
+            "booking_status": str(row.get("booking_status", "QUEUED")),
+            "auth_code": str(row.get("auth_code", "QUEUED")),
+            "total_price": float((G_STATE.pricing_quotes.get(row.get("quote_id"), {}) or {}).get("total_price", 0.0)),
+        })
+    return entries
+
+
+def _enqueue_booking(
+    username,
+    urgency,
+    date,
+    time_window,
+    requested_kwh,
+    charge_rate_kw,
+    quote_id=None,
+    reason="WAITING_FOR_SLOT",
+    charger_types=None,
+    charging_levels=None,
+    auto_assign_enabled=True,
+):
+    now = utils.system_now(caller="api_thread")
+    projected_slot_id, eta = _best_eta_slot_for_urgency(urgency)
+    G_STATE.queue_counter += 1
+    entry = {
+        "booking_id": f"qb_{G_STATE.queue_counter}",
+        "username": str(username),
+        "urgency": str(urgency or "LOW").upper(),
+        "date": str(date),
+        "time_window": str(time_window),
+        "requested_kwh": float(requested_kwh or 20.0),
+        "charge_rate_kw": float(charge_rate_kw or 7.0),
+        "quote_id": quote_id,
+        "charger_types": list(charger_types or []),
+        "charging_levels": list(charging_levels or []),
+        "queued_at": float(now),
+        "eta_minutes": int(eta if eta is not None else 30),
+        "projected_slot_id": int(projected_slot_id if projected_slot_id is not None else -1),
+        "reason": str(reason or "WAITING_FOR_SLOT"),
+        "booking_status": "QUEUED",
+        "assigned_slot_id": None,
+        "auth_code": None,
+        "reservation_key": None,
+        "auto_assign_enabled": bool(auto_assign_enabled),
+    }
+    G_STATE.booking_queue.append(entry)
+    G_STATE.booking_queue.sort(key=_queue_priority_value)
+    _persist_runtime_state()
+    return entry
+
+
+def _assign_queue_booking_to_slot(entry, slot_idx):
+    if str(entry.get("booking_status", "QUEUED")).upper() != "QUEUED":
+        return False
+    username = str(entry.get("username", "Anonymous"))
+    quote_id = entry.get("quote_id")
+    timeout = 600
+    code = G_STATE.auth_engine.generate_booking(slot_idx, username, timeout=timeout)
+    if not code:
+        return False
+    reservation_key = _reservation_key(slot_idx, entry.get("date"), entry.get("time_window"))
+    existing_res = G_STATE.slot_time_reservations.get(reservation_key)
+    if existing_res and str(existing_res.get("queue_booking_id", "")) != str(entry.get("booking_id", "")):
+        # Rollback provisional auth booking for this slot.
+        with G_STATE.auth_engine.lock:
+            G_STATE.auth_engine.bookings.pop(slot_idx, None)
+            G_STATE.auth_engine.authorizations.pop(slot_idx, None)
+        return False
+    G_STATE.slot_time_reservations[reservation_key] = {
+        "quote_id": quote_id,
+        "username": username,
+        "slot_id": int(slot_idx),
+        "date": entry.get("date"),
+        "time_window": entry.get("time_window"),
+        "auth_code": code,
+        "created_at": utils.system_now(caller="api_thread"),
+        "queue_booking_id": str(entry.get("booking_id", "")),
+    }
+    if quote_id:
+        quote = G_STATE.pricing_quotes.get(quote_id, {})
+        if isinstance(quote, dict):
+            quote["consumed"] = True
+    entry["projected_slot_id"] = int(slot_idx)
+    entry["assigned_slot_id"] = int(slot_idx)
+    entry["auth_code"] = str(code)
+    entry["reservation_key"] = str(reservation_key)
+    entry["booking_status"] = "ASSIGNED"
+    _persist_runtime_state()
+    return True
+
+
+def _queue_entry_matches_slot(entry, slot):
+    if str(entry.get("booking_status", "QUEUED")).upper() != "QUEUED":
+        return False
+    if not bool(entry.get("auto_assign_enabled", True)):
+        return False
+    req_types, req_levels = _extract_requested_capabilities({
+        "charger_types": entry.get("charger_types", []),
+        "charging_levels": entry.get("charging_levels", []),
+        "charger_type": entry.get("charger_type")
+    })
+    if req_types or req_levels:
+        if not _slot_matches_capabilities(slot, req_types, req_levels):
+            return False
+    if slot.slot_id in G_STATE.auth_engine.bookings and not G_STATE.auth_engine.is_expired(slot.slot_id):
+        return False
+    reservation_key = _reservation_key(slot.slot_id, entry.get("date"), entry.get("time_window"))
+    existing_res = G_STATE.slot_time_reservations.get(reservation_key)
+    if existing_res and str(existing_res.get("queue_booking_id", "")) != str(entry.get("booking_id", "")):
+        return False
+    return True
+
+
+def _update_queue_eta_fields():
+    for row in G_STATE.booking_queue:
+        if str(row.get("booking_status", "QUEUED")).upper() == "ASSIGNED":
+            sid = row.get("assigned_slot_id")
+            if sid is not None:
+                row["projected_slot_id"] = int(sid)
+            row["eta_minutes"] = max(0, int(row.get("eta_minutes", 0)))
+            continue
+        proj_slot, eta = _best_eta_slot_for_urgency(row.get("urgency", "LOW"))
+        row["projected_slot_id"] = int(proj_slot if proj_slot is not None else -1)
+        row["eta_minutes"] = int(eta if eta is not None else 30)
+
+
+def _dispatch_queue_to_free_slots():
+    if not G_STATE.booking_queue:
+        return
+    G_STATE.booking_queue.sort(key=_queue_priority_value)
+    free_slots = [slot for slot in G_STATE.slots if slot.state == SlotState.FREE]
+    for slot in sorted(free_slots, key=lambda s: s.slot_id):
+        if not G_STATE.booking_queue:
+            break
+        selected_entry = None
+        for entry in G_STATE.booking_queue:
+            if _queue_entry_matches_slot(entry, slot):
+                selected_entry = entry
+                break
+        if selected_entry:
+            _assign_queue_booking_to_slot(selected_entry, slot.slot_id)
+
+
+def _find_reservation_key_for_slot_user(slot_idx, username):
+    for key, res in G_STATE.slot_time_reservations.items():
+        if not isinstance(res, dict):
+            continue
+        if int(res.get("slot_id", -1)) != int(slot_idx):
+            continue
+        if str(res.get("username", "")) != str(username):
+            continue
+        return key, res
+    return None, None
+
+
+def _promote_high_over_non_charging_booking(high_entry):
+    if str(high_entry.get("booking_status", "QUEUED")).upper() != "QUEUED":
+        return False
+    high_user = str(high_entry.get("username", ""))
+    if not high_user:
+        return False
+
+    # Urgent slots first for HIGH, then others.
+    ordered_slots = sorted(
+        G_STATE.slots,
+        key=lambda s: (0 if _slot_is_urgent_only(s) else 1, s.slot_id)
+    )
+    for slot in ordered_slots:
+        sid = int(slot.slot_id)
+        # If charging, grace preemption handles it.
+        if sid in G_STATE.sessions:
+            continue
+        with G_STATE.auth_engine.lock:
+            booking = G_STATE.auth_engine.bookings.get(sid)
+            if not isinstance(booking, dict):
+                continue
+            if G_STATE.auth_engine.is_expired(sid):
+                continue
+            occupant_user = str(booking.get("user", "") or "")
+            occupant_code = str(booking.get("auth_code", "") or "")
+        if not occupant_user or occupant_user == high_user:
+            continue
+        occupant_urgency = _active_booking_urgency(sid, occupant_user)
+        if occupant_urgency == "HIGH":
+            continue
+
+        # Non-charging NORMAL booking: immediate swap (no grace).
+        res_key, res = _find_reservation_key_for_slot_user(sid, occupant_user)
+        displaced_quote_id = (res or {}).get("quote_id")
+        displaced_quote = G_STATE.pricing_quotes.get(displaced_quote_id, {}) if displaced_quote_id else {}
+        displaced_kwh = float((displaced_quote or {}).get("requested_kwh", 20.0) or 20.0)
+        displaced_rate = float((displaced_quote or {}).get("charge_rate_kw", 7.0) or 7.0)
+        displaced_date = (res or {}).get("date") or _current_date_str()
+        displaced_window = (res or {}).get("time_window") or _current_time_window()
+
+        # Clear current non-charging booking on this slot.
+        if res_key:
+            G_STATE.slot_time_reservations.pop(res_key, None)
+        with G_STATE.auth_engine.lock:
+            auth_booking = G_STATE.auth_engine.bookings.get(sid)
+            same_reservation = (
+                isinstance(auth_booking, dict)
+                and auth_booking.get("user") == occupant_user
+                and str(auth_booking.get("auth_code", "") or "") == occupant_code
+            )
+            if same_reservation:
+                G_STATE.auth_engine.revoke_authorization(sid)
+                G_STATE.auth_engine.bookings.pop(sid, None)
+                G_STATE.auth_engine.authorizations.pop(sid, None)
+        if slot.state in [SlotState.AUTH_PENDING, SlotState.AUTH_ACTIVE, SlotState.ALIGNMENT_PENDING]:
+            slot.set_state(SlotState.FREE)
+
+        # Move displaced NORMAL user to queue.
+        _enqueue_booking(
+            username=occupant_user,
+            urgency="LOW",
+            date=displaced_date,
+            time_window=displaced_window,
+            requested_kwh=displaced_kwh,
+            charge_rate_kw=displaced_rate,
+            quote_id=displaced_quote_id,
+            reason="DISPLACED_BY_HIGH_URGENCY",
+            auto_assign_enabled=False,
+        )
+        _set_urgent_alert(
+            occupant_user,
+            f"Your booking on Slot {sid + 1} was reprioritized for HIGH urgency demand. You were moved to queue.",
+            level="warning",
+            ttl_sec=180.0,
+        )
+
+        # Assign HIGH entry immediately to this slot.
+        assigned = _assign_queue_booking_to_slot(high_entry, sid)
+        if assigned:
+            _set_urgent_alert(
+                high_user,
+                f"HIGH priority applied: Slot {sid + 1} assigned with auth code {high_entry.get('auth_code', 'N/A')}.",
+                level="info",
+                ttl_sec=180.0,
+            )
+            _persist_runtime_state()
+            return True
+    return False
 
 def _build_user_active_sessions(username):
     sessions = []
@@ -727,7 +1175,8 @@ def _build_user_active_sessions(username):
                 "battery_pct": round(float(session.get("battery_pct", 0.0)), 2),
                 "power_kw": round(float(session.get("power", 0.0)), 2),
                 "energy_kwh": round(float(session.get("energy", 0.0)), 2),
-                "started_at": float(session.get("start_time", 0.0))
+                "started_at": float(session.get("start_time", 0.0)),
+                "urgency": str(session.get("urgency", "LOW")),
             })
     sessions.sort(key=lambda x: x.get("started_at", 0.0), reverse=True)
     return sessions
@@ -797,7 +1246,15 @@ def build_degraded_status_snapshot(username, reason):
         "user_id": username,
         "user_wallet": G_STATE.wallets.get(username, {"balance": 0.0, "currency": "USD"}),
         "user_bookings": [],
+        "user_queue_entries": [],
         "user_active_sessions": [],
+        "user_queue_status": {
+            "in_queue": False,
+            "position": None,
+            "eta_minutes": None,
+            "projected_slot_id": None,
+            "reason": None,
+        },
         "admin_kpis": {
             "last24h": {
                 "total_revenue": 0.0,
@@ -870,17 +1327,48 @@ def get_status():
                     "time_window": res.get("time_window"),
                     "auth_code": res.get("auth_code", "N/A"),
                     "created_at": float(res.get("created_at", 0.0)),
-                    "total_price": float((G_STATE.pricing_quotes.get(res.get("quote_id"), {}) or {}).get("total_price", 0.0))
+                    "total_price": float((G_STATE.pricing_quotes.get(res.get("quote_id"), {}) or {}).get("total_price", 0.0)),
+                    "booking_status": "BOOKED",
                 }
                 for key, res in G_STATE.slot_time_reservations.items()
-                if isinstance(res, dict) and res.get("username") == username
+                if isinstance(res, dict) and res.get("username") == username and not res.get("queue_booking_id")
             ]
+            user_queue_entries = _user_queue_entries(username)
+            for qb in user_queue_entries:
+                user_bookings.append({
+                    "booking_key": qb.get("booking_key"),
+                    "slot_id": int(qb.get("projected_slot_id", -1)),
+                    "date": qb.get("date"),
+                    "time_window": qb.get("time_window"),
+                    "auth_code": qb.get("auth_code", "QUEUED"),
+                    "created_at": float(qb.get("queued_at", 0.0)),
+                    "total_price": float(qb.get("total_price", 0.0)),
+                    "booking_status": qb.get("booking_status", "QUEUED"),
+                    "queue_position": int(qb.get("position", 0)),
+                    "eta_minutes": int(qb.get("eta_minutes", 0)),
+                    "urgency": qb.get("urgency", "LOW"),
+                })
+            alert_payload = None
+            alert = G_STATE.urgent_alerts.get(username)
+            if isinstance(alert, dict):
+                now_alert = utils.system_now(caller="api_thread")
+                if float(alert.get("expires_at", 0.0)) > now_alert:
+                    alert_payload = {
+                        "message": str(alert.get("message", "")),
+                        "level": str(alert.get("level", "warning")),
+                        "expires_at": float(alert.get("expires_at", 0.0)),
+                    }
+                else:
+                    G_STATE.urgent_alerts.pop(username, None)
         user_bookings.sort(key=lambda x: x.get("created_at", 0.0), reverse=True)
         # Inject the correct wallet and user ID for this specific session
         snapshot["user_id"] = username
         snapshot["user_wallet"] = G_STATE.wallets.get(username, {"balance": 0.0, "currency": "USD"})
         snapshot["user_bookings"] = user_bookings
+        snapshot["user_queue_entries"] = user_queue_entries
         snapshot["user_active_sessions"] = _build_user_active_sessions(username)
+        snapshot["user_queue_status"] = _user_queue_status(username)
+        snapshot["user_alert"] = alert_payload
         snapshot["admin_kpis"] = _build_admin_kpis(now)
         snapshot["pricing_settings"] = {
             "high_urgency_multiplier": float(
@@ -1131,9 +1619,11 @@ def signup_api():
 def book_slot_api():
     data = get_request_data()
     username = data.get('username', 'Anonymous')
+    urgency = str(data.get("urgency", "LOW") or "LOW").strip().upper()
     req_ct, req_cl = _extract_requested_capabilities(data)
     identifier = f"{request.remote_addr}:{username}"
     reservation_key = None
+    allow_waitlist = bool(data.get("allow_waitlist", False))
     
     if not DEV_MODE:
         limit = CONFIG.get('rate_limit_attempts', 5)
@@ -1150,6 +1640,8 @@ def book_slot_api():
                 return jsonify({"status": "error", "message": "Invalid quote_id"}), 400
             if quote.get("username") != username:
                 return jsonify({"status": "error", "message": "Quote user mismatch"}), 400
+            # Carry waitlist intent from quote flow (Find -> Reserve & Pay Now).
+            allow_waitlist = bool(allow_waitlist or quote.get("allow_waitlist", False))
             if utils.system_now(caller="api_thread") > quote.get("expires_at", 0):
                 return jsonify({"status": "error", "message": "Quote expired"}), 400
             if not quote.get("paid", False):
@@ -1158,7 +1650,7 @@ def book_slot_api():
                 return jsonify({"status": "error", "message": "Quote already used"}), 409
             reservation_key = _reservation_key(quote.get("slot_id"), quote.get("date"), quote.get("time_window"))
             existing_res = G_STATE.slot_time_reservations.get(reservation_key)
-            if existing_res and existing_res.get("quote_id") != quote_id:
+            if existing_res and existing_res.get("quote_id") != quote_id and not bool(quote.get("allow_waitlist", False)):
                 return jsonify({"status": "error", "message": "Slot already booked for selected date/time"}), 409
             q_slot_idx = int(quote.get("slot_id", -1))
             if (req_ct or req_cl) and 0 <= q_slot_idx < len(G_STATE.slots):
@@ -1189,23 +1681,44 @@ def book_slot_api():
                     "status": "error",
                     "message": "Slot does not support the selected Charger Type / Charging Level"
                 }), 409
-            logger.info(f"[BOOKING] Manual booking request for Slot {assigned_idx+1}")
+            # Hard guard: if selected slot is not immediately bookable, always fallback to queue path.
+            # This avoids "Booking rejected for this slot" during overflow even if waitlist flag is missing.
+            slot = G_STATE.slots[assigned_idx]
+            has_live_booking = (
+                assigned_idx in G_STATE.auth_engine.bookings
+                and not G_STATE.auth_engine.is_expired(assigned_idx)
+            )
+            reservation_conflict = False
+            q_date = data.get("date") or (quote.get("date") if quote_id else _current_date_str())
+            q_window = data.get("time_window") or (quote.get("time_window") if quote_id else _current_time_window())
+            if q_date and q_window:
+                q_key = _reservation_key(assigned_idx, q_date, q_window)
+                existing_q_res = G_STATE.slot_time_reservations.get(q_key)
+                if existing_q_res:
+                    if quote_id:
+                        reservation_conflict = existing_q_res.get("quote_id") != quote_id
+                    else:
+                        reservation_conflict = True
+            if slot.state != SlotState.FREE or has_live_booking or reservation_conflict:
+                assigned_idx = -1
+            if assigned_idx >= 0:
+                logger.info(f"[BOOKING] Manual booking request for Slot {assigned_idx+1}")
+            else:
+                logger.info("[BOOKING] Manual request moved to queue path (waitlist enabled)")
         else:
             # AUTO-FIND logic
-            for i, slot in enumerate(G_STATE.slots):
+            ordered_indices = list(range(len(G_STATE.slots)))
+            if urgency == "HIGH":
+                ordered_indices.sort(key=lambda i: (0 if _slot_is_urgent_only(G_STATE.slots[i]) else 1, i))
+            else:
+                ordered_indices.sort(key=lambda i: (1 if _slot_is_urgent_only(G_STATE.slots[i]) else 0, i))
+            for i in ordered_indices:
+                slot = G_STATE.slots[i]
                 if (req_ct or req_cl) and not _slot_matches_capabilities(slot, req_ct, req_cl):
                     continue
-                if slot.locked_track_id is not None:
-                    if i not in G_STATE.auth_engine.bookings or G_STATE.auth_engine.is_expired(i):
-                        assigned_idx = i
-                        break
-            if assigned_idx == -1:
-                for i, slot in enumerate(G_STATE.slots):
-                    if (req_ct or req_cl) and not _slot_matches_capabilities(slot, req_ct, req_cl):
-                        continue
-                    if slot.state == SlotState.FREE and (i not in G_STATE.auth_engine.bookings or G_STATE.auth_engine.is_expired(i)):
-                        assigned_idx = i
-                        break
+                if slot.state == SlotState.FREE and (i not in G_STATE.auth_engine.bookings or G_STATE.auth_engine.is_expired(i)):
+                    assigned_idx = i
+                    break
         
     if assigned_idx != -1 and assigned_idx < len(G_STATE.slots):
         timeout = data.get('timeout', 600)
@@ -1224,10 +1737,52 @@ def book_slot_api():
                 "created_at": utils.system_now(caller="api_thread")
             }
             _persist_runtime_state()
-        return jsonify({"status": "success", "slot_id": assigned_idx + 1, "auth_code": code})
+        warning = None
+        if urgency != "HIGH" and _slot_is_urgent_only(G_STATE.slots[assigned_idx]):
+            warning = (
+                f"Slot {assigned_idx + 1} is urgent-reserved. "
+                "If HIGH urgency demand appears during charging, session may be preempted after grace with remaining value refunded."
+            )
+        return jsonify({
+            "status": "success",
+            "slot_id": assigned_idx + 1,
+            "auth_code": code,
+            "warning": warning
+        })
     
-    no_slot_msg = "No slots match selected Charger Type / Charging Level." if (req_ct or req_cl) else "No slots available"
-    return jsonify({"status": "error", "message": no_slot_msg}), 400
+    requested_kwh = float(data.get("requested_kwh") or (quote.get("requested_kwh") if quote_id else 20.0) or 20.0)
+    charge_rate_kw = float(data.get("charge_rate_kw") or (quote.get("charge_rate_kw") if quote_id else 7.0) or 7.0)
+    with G_STATE.vision_lock:
+        queued = _enqueue_booking(
+            username=username,
+            urgency=urgency,
+            date=data.get("date") or _current_date_str(),
+            time_window=data.get("time_window") or _current_time_window(),
+            requested_kwh=requested_kwh,
+            charge_rate_kw=charge_rate_kw,
+            quote_id=quote_id,
+            reason="ALL_SLOTS_OCCUPIED",
+            charger_types=req_ct,
+            charging_levels=req_cl,
+        )
+        if urgency == "HIGH":
+            # Try to register preemption against best NORMAL active occupant.
+            candidate_slots = sorted([s.slot_id for s in G_STATE.slots], key=lambda i: _estimate_slot_eta_minutes(i))
+            for sid in candidate_slots:
+                session = G_STATE.sessions.get(sid, {})
+                if str(session.get("urgency", "LOW")).upper() == "HIGH":
+                    continue
+                if _register_preemption_for_queued_high(sid, queued):
+                    break
+        ordered = sorted(G_STATE.booking_queue, key=_queue_priority_value)
+        position = ordered.index(queued) + 1
+    return jsonify({
+        "status": "queued",
+        "message": "All slots are occupied. You have been added to queue.",
+        "queue_position": int(position),
+        "estimated_wait_minutes": int(queued.get("eta_minutes", 30)),
+        "projected_slot_id": int(queued.get("projected_slot_id", -1)),
+    })
 
 @api_app.route('/api/cancel_booking', methods=['POST'])
 def cancel_booking_api():
@@ -1238,6 +1793,55 @@ def cancel_booking_api():
         return jsonify({"status": "error", "message": "booking_key is required"}), 400
 
     with G_STATE.vision_lock:
+        if str(booking_key).startswith("queue::"):
+            queue_id = str(booking_key).split("queue::", 1)[1]
+            queue_row = next((row for row in G_STATE.booking_queue if str(row.get("booking_id", "")) == queue_id), None)
+            if not queue_row:
+                return jsonify({"status": "error", "message": "Booking not found"}), 404
+            if str(queue_row.get("username", "")) != str(username):
+                return jsonify({"status": "error", "message": "Booking user mismatch"}), 403
+            quote_id = queue_row.get("quote_id")
+            quote = G_STATE.pricing_quotes.get(quote_id, {}) if quote_id else {}
+            paid_amount = float(quote.get("total_price", 0.0))
+            start_ts = _booking_window_start_ts(queue_row.get("date"), queue_row.get("time_window"))
+            now_ts = utils.system_now(caller="api_thread")
+            hours_before = ((start_ts - now_ts) / 3600.0) if start_ts is not None else None
+            refund_ratio = _refund_ratio_for_hours(hours_before)
+            refund_amount = round(paid_amount * refund_ratio, 2)
+            wallet = G_STATE.wallets[username]
+            wallet["balance"] = round(float(wallet.get("balance", 0.0)) + refund_amount, 2)
+            if quote_id and quote:
+                quote["canceled"] = True
+                quote["consumed"] = True
+            assigned_slot_id = queue_row.get("assigned_slot_id")
+            reservation_key = queue_row.get("reservation_key")
+            auth_code = str(queue_row.get("auth_code") or "")
+            if reservation_key:
+                G_STATE.slot_time_reservations.pop(str(reservation_key), None)
+            if assigned_slot_id is not None:
+                sid = int(assigned_slot_id)
+                with G_STATE.auth_engine.lock:
+                    auth_booking = G_STATE.auth_engine.bookings.get(sid)
+                    same_reservation = (
+                        isinstance(auth_booking, dict)
+                        and auth_booking.get("user") == username
+                        and (not auth_code or str(auth_booking.get("auth_code") or "") == auth_code)
+                    )
+                    if same_reservation:
+                        G_STATE.auth_engine.revoke_authorization(sid)
+                        G_STATE.auth_engine.bookings.pop(sid, None)
+                        G_STATE.auth_engine.authorizations.pop(sid, None)
+            G_STATE.booking_queue = [row for row in G_STATE.booking_queue if str(row.get("booking_id", "")) != queue_id]
+            _persist_runtime_state()
+            G_STATE.last_snapshot_version += 1
+            return jsonify({
+                "status": "success",
+                "message": f"Booking cancelled. Refund ${refund_amount:.2f} credited to wallet.",
+                "refund_amount": refund_amount,
+                "refund_ratio": refund_ratio,
+                "wallet_balance": G_STATE.wallets[username]["balance"]
+            })
+
         booking = G_STATE.slot_time_reservations.get(booking_key)
         if not booking:
             return jsonify({"status": "error", "message": "Booking not found"}), 404
@@ -1249,8 +1853,7 @@ def cancel_booking_api():
             return jsonify({"status": "error", "message": "Invalid booking slot"}), 400
 
         slot = G_STATE.slots[slot_idx]
-        if slot.state == SlotState.CHARGING:
-            return jsonify({"status": "error", "message": "Cannot cancel an active charging session"}), 409
+        auth_code = str(booking.get("auth_code") or "")
 
         quote_id = booking.get("quote_id")
         quote = G_STATE.pricing_quotes.get(quote_id, {}) if quote_id else {}
@@ -1270,14 +1873,21 @@ def cancel_booking_api():
             quote["canceled"] = True
             quote["consumed"] = True
 
-        # Remove reservation and invalidate auth booking.
+        # Remove reservation and invalidate auth state only if it still maps to this reservation.
         del G_STATE.slot_time_reservations[booking_key]
-        G_STATE.auth_engine.revoke_authorization(slot_idx)
         with G_STATE.auth_engine.lock:
-            G_STATE.auth_engine.bookings.pop(slot_idx, None)
-            G_STATE.auth_engine.authorizations.pop(slot_idx, None)
+            auth_booking = G_STATE.auth_engine.bookings.get(slot_idx)
+            same_reservation = (
+                isinstance(auth_booking, dict)
+                and auth_booking.get("user") == username
+                and str(auth_booking.get("auth_code") or "") == auth_code
+            )
+            if same_reservation:
+                G_STATE.auth_engine.revoke_authorization(slot_idx)
+                G_STATE.auth_engine.bookings.pop(slot_idx, None)
+                G_STATE.auth_engine.authorizations.pop(slot_idx, None)
 
-        if slot.state in [SlotState.AUTH_PENDING, SlotState.AUTH_ACTIVE, SlotState.ALIGNMENT_PENDING]:
+        if slot.state in [SlotState.AUTH_PENDING, SlotState.AUTH_ACTIVE, SlotState.ALIGNMENT_PENDING] and same_reservation:
             slot.set_state(SlotState.FREE)
         _persist_runtime_state()
 
@@ -1308,7 +1918,8 @@ def availability_api():
                 "charger_type": _get_slot_charger_type(slot),
                 "charger_types": _get_slot_capabilities(slot)[0],
                 "charging_levels": _get_slot_capabilities(slot)[1],
-                "state": slot.state.name
+                "state": slot.state.name,
+                "urgent_only": bool(_slot_is_urgent_only(slot)),
             }
             for slot in free_slots
         ]
@@ -1349,7 +1960,7 @@ def pricing_quote_api():
         if slot.state != SlotState.FREE and not allow_waitlist:
             return jsonify({"status": "error", "message": "Slot not available"}), 409
         reservation_key = _reservation_key(slot_idx, date, time_window)
-        if reservation_key in G_STATE.slot_time_reservations:
+        if reservation_key in G_STATE.slot_time_reservations and not allow_waitlist:
             return jsonify({"status": "error", "message": "Slot already booked for selected date/time"}), 409
         if (req_ct or req_cl) and not _slot_matches_capabilities(slot, req_ct, req_cl):
             return jsonify({
@@ -1421,7 +2032,7 @@ def payment_mock_api():
             return jsonify({"status": "error", "message": "Quote already paid"}), 409
         reservation_key = _reservation_key(quote.get("slot_id"), quote.get("date"), quote.get("time_window"))
         existing_res = G_STATE.slot_time_reservations.get(reservation_key)
-        if existing_res and existing_res.get("quote_id") != quote_id:
+        if existing_res and existing_res.get("quote_id") != quote_id and not bool(quote.get("allow_waitlist", False)):
             return jsonify({"status": "error", "message": "Slot already booked for selected date/time"}), 409
         total_price = float(quote.get("total_price", 0.0))
         wallet = G_STATE.wallets[username]
@@ -1453,6 +2064,7 @@ def payment_mock_api():
 def admin_add_slot_api():
     data = get_request_data()
     requested_types, requested_levels = _extract_requested_capabilities(data)
+    urgent_only = bool(data.get("urgent_only", False))
     with G_STATE.vision_lock:
         slot_id = len(G_STATE.slots)
         # Use the last polygon as a placeholder for debug/admin runtime behavior.
@@ -1462,16 +2074,18 @@ def admin_add_slot_api():
             new_slot.charger_types = requested_types
         if requested_levels:
             new_slot.charging_levels = requested_levels
+        new_slot.urgent_only = urgent_only
         _get_slot_capabilities(new_slot)
         G_STATE.slots.append(new_slot)
         _persist_runtime_state()
-    logger.info(f"[ADMIN] Added slot {slot_id + 1} (types={new_slot.charger_types}, levels={new_slot.charging_levels})")
+    logger.info(f"[ADMIN] Added slot {slot_id + 1} (types={new_slot.charger_types}, levels={new_slot.charging_levels}, urgent_only={new_slot.urgent_only})")
     return jsonify({
         "status": "success",
         "slot_id": slot_id + 1,
         "charger_type": _get_slot_charger_type(new_slot),
         "charger_types": list(new_slot.charger_types),
         "charging_levels": list(new_slot.charging_levels),
+        "urgent_only": bool(new_slot.urgent_only),
     })
 
 @api_app.route('/api/admin_remove_slot', methods=['POST'])
@@ -1494,6 +2108,7 @@ def admin_remove_slot_api():
 def admin_update_slot_type_api():
     data = get_request_data()
     requested_types, requested_levels = _extract_requested_capabilities(data)
+    urgent_only = bool(data.get("urgent_only", False))
     with G_STATE.vision_lock:
         n = len(G_STATE.slots)
         target_slot = _resolve_admin_slot_index(data.get('slot_id'), n)
@@ -1504,15 +2119,17 @@ def admin_update_slot_type_api():
             slot.charger_types = requested_types
         if requested_levels:
             slot.charging_levels = requested_levels
+        slot.urgent_only = urgent_only
         _get_slot_capabilities(slot)
         _persist_runtime_state()
-    logger.info(f"[ADMIN] Updated slot {target_slot + 1} capabilities to types={slot.charger_types}, levels={slot.charging_levels}")
+    logger.info(f"[ADMIN] Updated slot {target_slot + 1} capabilities to types={slot.charger_types}, levels={slot.charging_levels}, urgent_only={slot.urgent_only}")
     return jsonify({
         "status": "success",
         "slot_id": target_slot + 1,
         "charger_type": _get_slot_charger_type(slot),
         "charger_types": list(slot.charger_types),
         "charging_levels": list(slot.charging_levels),
+        "urgent_only": bool(slot.urgent_only),
     })
 
 
@@ -1574,6 +2191,11 @@ def admin_reset_persisted_data_api():
             _reset_wallet_defaults()
         if "bookings" in normalized_fields:
             G_STATE.slot_time_reservations = {}
+            G_STATE.booking_queue = []
+            G_STATE.urgent_preemption = {}
+            G_STATE.urgent_alerts = {}
+            with G_STATE.session_lock:
+                G_STATE.sessions.clear()
             with G_STATE.auth_engine.lock:
                 G_STATE.auth_engine.bookings.clear()
                 G_STATE.auth_engine.authorizations.clear()
@@ -1622,15 +2244,17 @@ def recharge_api():
 def find_slot_api():
     data = get_request_data()
     v_type = data.get('type', 'SUV')
-    urgency = data.get('urgency', 'LOW')
+    urgency = str(data.get('urgency', 'LOW') or 'LOW').strip().upper()
     date = data.get("date") or _current_date_str()
     time_window = data.get("time_window") or _current_time_window()
     username = data.get("username", "Anonymous")
     requested_types, requested_levels = _extract_requested_capabilities(data)
 
     with G_STATE.vision_lock:
-        free_candidates = []
-        busy_candidates = []
+        urgent_free = []
+        normal_free = []
+        urgent_busy = []
+        normal_busy = []
         for slot in G_STATE.slots:
             reservation_key = _reservation_key(slot.slot_id, date, time_window)
             if reservation_key in G_STATE.slot_time_reservations:
@@ -1638,17 +2262,40 @@ def find_slot_api():
             if not _slot_matches_capabilities(slot, requested_types, requested_levels):
                 continue
             if slot.state == SlotState.FREE:
-                free_candidates.append(slot)
+                if _slot_is_urgent_only(slot):
+                    urgent_free.append(slot)
+                else:
+                    normal_free.append(slot)
             else:
-                busy_candidates.append(slot)
+                if _slot_is_urgent_only(slot):
+                    urgent_busy.append(slot)
+                else:
+                    normal_busy.append(slot)
+
+        if urgency == "HIGH":
+            free_candidates = urgent_free + normal_free
+            busy_candidates = urgent_busy + normal_busy
+        else:
+            free_candidates = normal_free + urgent_free
+            busy_candidates = normal_busy + urgent_busy
 
         if free_candidates:
-            selected = sorted(free_candidates, key=lambda s: s.slot_id)[0]
+            # Keep urgency-priority ordering:
+            # LOW => normal_free first, then urgent_free
+            # HIGH => urgent_free first, then normal_free
+            selected = free_candidates[0]
+            warning = None
+            if urgency != "HIGH" and _slot_is_urgent_only(selected):
+                warning = (
+                    f"Slot {selected.slot_id + 1} is marked urgent. "
+                    "It may be reclaimed if a HIGH urgency request arrives; remaining value will be refunded."
+                )
             logger.info(f"[FIND_SLOT] immediate_available user={username} slot={selected.slot_id} date={date} tw={time_window} type={v_type} urgency={urgency}")
             return jsonify({
                 "status": "success",
                 "mode": "AVAILABLE",
                 "message": f"Slot {selected.slot_id + 1} is available now.",
+                "warning": warning,
                 "date": date,
                 "time_window": time_window,
                 "recommended_slot": {
@@ -1656,19 +2303,30 @@ def find_slot_api():
                     "charger_type": _get_slot_charger_type(selected),
                     "charger_types": _get_slot_capabilities(selected)[0],
                     "charging_levels": _get_slot_capabilities(selected)[1],
-                    "state": selected.state.name
+                    "state": selected.state.name,
+                    "urgent_only": bool(_slot_is_urgent_only(selected)),
                 }
             })
 
         if busy_candidates:
-            selected_busy = sorted(busy_candidates, key=lambda s: s.slot_id)[0]
+            # Keep same urgency-priority ordering for wait projection as well.
+            selected_busy = busy_candidates[0]
             eta = _estimate_slot_eta_minutes(selected_busy.slot_id)
+            preemption_started = False
+            if urgency == "HIGH" and _slot_is_urgent_only(selected_busy):
+                preemption_started = _register_preemption_candidate(selected_busy.slot_id, username)
             logger.info(f"[FIND_SLOT] wait_required user={username} slot={selected_busy.slot_id} eta={eta}m date={date} tw={time_window} type={v_type} urgency={urgency}")
             return jsonify({
                 "status": "success",
                 "mode": "WAIT",
-                "message": f"No slot is free right now. Earliest Slot {selected_busy.slot_id + 1} in about {eta} min.",
+                "message": (
+                    f"No slot is free right now. Earliest Slot {selected_busy.slot_id + 1} in about {eta} min."
+                    if not preemption_started
+                    else f"Urgent demand registered for Slot {selected_busy.slot_id + 1}. Grace-period preemption countdown started."
+                ),
                 "eta_minutes": eta,
+                "preemption_started": bool(preemption_started),
+                "grace_seconds": float(URGENT_PREEMPTION_GRACE_SECONDS if preemption_started else 0.0),
                 "date": date,
                 "time_window": time_window,
                 "recommended_slot": {
@@ -1676,12 +2334,51 @@ def find_slot_api():
                     "charger_type": _get_slot_charger_type(selected_busy),
                     "charger_types": _get_slot_capabilities(selected_busy)[0],
                     "charging_levels": _get_slot_capabilities(selected_busy)[1],
-                    "state": selected_busy.state.name
+                    "state": selected_busy.state.name,
+                    "urgent_only": bool(_slot_is_urgent_only(selected_busy)),
                 },
                 "can_reserve_with_payment": True
             })
 
     logger.info(f"[FIND_SLOT] no_slot_found user={username} date={date} tw={time_window} type={v_type} urgency={urgency}")
+    with G_STATE.vision_lock:
+        # Full occupancy may appear as "no candidates" for this time-window because all rows are reserved.
+        # In that case, still allow the flow to continue as WAIT->queue path.
+        fallback_candidates = []
+        for slot in G_STATE.slots:
+            if not _slot_matches_capabilities(slot, requested_types, requested_levels):
+                continue
+            if urgency == "HIGH":
+                priority = 0 if _slot_is_urgent_only(slot) else 1
+            else:
+                priority = 1 if _slot_is_urgent_only(slot) else 0
+            eta = _estimate_slot_eta_minutes(slot.slot_id) if slot.state != SlotState.FREE else 0
+            fallback_candidates.append((priority, eta, slot.slot_id, slot))
+        if fallback_candidates:
+            _, _, _, selected_busy = sorted(fallback_candidates, key=lambda x: (x[0], x[1], x[2]))[0]
+            eta = _estimate_slot_eta_minutes(selected_busy.slot_id)
+            return jsonify({
+                "status": "success",
+                "mode": "WAIT",
+                "message": (
+                    f"All slots are currently occupied/booked for the selected window. "
+                    f"Projected Slot {selected_busy.slot_id + 1} in about {eta} min."
+                ),
+                "eta_minutes": eta,
+                "preemption_started": False,
+                "grace_seconds": 0.0,
+                "date": date,
+                "time_window": time_window,
+                "recommended_slot": {
+                    "slot_id": selected_busy.slot_id,
+                    "charger_type": _get_slot_charger_type(selected_busy),
+                    "charger_types": _get_slot_capabilities(selected_busy)[0],
+                    "charging_levels": _get_slot_capabilities(selected_busy)[1],
+                    "state": selected_busy.state.name,
+                    "urgent_only": bool(_slot_is_urgent_only(selected_busy)),
+                },
+                "can_reserve_with_payment": True
+            })
     mismatch_message = "No slots match selected Charger Type / Charging Level." if (requested_types or requested_levels) else "No slots available"
     return jsonify({"status": "error", "message": mismatch_message}), 400
 
@@ -1787,13 +2484,31 @@ def start_charging_api():
         if not slot.set_state(SlotState.CHARGING, track_id=track_id):
             return jsonify({"status": "error", "message": "Unable to start charging for this slot"}), 409
         G_STATE.auth_engine.consume_booking(idx)
+        consumed_queue_booking_id = None
+        for row in list(G_STATE.booking_queue):
+            if str(row.get("username", "")) != str(username):
+                continue
+            if int(row.get("assigned_slot_id", -1)) != int(idx):
+                continue
+            if str(row.get("auth_code") or "") not in ["", str(code)]:
+                continue
+            consumed_queue_booking_id = str(row.get("booking_id", ""))
+            res_key = row.get("reservation_key")
+            if res_key:
+                G_STATE.slot_time_reservations.pop(str(res_key), None)
+            G_STATE.booking_queue = [q for q in G_STATE.booking_queue if str(q.get("booking_id", "")) != consumed_queue_booking_id]
+            break
         with G_STATE.session_lock:
             G_STATE.sessions[idx] = {
                 "battery_pct": 20.0,
                 "power": 7.2,
                 "energy": 0.0,
-                "start_time": utils.system_now(caller="api_thread")
+                "start_time": utils.system_now(caller="api_thread"),
+                "username": username,
+                "urgency": _active_booking_urgency(idx, username),
             }
+        if consumed_queue_booking_id:
+            _persist_runtime_state()
     logger.info(f"[CHARGING] Manual start success user={username} slot={idx+1}")
     return jsonify({"status": "success", "slot_id": idx + 1, "message": "Charging started"})
 
@@ -1814,7 +2529,101 @@ def run_api():
 
 def charging_simulation_loop():
     while True:
-        with G_STATE.session_lock:
+        now_ts = utils.system_now(caller="main_loop")
+        with G_STATE.vision_lock, G_STATE.session_lock:
+            _update_queue_eta_fields()
+
+            # Register preemption for queued HIGH requests when needed.
+            for entry in sorted(G_STATE.booking_queue, key=_queue_priority_value):
+                if str(entry.get("booking_status", "QUEUED")).upper() != "QUEUED":
+                    continue
+                if str(entry.get("urgency", "LOW")).upper() != "HIGH":
+                    continue
+                # If occupant is not charging, do immediate priority swap (no grace).
+                if _promote_high_over_non_charging_booking(entry):
+                    continue
+                free_urgent = any(slot.state == SlotState.FREE and _slot_is_urgent_only(slot) for slot in G_STATE.slots)
+                if free_urgent:
+                    continue
+                # Prefer urgent slots occupied by NORMAL users.
+                urgent_normal = []
+                for slot in G_STATE.slots:
+                    if not _slot_is_urgent_only(slot):
+                        continue
+                    session = G_STATE.sessions.get(slot.slot_id, {})
+                    if str(session.get("urgency", "LOW")).upper() != "HIGH":
+                        urgent_normal.append(slot.slot_id)
+                if urgent_normal:
+                    _register_preemption_for_queued_high(sorted(urgent_normal)[0], entry)
+                else:
+                    # Fallback: preempt fastest normal slot if no urgent-normal slot exists.
+                    normal_candidates = []
+                    for slot in G_STATE.slots:
+                        session = G_STATE.sessions.get(slot.slot_id, {})
+                        if not session:
+                            continue
+                        if str(session.get("urgency", "LOW")).upper() == "HIGH":
+                            continue
+                        normal_candidates.append(( _estimate_slot_eta_minutes(slot.slot_id), slot.slot_id))
+                    if normal_candidates:
+                        _, sid = sorted(normal_candidates, key=lambda x: (x[0], x[1]))[0]
+                        _register_preemption_for_queued_high(sid, entry)
+
+            # Cleanup expired urgent demands
+            for slot_idx, request in list(G_STATE.urgent_preemption.items()):
+                if float(request.get("expires_at", 0.0)) <= now_ts:
+                    G_STATE.urgent_preemption.pop(slot_idx, None)
+
+            # Execute due preemptions
+            for slot_idx, request in list(G_STATE.urgent_preemption.items()):
+                if slot_idx not in G_STATE.sessions:
+                    G_STATE.urgent_preemption.pop(slot_idx, None)
+                    continue
+                if float(request.get("deadline_at", 0.0)) > now_ts:
+                    continue
+                session = G_STATE.sessions.get(slot_idx, {})
+                displaced_user = str(session.get("username", "") or request.get("occupant_username", ""))
+                slot = G_STATE.slots[slot_idx] if 0 <= slot_idx < len(G_STATE.slots) else None
+                refund = _estimate_preemption_refund(slot_idx, displaced_user, session)
+                if displaced_user:
+                    G_STATE.wallets[displaced_user]["balance"] = round(float(G_STATE.wallets[displaced_user].get("balance", 0.0)) + refund, 2)
+                    # Move displaced NORMAL user back to queue with top NORMAL priority.
+                    displaced_entry = _enqueue_booking(
+                        username=displaced_user,
+                        urgency="LOW",
+                        date=_current_date_str(),
+                        time_window=_current_time_window(),
+                        requested_kwh=max(5.0, 100.0 - float(session.get("battery_pct", 0.0))),
+                        charge_rate_kw=float(session.get("power", 7.2)) if float(session.get("power", 0.0)) > 0 else 7.2,
+                        quote_id=None,
+                        reason="PREEMPTED_BY_HIGH_URGENCY",
+                    )
+                    displaced_entry["queued_at"] = float(now_ts) - 0.001
+                    _set_urgent_alert(
+                        displaced_user,
+                        f"Charging session on Slot {slot_idx + 1} was preempted for urgent demand. Refund ${refund:.2f} credited.",
+                        level="warning",
+                        ttl_sec=180.0,
+                    )
+                if slot is not None:
+                    slot.set_state(SlotState.FREE)
+                G_STATE.sessions.pop(slot_idx, None)
+                G_STATE.auth_engine.revoke_authorization(slot_idx)
+                with G_STATE.auth_engine.lock:
+                    G_STATE.auth_engine.bookings.pop(slot_idx, None)
+                    G_STATE.auth_engine.authorizations.pop(slot_idx, None)
+                G_STATE.urgent_preemption.pop(slot_idx, None)
+                logger.warning(
+                    "[URGENT] Preempted slot=%s displaced_user=%s refund=%.2f urgent_user=%s",
+                    slot_idx + 1,
+                    displaced_user,
+                    refund,
+                    request.get("urgent_username"),
+                )
+                _persist_runtime_state()
+
+            _dispatch_queue_to_free_slots()
+
             for slot_idx in list(G_STATE.sessions.keys()):
                 session = G_STATE.sessions[slot_idx]
                 if session['battery_pct'] < 100:
@@ -2131,11 +2940,15 @@ def main():
                                     G_STATE.auth_engine.consume_booking(s_idx)
                                     with G_STATE.session_lock:
                                         if s_idx not in G_STATE.sessions:
+                                            booking = G_STATE.auth_engine.bookings.get(s_idx, {})
+                                            session_user = str(booking.get("user", "") or "")
                                             G_STATE.sessions[s_idx] = {
                                                 "battery_pct": 20.0,
                                                 "power": 7.2,
                                                 "energy": 0.0,
-                                                "start_time": utils.system_now(caller="main_loop")
+                                                "start_time": utils.system_now(caller="main_loop"),
+                                                "username": session_user,
+                                                "urgency": _active_booking_urgency(s_idx, session_user) if session_user else "LOW",
                                             }
                                     logger.info(f"[AUTH] AUTH_ACTIVE -> CHARGING for Slot {s_idx+1}")
                                     logger.info(f"VALIDATED Session Start for Slot {s_idx+1}")

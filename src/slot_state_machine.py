@@ -77,6 +77,7 @@ class Slot:
         self.last_update_time = utils.system_now(caller="main_loop")
         self.charger_types = list(DEFAULT_CHARGER_TYPES)
         self.charging_levels = list(DEFAULT_CHARGING_LEVELS)
+        self.urgent_only = False
 
     def get_capabilities(self):
         charger_types = list(getattr(self, "charger_types", None) or [])
@@ -138,7 +139,8 @@ class Slot:
             "occluded": self.occlusion_timer > 0,
             "charger_types": list(charger_types),
             "charging_levels": list(charging_levels),
-            "charger_type": self.legacy_charger_type()
+            "charger_type": self.legacy_charger_type(),
+            "urgent_only": bool(getattr(self, "urgent_only", False))
         }
 
     def force_safe_state(self):

@@ -83,9 +83,11 @@ export function initGrids() {
                 <div class="slot-type-badge ${slot.charger_type?.toLowerCase() || 'standard'}">
                     ${slot.charger_type || 'STANDARD'}
                 </div>
+                ${slot.urgent_only ? `<div class="slot-type-badge fast" style="margin-top:6px;">URGENT SLOT</div>` : ''}
                 <div class="slot-capabilities">
                     <div class="slot-capability-item"><span class="slot-cap-label">Type:</span> ${chargerSummary}</div>
                     <div class="slot-capability-item"><span class="slot-cap-label">Level:</span> ${levelSummary}</div>
+                    <div class="slot-capability-item"><span class="slot-cap-label">Urgency:</span> ${slot.urgent_only ? 'Urgent only (HIGH priority first)' : 'Normal / shared'}</div>
                 </div>
 
                 ${isAdmin ? `
@@ -107,6 +109,13 @@ export function initGrids() {
                                     <span>${opt.label}</span>
                                 </label>
                             `).join('')}
+                        </div>
+                        <div class="slot-cap-editor-group">
+                            <div class="slot-cap-title">Urgency</div>
+                            <label class="slot-cap-option">
+                                <input type="checkbox" id="slot-${slot.slot_id}-urgent-only" ${slot.urgent_only ? 'checked' : ''} />
+                                <span>Urgency (HIGH priority first)</span>
+                            </label>
                         </div>
                     </div>
                     <button class="btn-edit-capabilities" data-id="${slot.slot_id}">
@@ -233,9 +242,10 @@ export function initGrids() {
                 .map((o) => o.value);
             const finalTypes = nextTypes.length > 0 ? nextTypes : chargerTypes;
             const finalLevels = nextLevels.length > 0 ? nextLevels : chargingLevels;
+            const urgentOnly = !!document.getElementById(`slot-${slotId}-urgent-only`)?.checked;
             btnType.disabled = true;
             try {
-                const res = await updateSlotType(slotId, finalTypes, finalLevels);
+                const res = await updateSlotType(slotId, finalTypes, finalLevels, urgentOnly);
                 const ok = res && (res.status === 'success' || res.status === 'OK');
                 if (ok) {
                     showSlotCapabilityFeedback(slotId, true, 'Capabilities saved');
@@ -271,7 +281,8 @@ export function initGrids() {
                     id: s.slot_id,
                     state: String(s.state || ''),
                     ct: [...chargerTypes].sort().join(','),
-                    cl: [...chargingLevels].sort().join(',')
+                    cl: [...chargingLevels].sort().join(','),
+                    urgent: !!s.urgent_only
                 };
             });
             return `admin_slots:${JSON.stringify(body)}`;

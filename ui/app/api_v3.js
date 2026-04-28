@@ -330,6 +330,7 @@ export async function executeAction(endpoint, payload, intentKey = null) {
                 charger_type: payload.charger_type || 'STANDARD',
                 charger_types: chargerTypes,
                 charging_levels: chargingLevels,
+                urgent_only: !!payload.urgent_only,
                 assigned_global_id: null
             });
             success = true;
@@ -346,6 +347,7 @@ export async function executeAction(endpoint, payload, intentKey = null) {
                 slot.charger_types = Array.isArray(payload.charger_types) && payload.charger_types.length > 0 ? payload.charger_types : slot.charger_types || ['AC_WIRED'];
                 slot.charging_levels = Array.isArray(payload.charging_levels) && payload.charging_levels.length > 0 ? payload.charging_levels : slot.charging_levels || ['LEVEL_2'];
                 slot.charger_type = payload.charger_type || slot.charger_type;
+                slot.urgent_only = !!payload.urgent_only;
                 success = true;
             }
         }
@@ -397,7 +399,7 @@ export async function executeAction(endpoint, payload, intentKey = null) {
         events.emit('ACTION_RESPONSE', { 
             requestId, 
             endpoint,
-            status: data.status === 'OK' || data.status === 'success' ? (data.replayed ? 'REPLAYED' : 'NEW') : 'REJECTED',
+            status: (data.status === 'OK' || data.status === 'success' || data.status === 'queued') ? (data.replayed ? 'REPLAYED' : 'NEW') : 'REJECTED',
             snapshot_version: data.snapshot_version,
             snapshot_sequence: data.snapshot_sequence,
             payload: data 
@@ -430,11 +432,12 @@ export async function removeSlot(slotId) {
     return executeAction('admin_remove_slot', { slot_id: slotId });
 }
 
-export async function updateSlotType(slotId, chargerTypes, chargingLevels) {
+export async function updateSlotType(slotId, chargerTypes, chargingLevels, urgentOnly = false) {
     return executeAction('admin_update_slot_type', {
         slot_id: slotId,
         charger_types: chargerTypes,
-        charging_levels: chargingLevels
+        charging_levels: chargingLevels,
+        urgent_only: !!urgentOnly
     });
 }
 

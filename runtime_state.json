@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "saved_at": 1777271800.3418546,
+  "saved_at": 1777411288.6264691,
   "users_db": [
     {
       "username": "admin",
@@ -21,17 +21,552 @@
       "username": "test4@gmail.com",
       "password": "123",
       "role": "user"
+    },
+    {
+      "username": "johndoe@gmai.com",
+      "password": "1234567890",
+      "role": "user",
+      "name": "John Doe"
+    },
+    {
+      "username": "johndoeleft@gmai.com",
+      "password": "1234567890",
+      "role": "user",
+      "name": "John Doe Left"
+    },
+    {
+      "username": "johndoeright@gmai.com",
+      "password": "1234567890",
+      "role": "user",
+      "name": "John Doe Right"
+    },
+    {
+      "username": "johndoemiddle@gmai.com",
+      "password": "1234567890",
+      "role": "user",
+      "name": "John Doe Middle"
+    },
+    {
+      "username": "johndoetop@gmai.com",
+      "password": "1234567890",
+      "role": "user",
+      "name": "John Doe Top"
+    },
+    {
+      "username": "johndoebottom@gmai.com",
+      "password": "1234567890",
+      "role": "user",
+      "name": "John Doe Bottom"
     }
   ],
   "wallets": {
     "test3@gmail.com": {
       "balance": 100.0,
       "currency": "USD"
+    },
+    "johndoebottom@gmai.com": {
+      "balance": 382.5,
+      "currency": "USD"
+    },
+    "johndoe@gmai.com": {
+      "balance": 440.0,
+      "currency": "USD"
+    },
+    "johndoeleft@gmai.com": {
+      "balance": 417.5,
+      "currency": "USD"
+    },
+    "johndoeright@gmai.com": {
+      "balance": 437.5,
+      "currency": "USD"
+    },
+    "johndoemiddle@gmai.com": {
+      "balance": 430.0,
+      "currency": "USD"
+    },
+    "johndoetop@gmai.com": {
+      "balance": 435.0,
+      "currency": "USD"
     }
   },
-  "slot_time_reservations": {},
-  "pricing_quotes": {},
-  "payment_receipts": {},
+  "slot_time_reservations": {
+    "2|2026-04-28|06:00-12:00": {
+      "quote_id": "q_1777411007929_2",
+      "username": "johndoe@gmai.com",
+      "slot_id": 2,
+      "date": "2026-04-28",
+      "time_window": "06:00-12:00",
+      "auth_code": "204567",
+      "created_at": 1777411011.046213
+    },
+    "3|2026-04-28|06:00-12:00": {
+      "quote_id": "q_1777411023171_3",
+      "username": "johndoemiddle@gmai.com",
+      "slot_id": 3,
+      "date": "2026-04-28",
+      "time_window": "06:00-12:00",
+      "auth_code": "152266",
+      "created_at": 1777411025.8576334
+    },
+    "0|2026-04-28|06:00-12:00": {
+      "quote_id": "q_1777411225868_0",
+      "username": "johndoeright@gmai.com",
+      "slot_id": 0,
+      "date": "2026-04-28",
+      "time_window": "06:00-12:00",
+      "auth_code": "442964",
+      "created_at": 1777411229.491534,
+      "queue_booking_id": "qb_21"
+    },
+    "1|2026-04-28|06:00-12:00": {
+      "quote_id": "q_1777411284220_0",
+      "username": "johndoebottom@gmai.com",
+      "slot_id": 1,
+      "date": "2026-04-28",
+      "time_window": "06:00-12:00",
+      "auth_code": "644114",
+      "created_at": 1777411288.620579,
+      "queue_booking_id": "qb_25"
+    }
+  },
+  "pricing_quotes": {
+    "q_1777410985837_1": {
+      "quote_id": "q_1777410985837_1",
+      "username": "johndoeleft@gmai.com",
+      "slot_id": 1,
+      "charger_type": "STANDARD",
+      "charger_types": [
+        "AC_WIRED"
+      ],
+      "charging_levels": [
+        "LEVEL_2"
+      ],
+      "date": "2026-04-28",
+      "time_window": "06:00-12:00",
+      "urgency": "LOW",
+      "unit_price": 10.0,
+      "multiplier": 1.0,
+      "time_multiplier": 1.0,
+      "urgency_multiplier": 1.0,
+      "urgency_surcharge_applied": false,
+      "requested_kwh": 20.0,
+      "charge_rate_kw": 7.0,
+      "total_price": 10.0,
+      "currency": "USD",
+      "expires_at": 1777411285.8373988,
+      "paid": true,
+      "consumed": true,
+      "allow_waitlist": false
+    },
+    "q_1777411007929_2": {
+      "quote_id": "q_1777411007929_2",
+      "username": "johndoe@gmai.com",
+      "slot_id": 2,
+      "charger_type": "STANDARD",
+      "charger_types": [
+        "AC_WIRED"
+      ],
+      "charging_levels": [
+        "LEVEL_2"
+      ],
+      "date": "2026-04-28",
+      "time_window": "06:00-12:00",
+      "urgency": "LOW",
+      "unit_price": 10.0,
+      "multiplier": 1.0,
+      "time_multiplier": 1.0,
+      "urgency_multiplier": 1.0,
+      "urgency_surcharge_applied": false,
+      "requested_kwh": 20.0,
+      "charge_rate_kw": 7.0,
+      "total_price": 10.0,
+      "currency": "USD",
+      "expires_at": 1777411307.9293883,
+      "paid": true,
+      "consumed": true,
+      "allow_waitlist": false
+    },
+    "q_1777411023171_3": {
+      "quote_id": "q_1777411023171_3",
+      "username": "johndoemiddle@gmai.com",
+      "slot_id": 3,
+      "charger_type": "STANDARD",
+      "charger_types": [
+        "AC_WIRED"
+      ],
+      "charging_levels": [
+        "LEVEL_2"
+      ],
+      "date": "2026-04-28",
+      "time_window": "06:00-12:00",
+      "urgency": "LOW",
+      "unit_price": 10.0,
+      "multiplier": 1.0,
+      "time_multiplier": 1.0,
+      "urgency_multiplier": 1.0,
+      "urgency_surcharge_applied": false,
+      "requested_kwh": 20.0,
+      "charge_rate_kw": 7.0,
+      "total_price": 10.0,
+      "currency": "USD",
+      "expires_at": 1777411323.1710606,
+      "paid": true,
+      "consumed": true,
+      "allow_waitlist": false
+    },
+    "q_1777411149467_0": {
+      "quote_id": "q_1777411149467_0",
+      "username": "johndoebottom@gmai.com",
+      "slot_id": 0,
+      "charger_type": "STANDARD",
+      "charger_types": [
+        "AC_WIRED"
+      ],
+      "charging_levels": [
+        "LEVEL_2"
+      ],
+      "date": "2026-04-28",
+      "time_window": "06:00-12:00",
+      "urgency": "LOW",
+      "unit_price": 10.0,
+      "multiplier": 1.0,
+      "time_multiplier": 1.0,
+      "urgency_multiplier": 1.0,
+      "urgency_surcharge_applied": false,
+      "requested_kwh": 20.0,
+      "charge_rate_kw": 7.0,
+      "total_price": 10.0,
+      "currency": "USD",
+      "expires_at": 1777411449.4677272,
+      "paid": false,
+      "consumed": false,
+      "allow_waitlist": false
+    },
+    "q_1777411167466_0": {
+      "quote_id": "q_1777411167466_0",
+      "username": "johndoebottom@gmai.com",
+      "slot_id": 0,
+      "charger_type": "STANDARD",
+      "charger_types": [
+        "AC_WIRED"
+      ],
+      "charging_levels": [
+        "LEVEL_2"
+      ],
+      "date": "2026-04-28",
+      "time_window": "06:00-12:00",
+      "urgency": "LOW",
+      "unit_price": 10.0,
+      "multiplier": 1.0,
+      "time_multiplier": 1.0,
+      "urgency_multiplier": 1.0,
+      "urgency_surcharge_applied": false,
+      "requested_kwh": 20.0,
+      "charge_rate_kw": 7.0,
+      "total_price": 10.0,
+      "currency": "USD",
+      "expires_at": 1777411467.4664419,
+      "paid": true,
+      "consumed": true,
+      "allow_waitlist": false,
+      "canceled": true
+    },
+    "q_1777411187487_1": {
+      "quote_id": "q_1777411187487_1",
+      "username": "johndoetop@gmai.com",
+      "slot_id": 1,
+      "charger_type": "STANDARD",
+      "charger_types": [
+        "AC_WIRED"
+      ],
+      "charging_levels": [
+        "LEVEL_2"
+      ],
+      "date": "2026-04-28",
+      "time_window": "06:00-12:00",
+      "urgency": "LOW",
+      "unit_price": 10.0,
+      "multiplier": 1.0,
+      "time_multiplier": 1.0,
+      "urgency_multiplier": 1.0,
+      "urgency_surcharge_applied": false,
+      "requested_kwh": 20.0,
+      "charge_rate_kw": 7.0,
+      "total_price": 10.0,
+      "currency": "USD",
+      "expires_at": 1777411487.487274,
+      "paid": true,
+      "consumed": true,
+      "allow_waitlist": true
+    },
+    "q_1777411225868_0": {
+      "quote_id": "q_1777411225868_0",
+      "username": "johndoeright@gmai.com",
+      "slot_id": 0,
+      "charger_type": "STANDARD",
+      "charger_types": [
+        "AC_WIRED"
+      ],
+      "charging_levels": [
+        "LEVEL_2"
+      ],
+      "date": "2026-04-28",
+      "time_window": "06:00-12:00",
+      "urgency": "HIGH",
+      "unit_price": 10.0,
+      "multiplier": 1.0,
+      "time_multiplier": 1.0,
+      "urgency_multiplier": 1.25,
+      "urgency_surcharge_applied": true,
+      "requested_kwh": 20.0,
+      "charge_rate_kw": 7.0,
+      "total_price": 12.5,
+      "currency": "USD",
+      "expires_at": 1777411525.868358,
+      "paid": true,
+      "consumed": true,
+      "allow_waitlist": true
+    },
+    "q_1777411263416_0": {
+      "quote_id": "q_1777411263416_0",
+      "username": "johndoebottom@gmai.com",
+      "slot_id": 0,
+      "charger_type": "STANDARD",
+      "charger_types": [
+        "AC_WIRED"
+      ],
+      "charging_levels": [
+        "LEVEL_2"
+      ],
+      "date": "2026-04-28",
+      "time_window": "06:00-12:00",
+      "urgency": "HIGH",
+      "unit_price": 10.0,
+      "multiplier": 1.0,
+      "time_multiplier": 1.0,
+      "urgency_multiplier": 1.25,
+      "urgency_surcharge_applied": true,
+      "requested_kwh": 20.0,
+      "charge_rate_kw": 7.0,
+      "total_price": 12.5,
+      "currency": "USD",
+      "expires_at": 1777411563.4169862,
+      "paid": true,
+      "consumed": true,
+      "allow_waitlist": true,
+      "canceled": true
+    },
+    "q_1777411284220_0": {
+      "quote_id": "q_1777411284220_0",
+      "username": "johndoebottom@gmai.com",
+      "slot_id": 0,
+      "charger_type": "STANDARD",
+      "charger_types": [
+        "AC_WIRED"
+      ],
+      "charging_levels": [
+        "LEVEL_2"
+      ],
+      "date": "2026-04-28",
+      "time_window": "06:00-12:00",
+      "urgency": "HIGH",
+      "unit_price": 10.0,
+      "multiplier": 1.0,
+      "time_multiplier": 1.0,
+      "urgency_multiplier": 1.25,
+      "urgency_surcharge_applied": true,
+      "requested_kwh": 20.0,
+      "charge_rate_kw": 7.0,
+      "total_price": 12.5,
+      "currency": "USD",
+      "expires_at": 1777411584.2206724,
+      "paid": true,
+      "consumed": true,
+      "allow_waitlist": true
+    }
+  },
+  "payment_receipts": {
+    "pay_1777410989347": {
+      "status": "success",
+      "payment_id": "pay_1777410989347",
+      "quote_id": "q_1777410985837_1",
+      "method": "WALLET",
+      "amount": 10.0,
+      "wallet_balance": 417.5,
+      "processed_at": 1777410989.3470016
+    },
+    "pay_1777411010778": {
+      "status": "success",
+      "payment_id": "pay_1777411010778",
+      "quote_id": "q_1777411007929_2",
+      "method": "WALLET",
+      "amount": 10.0,
+      "wallet_balance": 440.0,
+      "processed_at": 1777411010.778957
+    },
+    "pay_1777411025600": {
+      "status": "success",
+      "payment_id": "pay_1777411025600",
+      "quote_id": "q_1777411023171_3",
+      "method": "WALLET",
+      "amount": 10.0,
+      "wallet_balance": 430.0,
+      "processed_at": 1777411025.6002119
+    },
+    "pay_1777411170067": {
+      "status": "success",
+      "payment_id": "pay_1777411170067",
+      "quote_id": "q_1777411167466_0",
+      "method": "WALLET",
+      "amount": 10.0,
+      "wallet_balance": 407.5,
+      "processed_at": 1777411170.0675848
+    },
+    "pay_1777411190523": {
+      "status": "success",
+      "payment_id": "pay_1777411190523",
+      "quote_id": "q_1777411187487_1",
+      "method": "WALLET",
+      "amount": 10.0,
+      "wallet_balance": 435.0,
+      "processed_at": 1777411190.523537
+    },
+    "pay_1777411228620": {
+      "status": "success",
+      "payment_id": "pay_1777411228620",
+      "quote_id": "q_1777411225868_0",
+      "method": "WALLET",
+      "amount": 12.5,
+      "wallet_balance": 437.5,
+      "processed_at": 1777411228.620355
+    },
+    "pay_1777411266720": {
+      "status": "success",
+      "payment_id": "pay_1777411266720",
+      "quote_id": "q_1777411263416_0",
+      "method": "WALLET",
+      "amount": 12.5,
+      "wallet_balance": 395.0,
+      "processed_at": 1777411266.7202506
+    },
+    "pay_1777411287402": {
+      "status": "success",
+      "payment_id": "pay_1777411287402",
+      "quote_id": "q_1777411284220_0",
+      "method": "WALLET",
+      "amount": 12.5,
+      "wallet_balance": 382.5,
+      "processed_at": 1777411287.4027765
+    }
+  },
+  "booking_queue": [
+    {
+      "booking_id": "qb_21",
+      "username": "johndoeright@gmai.com",
+      "urgency": "HIGH",
+      "date": "2026-04-28",
+      "time_window": "06:00-12:00",
+      "requested_kwh": 20.0,
+      "charge_rate_kw": 7.0,
+      "quote_id": "q_1777411225868_0",
+      "charger_types": [],
+      "charging_levels": [],
+      "queued_at": 1777411228.885154,
+      "eta_minutes": 0,
+      "projected_slot_id": 0,
+      "reason": "ALL_SLOTS_OCCUPIED",
+      "booking_status": "ASSIGNED",
+      "assigned_slot_id": 0,
+      "auth_code": "442964",
+      "reservation_key": "0|2026-04-28|06:00-12:00",
+      "auto_assign_enabled": true
+    },
+    {
+      "booking_id": "qb_25",
+      "username": "johndoebottom@gmai.com",
+      "urgency": "HIGH",
+      "date": "2026-04-28",
+      "time_window": "06:00-12:00",
+      "requested_kwh": 20.0,
+      "charge_rate_kw": 7.0,
+      "quote_id": "q_1777411284220_0",
+      "charger_types": [],
+      "charging_levels": [],
+      "queued_at": 1777411287.6231027,
+      "eta_minutes": 0,
+      "projected_slot_id": 1,
+      "reason": "ALL_SLOTS_OCCUPIED",
+      "booking_status": "ASSIGNED",
+      "assigned_slot_id": 1,
+      "auth_code": "644114",
+      "reservation_key": "1|2026-04-28|06:00-12:00",
+      "auto_assign_enabled": true
+    },
+    {
+      "booking_id": "qb_20",
+      "username": "johndoetop@gmai.com",
+      "urgency": "LOW",
+      "date": "2026-04-28",
+      "time_window": "06:00-12:00",
+      "requested_kwh": 20.0,
+      "charge_rate_kw": 7.0,
+      "quote_id": "q_1777411187487_1",
+      "charger_types": [],
+      "charging_levels": [],
+      "queued_at": 1777411190.6373117,
+      "eta_minutes": 0,
+      "projected_slot_id": 1,
+      "reason": "ALL_SLOTS_OCCUPIED",
+      "booking_status": "ASSIGNED",
+      "assigned_slot_id": 1,
+      "auth_code": "122884",
+      "reservation_key": "1|2026-04-28|06:00-12:00",
+      "auto_assign_enabled": true
+    },
+    {
+      "booking_id": "qb_24",
+      "username": "johndoeleft@gmai.com",
+      "urgency": "LOW",
+      "date": "2026-04-28",
+      "time_window": "06:00-12:00",
+      "requested_kwh": 20.0,
+      "charge_rate_kw": 7.0,
+      "quote_id": "q_1777410985837_1",
+      "charger_types": [],
+      "charging_levels": [],
+      "queued_at": 1777411267.5428283,
+      "eta_minutes": 0,
+      "projected_slot_id": 1,
+      "reason": "DISPLACED_BY_HIGH_URGENCY",
+      "booking_status": "QUEUED",
+      "assigned_slot_id": null,
+      "auth_code": null,
+      "reservation_key": null,
+      "auto_assign_enabled": false
+    },
+    {
+      "booking_id": "qb_26",
+      "username": "johndoetop@gmai.com",
+      "urgency": "LOW",
+      "date": "2026-04-28",
+      "time_window": "06:00-12:00",
+      "requested_kwh": 20.0,
+      "charge_rate_kw": 7.0,
+      "quote_id": "q_1777411187487_1",
+      "charger_types": [],
+      "charging_levels": [],
+      "queued_at": 1777411288.6141875,
+      "eta_minutes": 0,
+      "projected_slot_id": 1,
+      "reason": "DISPLACED_BY_HIGH_URGENCY",
+      "booking_status": "QUEUED",
+      "assigned_slot_id": null,
+      "auth_code": null,
+      "reservation_key": null,
+      "auto_assign_enabled": false
+    }
+  ],
+  "queue_counter": 26,
   "admin_slots": [
     {
       "slot_id": 0,
@@ -40,7 +575,8 @@
       ],
       "charging_levels": [
         "LEVEL_2"
-      ]
+      ],
+      "urgent_only": true
     },
     {
       "slot_id": 1,
@@ -49,7 +585,8 @@
       ],
       "charging_levels": [
         "LEVEL_2"
-      ]
+      ],
+      "urgent_only": false
     },
     {
       "slot_id": 2,
@@ -58,7 +595,8 @@
       ],
       "charging_levels": [
         "LEVEL_2"
-      ]
+      ],
+      "urgent_only": false
     },
     {
       "slot_id": 3,
@@ -67,7 +605,8 @@
       ],
       "charging_levels": [
         "LEVEL_2"
-      ]
+      ],
+      "urgent_only": false
     }
   ],
   "pricing_settings": {
